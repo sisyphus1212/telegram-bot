@@ -88,3 +88,4 @@ sudo journalctl -u telegram-bot.service -f
 1. Bot无响应：查看 `log/bot.log` 或 `journalctl -u telegram-bot.service -f`
 2. 连接失败：确认本机 `codex` 可用（`codex --version`）
 3. 风险控制：建议设置 `TELEGRAM_ALLOWED_USER_IDS` 只允许你自己使用
+# telegram-bot
