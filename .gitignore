@@ -1,0 +1,22 @@
+# Logs
+*.log
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Session data (user specific)
+sessions.json
+
+# Codex bot config (contains Telegram bot token)
+codex_config.json

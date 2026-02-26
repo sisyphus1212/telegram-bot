@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram Bot (Codex app-server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/telegram-bot
+EnvironmentFile=/etc/telegram-bot.env
+ExecStart=/root/telegram-bot/scripts/run.sh
+Restart=on-failure
+RestartSec=3
+
+# Hardening (relax if needed)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+
