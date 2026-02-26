@@ -419,6 +419,11 @@ class CodexProxyAgent:
                                             p = params if isinstance(params, dict) else None
                                             # Compatibility layer: keep TG/API naming aligned with docs, translate to local codex expectations where needed.
                                             if method == "thread/start" and isinstance(p, dict):
+                                                # If manager doesn't specify, use proxy-local defaults from proxy_config.json.
+                                                if "sandbox" not in p:
+                                                    p["sandbox"] = self.sandbox
+                                                if "approvalPolicy" not in p:
+                                                    p["approvalPolicy"] = self.approval_policy
                                                 if "sandbox" in p and isinstance(p.get("sandbox"), str):
                                                     p["sandbox"] = _map_threadstart_sandbox(str(p["sandbox"]))
                                                 if "approvalPolicy" in p and isinstance(p.get("approvalPolicy"), str):

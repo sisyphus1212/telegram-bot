@@ -416,7 +416,8 @@ class ManagerCore:
         rep = await self.appserver_call(
             proxy_id,
             "thread/start",
-            {"cwd": str(BASE_DIR), "sandbox": "workspaceWrite", "approvalPolicy": "onRequest", "personality": "pragmatic"},
+            # Let proxy apply its local defaults (sandbox/approvalPolicy) unless caller explicitly sets them.
+            {"cwd": str(BASE_DIR), "personality": "pragmatic"},
             timeout_s=min(timeout_s, 60.0),
         )
         if not bool(rep.get("ok")):
@@ -959,7 +960,7 @@ async def run_control_server(listen: str, token: str, registry: ProxyRegistry, c
                             rep = await core.appserver_call(
                                 proxy_id,
                                 "thread/start",
-                                {"cwd": str(BASE_DIR), "sandbox": "workspaceWrite", "approvalPolicy": "onRequest", "personality": "pragmatic"},
+                                {"cwd": str(BASE_DIR), "personality": "pragmatic"},
                                 timeout_s=min(timeout_s, 60.0),
                             )
                             if not bool(rep.get("ok")):
@@ -1635,7 +1636,7 @@ class ManagerApp:
             return
         if not thread_id:
             # Auto-create a thread on first message for this (chat, proxy).
-            params: JsonDict = {"cwd": str(BASE_DIR), "sandbox": "workspaceWrite", "approvalPolicy": "onRequest", "personality": "pragmatic"}
+            params: JsonDict = {"cwd": str(BASE_DIR), "personality": "pragmatic"}
             rep = await core.appserver_call(proxy_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
             if not bool(rep.get("ok")):
                 await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start failed: {rep.get('error')}"), timeout_s=15.0, what="msg reply")
