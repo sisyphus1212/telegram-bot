@@ -988,7 +988,13 @@ class ManagerApp:
         lines.append(f"selected: {selected or '(none)'}")
         if allowed:
             lines.append(f"allowed: {', '.join(allowed)}")
-        lines.append("use: /proxy_use <id>")
+        if online:
+            lines.append("")
+            lines.append("可直接复制切换：")
+            for pid in online:
+                lines.append(f"/proxy_use {pid}")
+        else:
+            lines.append("use: /proxy_use <id>")
         await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/proxy_list reply")
 
     async def cmd_proxy_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
