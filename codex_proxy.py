@@ -146,7 +146,13 @@ class CodexProxyAgent:
                                     continue
                                 if msg.get("type") != "task_assign":
                                     continue
+                                task_id = msg.get("task_id")
+                                logger.info(f"task_assign received proxy_id={self.proxy_id} task_id={task_id!r}")
                                 out = await self._run_task(msg)
+                                logger.info(
+                                    f"task_result sending proxy_id={self.proxy_id} "
+                                    f"task_id={out.get('task_id')!r} ok={out.get('ok')!r}"
+                                )
                                 await ws.send(_json_dumps(out))
                         finally:
                             stop_hb.set()

@@ -71,6 +71,14 @@ Manager 的 Telegram token 推荐放 `codex_config.json`（不要提交，已在
 - `CODEX_TASK_TIMEOUT`: 单次任务超时秒数（可选）
 - `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`: 如果你的环境需要代理访问 Telegram API
 
+也可以在 `codex_config.json` 里显式配置 Telegram 代理（优先级低于环境变量）：
+
+```json
+{
+  "telegram_proxy": "http://127.0.0.1:8080"
+}
+```
+
 安全相关（当前阶段可以先不设，但强烈建议后续补上）：
 
 - `TELEGRAM_ALLOWED_USER_IDS`: 允许使用的 Telegram user id 列表(逗号分隔)，为空表示不限制
@@ -141,6 +149,7 @@ python codex_proxy.py --config proxy_config.json
 在 Telegram 对话里：
 
 1. `/servers` 查看在线 proxy
+2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 proxy）
 2. 直接发一条消息，例如 `ping`
 3. 预期会看到 `pong` 或 Codex 的回复
 
@@ -179,6 +188,7 @@ sudo journalctl -u codex-proxy.service -f
 1. Telegram 收不到消息：
    - 看 `journalctl -u codex-manager.service -f`
    - 很多环境需要设置 `HTTP_PROXY/HTTPS_PROXY`
+   - 本项目会优先使用 `HTTPS_PROXY/HTTP_PROXY`（或 `codex_config.json` 里的 `telegram_proxy`）显式配置到 Telegram HTTP 客户端
 2. Manager 看不到在线 proxy：
    - 看 `journalctl -u codex-proxy.service -f`
    - 确认 `CODEX_MANAGER_WS` 可达、端口放通

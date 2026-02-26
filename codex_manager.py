@@ -56,6 +56,13 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
+async def _tg_call(coro, *, timeout_s: float, what: str) -> Any:
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_s)
+    except Exception as e:
+        logger.warning(f"telegram call failed ({what}): {type(e).__name__}: {e}")
+        raise
+
 
 def _load_config() -> dict:
     cfg_path = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
@@ -212,9 +219,13 @@ class ProxyRegistry:
             self._task_futures[task_id] = fut
             self._tasks_by_proxy.setdefault(proxy_id, set()).add(task_id)
 
+        payload = json.dumps(task_msg, ensure_ascii=False, separators=(",", ":"))
+        logger.info(f"ws send start proxy={proxy_id} task_id={task_id}")
         try:
-            await ws.send(json.dumps(task_msg, ensure_ascii=False, separators=(",", ":")))
-        except Exception:
+            await asyncio.wait_for(ws.send(payload), timeout=5.0)
+            logger.info(f"ws send done proxy={proxy_id} task_id={task_id} bytes={len(payload)}")
+        except Exception as e:
+            logger.warning(f"ws send failed proxy={proxy_id} task_id={task_id}: {type(e).__name__}: {e}")
             async with self._lock:
                 self._task_futures.pop(task_id, None)
                 self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
@@ -318,8 +329,9 @@ class ManagerApp:
         return online[0] if online else None
 
     async def cmd_servers(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /servers from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not self._is_allowed(update):
-            await update.message.reply_text("unauthorized")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/servers reply")
             return
         sk = _session_key(update)
         sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
@@ -331,59 +343,73 @@ class ManagerApp:
         lines.append(f"selected: {selected or '(auto)'}")
         if allowed:
             lines.append(f"allowed: {', '.join(allowed)}")
-        await update.message.reply_text("\n".join(lines))
+        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/servers reply")
+
+    async def cmd_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(
+            f"cmd /ping from chat={update.effective_chat.id if update.effective_chat else '?'} "
+            f"user={update.effective_user.id if update.effective_user else '?'}"
+        )
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/ping reply")
+            return
+        await _tg_call(update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
 
     async def cmd_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /use from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not self._is_allowed(update):
-            await update.message.reply_text("unauthorized")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/use reply")
             return
         sk = _session_key(update)
         if not context.args:
-            await update.message.reply_text("usage: /use <proxy_id>")
+            await _tg_call(update.message.reply_text("usage: /use <proxy_id>"), timeout_s=15.0, what="/use reply")
             return
         proxy_id = str(context.args[0]).strip()
         if not proxy_id:
-            await update.message.reply_text("usage: /use <proxy_id>")
+            await _tg_call(update.message.reply_text("usage: /use <proxy_id>"), timeout_s=15.0, what="/use reply")
             return
         if not self.registry.is_online(proxy_id):
-            await update.message.reply_text(f"proxy offline: {proxy_id}")
+            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id}"), timeout_s=15.0, what="/use reply")
             return
         sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
         sess["proxy"] = proxy_id
         sess["reset_next"] = True  # switch machine => reset remote thread mapping
         self.sessions[sk] = sess
         save_sessions(self.sessions)
-        await update.message.reply_text(f"using proxy: {proxy_id} (next turn will reset)")
+        await _tg_call(update.message.reply_text(f"using proxy: {proxy_id} (next turn will reset)"), timeout_s=15.0, what="/use reply")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /reset from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not self._is_allowed(update):
-            await update.message.reply_text("unauthorized")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/reset reply")
             return
         sk = _session_key(update)
         sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
         sess["reset_next"] = True
         self.sessions[sk] = sess
         save_sessions(self.sessions)
-        await update.message.reply_text("ok (next turn will reset)")
+        await _tg_call(update.message.reply_text("ok (next turn will reset)"), timeout_s=15.0, what="/reset reply")
 
     async def cmd_pc(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /pc from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not self._is_allowed(update):
-            await update.message.reply_text("unauthorized")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/pc reply")
             return
         sk = _session_key(update)
         if not context.args or context.args[0] not in ("on", "off"):
-            await update.message.reply_text("usage: /pc on|off")
+            await _tg_call(update.message.reply_text("usage: /pc on|off"), timeout_s=15.0, what="/pc reply")
             return
         mode = context.args[0] == "on"
         sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
         sess["pc_mode"] = mode
         self.sessions[sk] = sess
         save_sessions(self.sessions)
-        await update.message.reply_text(f"pc_mode={mode} (currently not used by protocol)")
+        await _tg_call(update.message.reply_text(f"pc_mode={mode} (currently not used by protocol)"), timeout_s=15.0, what="/pc reply")
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"msg text from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} len={len(update.message.text) if update.message and update.message.text else 0}")
         if not self._is_allowed(update):
-            await update.message.reply_text("unauthorized")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="msg reply")
             return
         if not update.message or not isinstance(update.message.text, str):
             return
@@ -392,7 +418,7 @@ class ManagerApp:
         sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
         proxy_id = self._choose_proxy(str(sess.get("proxy") or ""))
         if not proxy_id:
-            await update.message.reply_text("no proxy online. use /servers")
+            await _tg_call(update.message.reply_text("no proxy online. use /servers"), timeout_s=15.0, what="msg reply")
             return
 
         task_id = uuid.uuid4().hex
@@ -402,7 +428,11 @@ class ManagerApp:
         save_sessions(self.sessions)
 
         prompt = update.message.text
-        placeholder = await update.message.reply_text(f"working (proxy={proxy_id}, reset={reset_thread}) ...")
+        placeholder = await _tg_call(
+            update.message.reply_text(f"working (proxy={proxy_id}, reset={reset_thread}) ..."),
+            timeout_s=15.0,
+            what="placeholder",
+        )
 
         task_msg: JsonDict = {
             "type": "task_assign",
@@ -413,27 +443,41 @@ class ManagerApp:
         }
 
         try:
+            logger.info(f"dispatch start proxy={proxy_id} task_id={task_id} reset={reset_thread}")
             res = await self.registry.dispatch(proxy_id=proxy_id, task_msg=task_msg, timeout_s=self.task_timeout_s)
+            logger.info(f"dispatch done proxy={proxy_id} task_id={task_id} ok={bool(isinstance(res, dict) and res.get('ok'))}")
         except Exception as e:
-            await placeholder.edit_text(f"error: {e}")
+            try:
+                await _tg_call(placeholder.edit_text(f"error: {e}"), timeout_s=15.0, what="edit error")
+            except Exception as ee:
+                logger.warning(f"telegram edit_text failed: {type(ee).__name__}: {ee}")
             return
 
         if not isinstance(res, dict) or res.get("type") != "task_result":
-            await placeholder.edit_text("error: bad task_result")
+            await _tg_call(placeholder.edit_text("error: bad task_result"), timeout_s=15.0, what="edit bad_task_result")
             return
 
         if not res.get("ok"):
+            logger.info(f"task_result not ok proxy={proxy_id} task_id={task_id} res={res}")
             err = res.get("error") or "unknown error"
-            await placeholder.edit_text(f"error: {err}")
+            try:
+                await _tg_call(placeholder.edit_text(f"error: {err}"), timeout_s=15.0, what="edit task_error")
+            except Exception as ee:
+                logger.warning(f"telegram edit_text failed: {type(ee).__name__}: {ee}")
+                await _tg_call(update.message.reply_text(f"error: {err}"), timeout_s=15.0, what="reply task_error")
             return
 
         text = str(res.get("text") or "").strip()
         if not text:
             text = "(empty)"
         parts = _split_telegram_text(text)
-        await placeholder.edit_text(parts[0])
+        try:
+            await _tg_call(placeholder.edit_text(parts[0]), timeout_s=15.0, what="edit result")
+        except Exception as ee:
+            logger.warning(f"telegram edit_text failed: {type(ee).__name__}: {ee}")
+            await _tg_call(update.message.reply_text(parts[0]), timeout_s=15.0, what="reply result")
         for extra in parts[1:]:
-            await update.message.reply_text(extra)
+            await _tg_call(update.message.reply_text(extra), timeout_s=15.0, what="reply extra")
 
 
 def main() -> int:
@@ -534,15 +578,35 @@ def main() -> int:
             while not stop_event.is_set():
                 tg = None
                 try:
-                    req = HTTPXRequest(connect_timeout=20.0, read_timeout=60.0, write_timeout=60.0, pool_timeout=20.0)
+                    # PTB's HTTPXRequest does not necessarily honor env proxy settings depending on internal httpx config.
+                    # We pass it explicitly when present to avoid "no response" behind an HTTP proxy.
+                    proxy = (
+                        os.environ.get("HTTPS_PROXY")
+                        or os.environ.get("HTTP_PROXY")
+                        or str(cfg.get("telegram_proxy") or "")
+                    ).strip() or None
+                    req = HTTPXRequest(
+                        connect_timeout=20.0,
+                        read_timeout=60.0,
+                        write_timeout=60.0,
+                        pool_timeout=20.0,
+                        proxy=proxy,
+                    )
                     tg = Application.builder().token(bot_token).request(req).build()
                     tg.add_handler(CommandHandler("servers", app.cmd_servers))
+                    tg.add_handler(CommandHandler("ping", app.cmd_ping))
                     tg.add_handler(CommandHandler("use", app.cmd_use))
                     tg.add_handler(CommandHandler("reset", app.cmd_reset))
                     tg.add_handler(CommandHandler("pc", app.cmd_pc))
                     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app.on_text))
+                    tg.add_error_handler(lambda _u, c: logger.warning(f"telegram handler error: {c.error!r}"), block=False)
 
                     await tg.initialize()
+                    # Ensure we're in polling mode. If a webhook is set, getUpdates won't deliver anything.
+                    try:
+                        await tg.bot.delete_webhook(drop_pending_updates=False)
+                    except Exception as e:
+                        logger.warning(f"delete_webhook failed: {type(e).__name__}: {e}")
                     await tg.start()
                     assert tg.updater is not None
                     await tg.updater.start_polling()
