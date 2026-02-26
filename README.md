@@ -69,9 +69,9 @@ Manager 的 Telegram token 推荐放 `codex_config.json`（不要提交，已在
 - `CODEX_MANAGER_WS_LISTEN`: manager WS 监听地址（例如 `0.0.0.0:8765`）
 - `CODEX_DEFAULT_PROXY`: 默认 proxy（可选）
 - `CODEX_TASK_TIMEOUT`: 单次任务超时秒数（可选）
-- `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`: 如果你的环境需要代理访问 Telegram API
+- `TELEGRAM_PROXY`: 如果你的环境需要代理访问 Telegram API（例如 `http://127.0.0.1:8080`）
 
-也可以在 `codex_config.json` 里显式配置 Telegram 代理（优先级低于环境变量）：
+也可以在 `codex_config.json` 里显式配置 Telegram 代理（优先级低于 `TELEGRAM_PROXY`）：
 
 ```json
 {
@@ -189,8 +189,8 @@ sudo journalctl -u codex-proxy.service -f
 
 1. Telegram 收不到消息：
    - 看 `journalctl -u codex-manager.service -f`
-   - 很多环境需要设置 `HTTP_PROXY/HTTPS_PROXY`
-   - 本项目会优先使用 `HTTPS_PROXY/HTTP_PROXY`（或 `codex_config.json` 里的 `telegram_proxy`）显式配置到 Telegram HTTP 客户端
+   - 很多环境需要设置 `TELEGRAM_PROXY`
+   - 为了避免被系统 `HTTP_PROXY/HTTPS_PROXY` 环境变量干扰，本项目默认 `trust_env=false`，不会自动继承系统代理；需要的话请显式配置 `TELEGRAM_PROXY` 或 `codex_config.json` 的 `telegram_proxy`
 2. Manager 看不到在线 proxy：
    - 看 `journalctl -u codex-proxy.service -f`
    - 确认 `CODEX_MANAGER_WS` 可达、端口放通

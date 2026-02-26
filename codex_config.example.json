@@ -1,6 +1,7 @@
 {
   "telegram_bot_token": "PUT-YOUR-TELEGRAM-BOT-TOKEN-HERE",
   "telegram_allowed_user_ids": [5974809970],
+  "telegram_proxy": "",
   "manager_ws_listen": "0.0.0.0:8765",
   "default_proxy": "proxy1",
   "proxies": {

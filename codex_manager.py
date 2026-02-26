@@ -14,6 +14,7 @@ from typing import Any
 import websockets
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
 import log_rotate
@@ -57,12 +58,32 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-async def _tg_call(coro, *, timeout_s: float, what: str) -> Any:
-    try:
-        return await asyncio.wait_for(coro, timeout=timeout_s)
-    except Exception as e:
-        logger.warning(f"telegram call failed ({what}): {type(e).__name__}: {e}")
-        raise
+async def _tg_call(coro, *, timeout_s: float, what: str, retries: int = 3) -> Any:
+    """
+    Telegram 网络在部分环境下不稳定（尤其是走本地代理时），这里做轻量重试避免“没反应”。
+
+    注意：send_message 不是严格幂等，重试可能导致重复消息；但比起完全无响应更可接受。
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout_s)
+        except RetryAfter as e:
+            # Telegram 限流：按建议等待后重试。
+            wait_s = max(0.5, float(getattr(e, "retry_after", 1.0)))
+            logger.warning(f"telegram call rate-limited ({what}): RetryAfter {wait_s:.1f}s (attempt {attempt}/{retries})")
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(wait_s)
+        except (TimedOut, NetworkError, asyncio.TimeoutError) as e:
+            logger.warning(f"telegram call transient failed ({what}): {type(e).__name__}: {e} (attempt {attempt}/{retries})")
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(min(5.0, 0.7 * (1.6 ** (attempt - 1))))
+        except Exception as e:
+            logger.warning(f"telegram call failed ({what}): {type(e).__name__}: {e}")
+            raise
 
 
 def _load_config() -> dict:
@@ -368,6 +389,7 @@ class ManagerCore:
         task_id = str(msg.get("task_id") or "")
         if not task_id:
             return
+        logger.info(f"task_result recv proxy={proxy_id} task_id={task_id} ok={bool(msg.get('ok'))}")
 
         async with self._lock:
             waiter = self._waiters.get(task_id)
@@ -417,16 +439,20 @@ class ManagerCore:
         if ok:
             body = text.strip() or "(empty)"
             parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}] ")
-            await outbox.enqueue(TgAction(type="edit", chat_id=ctx.chat_id, message_id=ctx.placeholder_msg_id, text=parts[0]))
+            if not await outbox.enqueue(TgAction(type="edit", chat_id=ctx.chat_id, message_id=ctx.placeholder_msg_id, text=parts[0])):
+                logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit)")
             for extra in parts[1:]:
-                await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text=extra))
+                if not await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text=extra)):
+                    logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send extra)")
             return
 
         body = f"error: {err or 'unknown error'}"
         parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}] ")
-        await outbox.enqueue(TgAction(type="edit", chat_id=ctx.chat_id, message_id=ctx.placeholder_msg_id, text=parts[0]))
+        if not await outbox.enqueue(TgAction(type="edit", chat_id=ctx.chat_id, message_id=ctx.placeholder_msg_id, text=parts[0])):
+            logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit err)")
         for extra in parts[1:]:
-            await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text=extra))
+            if not await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text=extra)):
+                logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send extra err)")
 
     async def _fail_task(self, task_id: str, reason: str, *, proxy_id: str) -> None:
         ctx: TaskContext | None = None
@@ -796,19 +822,16 @@ def main() -> int:
             while not stop_event.is_set():
                 tg = None
                 try:
-                    # PTB's HTTPXRequest does not necessarily honor env proxy settings depending on internal httpx config.
-                    # We pass it explicitly when present to avoid "no response" behind an HTTP proxy.
-                    proxy = (
-                        os.environ.get("HTTPS_PROXY")
-                        or os.environ.get("HTTP_PROXY")
-                        or str(cfg.get("telegram_proxy") or "")
-                    ).strip() or None
+                    # 只使用显式配置的 Telegram 代理，避免被系统 HTTP(S)_PROXY 环境变量“误伤”。
+                    # 如需代理：在 codex_config.json 里配置 telegram_proxy，或设置 TELEGRAM_PROXY。
+                    proxy = (os.environ.get("TELEGRAM_PROXY") or str(cfg.get("telegram_proxy") or cfg.get("telegram_http_proxy") or "")).strip() or None
                     req = HTTPXRequest(
                         connect_timeout=20.0,
                         read_timeout=60.0,
                         write_timeout=60.0,
                         pool_timeout=20.0,
                         proxy=proxy,
+                        httpx_kwargs={"trust_env": False},
                     )
                     tg = Application.builder().token(bot_token).request(req).build()
                     tg.bot_data["core"] = core
