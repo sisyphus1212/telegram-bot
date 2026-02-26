@@ -4,7 +4,7 @@ import os
 import signal
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 
 JsonDict = dict[str, Any]
@@ -30,9 +30,16 @@ class CodexAppServerStdioProcess:
     Minimal stdio JSON-RPC 2.0 client for `codex app-server` (JSONL over stdio).
     """
 
-    def __init__(self, config: CodexLocalAppServerConfig, on_log: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        config: CodexLocalAppServerConfig,
+        on_log: Callable[[str], None] | None = None,
+        *,
+        on_approval_request: Callable[[JsonDict], Awaitable[str]] | None = None,
+    ) -> None:
         self._config = config
         self._on_log = on_log
+        self._on_approval_request = on_approval_request
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stdout: asyncio.StreamReader | None = None
@@ -269,12 +276,16 @@ class CodexAppServerStdioProcess:
         if not isinstance(req_id, int) or not isinstance(method, str):
             return
 
-        # Default: decline approvals for safety. Override by running app-server with approvalPolicy=never.
-        if method == "item/commandExecution/requestApproval":
-            await self._send_raw({"id": req_id, "result": {"decision": "decline"}})
-            return
-        if method == "item/fileChange/requestApproval":
-            await self._send_raw({"id": req_id, "result": {"decision": "decline"}})
+        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+            # Let the outer application decide; if no handler, default to decline for safety.
+            decision = "decline"
+            if self._on_approval_request is not None:
+                try:
+                    decision = (await self._on_approval_request(req)) or "decline"
+                except Exception as e:
+                    self._log(f"[app-server] approval handler failed: {type(e).__name__}: {e}")
+                    decision = "decline"
+            await self._send_raw({"id": req_id, "result": {"decision": decision}})
             return
         await self._send_raw({"id": req_id, "error": {"code": -32601, "message": f"Unsupported request: {method}"}})
 

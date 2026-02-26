@@ -218,6 +218,19 @@ class TaskContext:
 
 
 @dataclass
+class ApprovalContext:
+    approval_id: str
+    proxy_id: str
+    task_id: str
+    trace_id: str
+    rpc_id: int | None
+    method: str
+    params: JsonDict
+    chat_id: int
+    created_at: float
+
+
+@dataclass
 class TgAction:
     type: str  # "edit" | "send"
     chat_id: int
@@ -387,6 +400,7 @@ class ManagerCore:
         self._timeout_task: asyncio.Task | None = None
         self._waiters: dict[str, asyncio.Future[JsonDict]] = {}
         self._rpc_waiters: dict[str, asyncio.Future[JsonDict]] = {}
+        self._approvals: dict[str, ApprovalContext] = {}
 
     def set_outbox(self, outbox: TelegramOutbox) -> None:
         self._outbox = outbox
@@ -473,6 +487,9 @@ class ManagerCore:
 
     async def on_proxy_message(self, proxy_id: str, msg: JsonDict) -> None:
         t = msg.get("type")
+        if t == "approval_request":
+            await self._handle_approval_request(proxy_id=proxy_id, msg=msg)
+            return
         if t == "task_ack":
             task_id = str(msg.get("task_id") or "")
             trace_id = str(msg.get("trace_id") or "")
@@ -505,6 +522,106 @@ class ManagerCore:
                 waiter.set_result(msg)
                 return
         await self._handle_task_result(proxy_id=proxy_id, msg=msg)
+
+    async def _handle_approval_request(self, *, proxy_id: str, msg: JsonDict) -> None:
+        approval_id = str(msg.get("approval_id") or "")
+        task_id = str(msg.get("task_id") or "")
+        trace_id = str(msg.get("trace_id") or "")
+        method = str(msg.get("method") or "")
+        params = msg.get("params")
+        rpc_id = msg.get("rpc_id")
+        if not approval_id or not method:
+            return
+        if not isinstance(params, dict):
+            params = {}
+        rpc_id_i = rpc_id if isinstance(rpc_id, int) else None
+
+        ctx: TaskContext | None = None
+        async with self._lock:
+            # We only support approvals triggered during an inflight task for now.
+            ctx = self._tasks_inflight.get(task_id) if task_id else None
+        if ctx is None:
+            logger.warning(f"approval_request dropped: proxy={proxy_id} approval_id={approval_id} task_id={task_id!r} method={method}")
+            # Don't hang the proxy: decline immediately.
+            try:
+                await self.registry.send_json(proxy_id, {"type": "approval_decision", "approval_id": approval_id, "decision": "decline"})
+            except Exception:
+                pass
+            return
+
+        outbox = self._outbox
+        if outbox is None:
+            logger.warning(f"approval_request dropped (no outbox): proxy={proxy_id} approval_id={approval_id}")
+            try:
+                await self.registry.send_json(proxy_id, {"type": "approval_decision", "approval_id": approval_id, "decision": "decline"})
+            except Exception:
+                pass
+            return
+
+        ac = ApprovalContext(
+            approval_id=approval_id,
+            proxy_id=proxy_id,
+            task_id=task_id,
+            trace_id=trace_id or ctx.trace_id,
+            rpc_id=rpc_id_i,
+            method=method,
+            params=params,
+            chat_id=ctx.chat_id,
+            created_at=time.time(),
+        )
+        async with self._lock:
+            self._approvals[approval_id] = ac
+
+        # Render a minimal approval message (align with app-server naming).
+        text_lines: list[str] = []
+        text_lines.append(f"[{proxy_id}] 需要审批：{method}")
+        # Try to extract key fields from the official request payload.
+        if method == "item/commandExecution/requestApproval":
+            cmd = params.get("command")
+            cwd = params.get("cwd")
+            reason = params.get("reason")
+            if cmd:
+                text_lines.append(f"command: {cmd}")
+            if cwd:
+                text_lines.append(f"cwd: {cwd}")
+            if reason:
+                text_lines.append(f"reason: {reason}")
+            net = params.get("networkApprovalContext")
+            if isinstance(net, dict):
+                host = net.get("host")
+                proto = net.get("protocol")
+                port = net.get("port")
+                if host or proto or port:
+                    text_lines.append(f"network: {proto or '?'} {host or '?'}:{port or '?'}")
+        elif method == "item/fileChange/requestApproval":
+            reason = params.get("reason")
+            if reason:
+                text_lines.append(f"reason: {reason}")
+        text_lines.append("")
+        text_lines.append("回复以下命令进行选择：")
+        text_lines.append(f"/approve {approval_id}")
+        text_lines.append(f"/approve_session {approval_id}")
+        text_lines.append(f"/decline {approval_id}")
+
+        await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text="\n".join(text_lines), trace_id=ac.trace_id, proxy_id=proxy_id, task_id=task_id, kind="approval"))
+
+    async def approval_decide(self, *, approval_id: str, decision: str, chat_id: int) -> tuple[bool, str]:
+        decision = (decision or "").strip()
+        if decision not in ("accept", "acceptForSession", "decline", "cancel"):
+            return False, "invalid decision"
+        async with self._lock:
+            ac = self._approvals.get(approval_id)
+        if ac is None:
+            return False, "approval_id not found (maybe expired)"
+        if ac.chat_id != chat_id:
+            return False, "chat mismatch"
+        try:
+            await self.registry.send_json(ac.proxy_id, {"type": "approval_decision", "approval_id": approval_id, "decision": decision})
+        except Exception as e:
+            return False, f"send failed: {type(e).__name__}: {e}"
+        async with self._lock:
+            self._approvals.pop(approval_id, None)
+        return True, "ok"
 
     async def _handle_task_result(self, *, proxy_id: str, msg: JsonDict) -> None:
         task_id = str(msg.get("task_id") or "")
@@ -703,7 +820,7 @@ async def run_ws_server(listen: str, registry: ProxyRegistry, core: ManagerCore)
                 if t == "heartbeat":
                     await registry.heartbeat(proxy_id, ws)
                     continue
-                if t in ("task_ack", "task_result", "appserver_response"):
+                if t in ("task_ack", "task_result", "appserver_response", "approval_request"):
                     await core.on_proxy_message(proxy_id, m)
                     continue
         except websockets.ConnectionClosed:
@@ -889,12 +1006,14 @@ def _session_key(update: Update) -> str:
 class ManagerApp:
     def __init__(
         self,
+        core: ManagerCore,
         registry: ProxyRegistry,
         sessions: dict[str, dict],
         allowed_users: set[int],
         default_proxy: str,
         task_timeout_s: float,
     ) -> None:
+        self.core = core
         self.registry = registry
         self.sessions = sessions
         self.allowed_users = allowed_users
@@ -1071,6 +1190,12 @@ class ManagerApp:
         lines.append("- /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]")
         lines.append("- /collaborationmode_list")
         lines.append("")
+        lines.append("5) 审批（approval）")
+        lines.append("- 当 approvalPolicy=onRequest 时，某些命令/文件变更会触发审批。")
+        lines.append("- /approve <approval_id>  同意一次")
+        lines.append("- /approve_session <approval_id>  本会话同意（如果 codex 支持）")
+        lines.append("- /decline <approval_id>  拒绝")
+        lines.append("")
         lines.append("参数格式：key=value（多个参数用空格分隔）。JSON 参数用 value=<json>。")
         lines.append("示例：")
         lines.append("- /proxy_use proxy27")
@@ -1080,6 +1205,48 @@ class ManagerApp:
         lines.append("提示：thread 内容由 Codex 保存在 proxy 机器的 ~/.codex/；manager 只保存 chat->(proxy, threadId) 路由。")
 
         await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/help reply")
+
+    async def cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message:
+            return
+        logger.info(f"cmd /approve chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve reply")
+            return
+        approval_id = (context.args[0] if context.args else "").strip()
+        if not approval_id:
+            await _tg_call(update.message.reply_text("usage: /approve <approval_id>"), timeout_s=15.0, what="/approve reply")
+            return
+        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="accept", chat_id=update.effective_chat.id)
+        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve reply")
+
+    async def cmd_approve_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message:
+            return
+        logger.info(f"cmd /approve_session chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve_session reply")
+            return
+        approval_id = (context.args[0] if context.args else "").strip()
+        if not approval_id:
+            await _tg_call(update.message.reply_text("usage: /approve_session <approval_id>"), timeout_s=15.0, what="/approve_session reply")
+            return
+        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="acceptForSession", chat_id=update.effective_chat.id)
+        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve_session reply")
+
+    async def cmd_decline(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message:
+            return
+        logger.info(f"cmd /decline chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/decline reply")
+            return
+        approval_id = (context.args[0] if context.args else "").strip()
+        if not approval_id:
+            await _tg_call(update.message.reply_text("usage: /decline <approval_id>"), timeout_s=15.0, what="/decline reply")
+            return
+        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="decline", chat_id=update.effective_chat.id)
+        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/decline reply")
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Telegram common entrypoint.
@@ -1609,6 +1776,7 @@ def main() -> int:
             return
 
         app = ManagerApp(
+            core=core,
             registry=registry,
             sessions=sessions,
             allowed_users=allowed_users,
@@ -1639,6 +1807,9 @@ def main() -> int:
                     tg.add_handler(CommandHandler("help", app.cmd_help))
                     tg.add_handler(CommandHandler("start", app.cmd_start))
                     tg.add_handler(CommandHandler("ping", app.cmd_ping))
+                    tg.add_handler(CommandHandler("approve", app.cmd_approve))
+                    tg.add_handler(CommandHandler("approve_session", app.cmd_approve_session))
+                    tg.add_handler(CommandHandler("decline", app.cmd_decline))
                     # Back-compat aliases.
                     tg.add_handler(CommandHandler("servers", app.cmd_proxy_list))
                     tg.add_handler(CommandHandler("use", app.cmd_proxy_use))

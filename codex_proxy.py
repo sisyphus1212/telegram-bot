@@ -147,7 +147,51 @@ class CodexProxyAgent:
         self.cwd = cwd
         self.sandbox = sandbox
         self.approval_policy = approval_policy
-        self.app = CodexAppServerStdioProcess(CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd))
+        self._approval_waiters: dict[str, asyncio.Future[str]] = {}
+        self._ws: Any | None = None
+        self._ws_send_lock: asyncio.Lock | None = None
+        self._current_task_id: str = ""
+        self._current_trace_id: str = ""
+
+        async def _on_approval(req: JsonDict) -> str:
+            # Forward approval request to manager and wait for TG user decision.
+            approval_id = uuid.uuid4().hex
+            fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            self._approval_waiters[approval_id] = fut
+            try:
+                ws = self._ws
+                send_lock = self._ws_send_lock
+                if ws is None or send_lock is None:
+                    return "decline"
+                msg = {
+                    "type": "approval_request",
+                    "approval_id": approval_id,
+                    "proxy_id": self.proxy_id,
+                    "task_id": self._current_task_id,
+                    "trace_id": self._current_trace_id,
+                    "rpc_id": req.get("id"),
+                    "method": req.get("method"),
+                    "params": req.get("params") or {},
+                }
+                logger.info(_kv(op="approval.forward", proxy_id=self.proxy_id, approval_id=approval_id, task_id=self._current_task_id or None, trace_id=self._current_trace_id or None, method=req.get("method")))
+                async with send_lock:
+                    await ws.send(_json_dumps(msg))
+                # Wait for decision (default decline on timeout).
+                decision = await asyncio.wait_for(fut, timeout=300.0)
+                decision = (decision or "decline").strip()
+                logger.info(_kv(op="approval.decision", proxy_id=self.proxy_id, approval_id=approval_id, decision=decision))
+                return decision
+            except asyncio.TimeoutError:
+                logger.info(_kv(op="approval.timeout", proxy_id=self.proxy_id, approval_id=approval_id))
+                return "decline"
+            finally:
+                self._approval_waiters.pop(approval_id, None)
+
+        self.app = CodexAppServerStdioProcess(
+            CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd),
+            on_log=lambda s: logger.info(_kv(op="appserver.log", proxy_id=self.proxy_id, msg=s[:500])),
+            on_approval_request=_on_approval,
+        )
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._resumed_threads: set[str] = set()
         self._busy = asyncio.Lock()  # single execution loop (proxy feeds Codex sequentially)
@@ -168,6 +212,8 @@ class CodexProxyAgent:
             }
 
         async with self._busy:
+            self._current_task_id = task_id
+            self._current_trace_id = trace_id
             t0 = time.time()
             logger.info(
                 _kv(
@@ -242,6 +288,9 @@ class CodexProxyAgent:
                     )
                 )
                 return {"type": "task_result", "trace_id": trace_id, "task_id": task_id, "ok": False, "error": err}
+            finally:
+                self._current_task_id = ""
+                self._current_trace_id = ""
 
     async def run_forever(self) -> None:
         try:
@@ -254,6 +303,8 @@ class CodexProxyAgent:
                 try:
                     async with websockets.connect(self.manager_ws, ping_interval=20, ping_timeout=20, max_size=8 * 1024 * 1024) as ws:
                         send_lock = asyncio.Lock()
+                        self._ws = ws
+                        self._ws_send_lock = send_lock
                         exec_queue: asyncio.Queue[JsonDict] = asyncio.Queue()
                         pending_count = 0
 
@@ -328,6 +379,13 @@ class CodexProxyAgent:
                                 if not isinstance(msg, dict):
                                     continue
                                 mtype = msg.get("type")
+                                if mtype == "approval_decision":
+                                    approval_id = str(msg.get("approval_id") or "")
+                                    decision = str(msg.get("decision") or "decline")
+                                    fut = self._approval_waiters.get(approval_id)
+                                    if fut and not fut.done():
+                                        fut.set_result(decision)
+                                    continue
                                 if mtype == "appserver_request":
                                     req_id = str(msg.get("req_id") or "")
                                     trace_id = str(msg.get("trace_id") or "") or uuid.uuid4().hex
@@ -426,6 +484,8 @@ class CodexProxyAgent:
                         finally:
                             stop_hb.set()
                             stop_exec.set()
+                            self._ws = None
+                            self._ws_send_lock = None
                             hb_task.cancel()
                             exec_task.cancel()
                             await asyncio.gather(hb_task, return_exceptions=True)
