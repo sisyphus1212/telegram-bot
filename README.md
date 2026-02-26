@@ -13,8 +13,6 @@
 
 - [ARCHITECTURE.md](/root/telegram-bot/ARCHITECTURE.md) - 架构与协议说明
 - `codex_manager.py` - Manager（Telegram + WS registry + task dispatch）
-- `telegram_bot.py` - 兼容入口（直接调用 `codex_manager.py`）
-- `bot.py` - 兼容入口（直接调用 `codex_manager.py`，旧名字）
 - `codex_proxy.py` - Proxy（WS client，内部使用本机 `codex app-server`）
 - `codex_stdio_client.py` - Proxy 使用的 stdio JSON-RPC 客户端
 - `codex_proxy_probe.py` - 自检脚本（验证本机 `codex app-server` 链路）
@@ -22,7 +20,6 @@
 - `scripts/verify_phase2_ws.sh` - 阶段 2：manager<->proxy WS 一键验证（需要开启 manager control server）
 - `scripts/verify_phase2_appserver_rpc.sh` - 阶段 2：manager<->proxy app-server RPC 透传验证（需要开启 control server）
 - `docs/verify_phase3_tg.md` - 阶段 3：TG 端到端验证说明
-- `codex_app_server_client.py` / `codex_app_server_probe.py` - 历史兼容文件（转到新实现）
 - `manager_config.example.json` - manager 配置示例（复制为 `manager_config.json` 后填写；不要提交真实 token）
 - `requirements.txt` - Python 依赖
 - `scripts/install.sh` - 创建 venv 并安装依赖
@@ -31,8 +28,6 @@
 - `systemd/codex-manager.service` - systemd: manager 服务文件
 - `systemd/codex-manager.env.example` - systemd: manager 环境变量示例
 - `systemd/codex-proxy.service` - systemd: proxy 服务文件
-- `systemd/telegram-bot.service` - legacy: 旧服务名（仍可用，实际启动 manager）
-- `systemd/telegram-bot.env.example` - legacy: 旧 env 示例（仍可用）
 - `log/manager.log` - 运行日志（运行后生成）
 - `sessions.json` - 会话存储文件（运行后生成）
   - v2 会保存 chat -> proxy 以及 per-proxy 的 current threadId

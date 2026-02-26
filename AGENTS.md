@@ -29,10 +29,6 @@
 - `systemd/`：systemd unit 与 env 示例
 - `scripts/`：启动脚本（使用本 repo 的 `.venv`）
 
-兼容入口（尽量少改）：
-
-- `bot.py` / `telegram_bot.py`：旧入口名，内部转到 `codex_manager.py`
-
 ## 4. 配置约定
 
 ### 4.1 Manager（Telegram + WS）
