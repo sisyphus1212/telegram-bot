@@ -249,6 +249,12 @@ class CodexAppServerStdioProcess:
                 params = msg.get("params") or {}
 
                 if method == "error":
+                    # Some codex versions emit transient errors with `willRetry=true`, e.g.
+                    # {"message":"Reconnecting... 1/5", "willRetry":true, ...}
+                    # Treat these as progress notifications; only fail on non-retriable errors.
+                    if isinstance(params, dict) and bool(params.get("willRetry")):
+                        self._log(f"[app-server] transient error (willRetry=true): {str(params)[:500]}")
+                        continue
                     raise CodexAppServerError(str(params))
 
                 if method == "item/completed":
