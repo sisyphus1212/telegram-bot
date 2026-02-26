@@ -482,42 +482,59 @@ class ManagerApp:
             "reset_thread": reset_thread,
         }
 
-        try:
-            logger.info(f"dispatch start proxy={proxy_id} task_id={task_id} reset={reset_thread}")
-            res = await self.registry.dispatch(proxy_id=proxy_id, task_msg=task_msg, timeout_s=self.task_timeout_s)
-            logger.info(f"dispatch done proxy={proxy_id} task_id={task_id} ok={bool(isinstance(res, dict) and res.get('ok'))}")
-        except Exception as e:
+        # Do not block Telegram's update processing on slow/failed proxies.
+        # PTB defaults to sequential update handling; a single hung task would make the bot appear "no response".
+        bot = context.bot
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        placeholder_id = placeholder.message_id
+        if chat_id is None:
+            return
+
+        async def _work() -> None:
             try:
-                await _tg_call(placeholder.edit_text(f"error: {e}"), timeout_s=15.0, what="edit error")
-            except Exception as ee:
-                logger.warning(f"telegram edit_text failed: {type(ee).__name__}: {ee}")
-            return
+                logger.info(f"dispatch start proxy={proxy_id} task_id={task_id} reset={reset_thread}")
+                res = await self.registry.dispatch(proxy_id=proxy_id, task_msg=task_msg, timeout_s=self.task_timeout_s)
+                logger.info(f"dispatch done proxy={proxy_id} task_id={task_id} ok={bool(isinstance(res, dict) and res.get('ok'))}")
+            except Exception as e:
+                try:
+                    await _tg_call(
+                        bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text=f"error: {e}"),
+                        timeout_s=15.0,
+                        what="edit error",
+                    )
+                except Exception as ee:
+                    logger.warning(f"telegram edit_message_text failed: {type(ee).__name__}: {ee}")
+                return
 
-        if not isinstance(res, dict) or res.get("type") != "task_result":
-            await _tg_call(placeholder.edit_text("error: bad task_result"), timeout_s=15.0, what="edit bad_task_result")
-            return
+            if not isinstance(res, dict) or res.get("type") != "task_result":
+                await _tg_call(
+                    bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text="error: bad task_result"),
+                    timeout_s=15.0,
+                    what="edit bad_task_result",
+                )
+                return
 
-        if not res.get("ok"):
-            logger.info(f"task_result not ok proxy={proxy_id} task_id={task_id} res={res}")
-            err = res.get("error") or "unknown error"
-            try:
-                await _tg_call(placeholder.edit_text(f"error: {err}"), timeout_s=15.0, what="edit task_error")
-            except Exception as ee:
-                logger.warning(f"telegram edit_text failed: {type(ee).__name__}: {ee}")
-                await _tg_call(update.message.reply_text(f"error: {err}"), timeout_s=15.0, what="reply task_error")
-            return
+            if not res.get("ok"):
+                logger.info(f"task_result not ok proxy={proxy_id} task_id={task_id} res={res}")
+                err = res.get("error") or "unknown error"
+                await _tg_call(
+                    bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text=f"error: {err}"),
+                    timeout_s=15.0,
+                    what="edit task_error",
+                )
+                return
 
-        text = str(res.get("text") or "").strip()
-        if not text:
-            text = "(empty)"
-        parts = _split_telegram_text(text)
-        try:
-            await _tg_call(placeholder.edit_text(parts[0]), timeout_s=15.0, what="edit result")
-        except Exception as ee:
-            logger.warning(f"telegram edit_text failed: {type(ee).__name__}: {ee}")
-            await _tg_call(update.message.reply_text(parts[0]), timeout_s=15.0, what="reply result")
-        for extra in parts[1:]:
-            await _tg_call(update.message.reply_text(extra), timeout_s=15.0, what="reply extra")
+            text = str(res.get("text") or "").strip() or "(empty)"
+            parts = _split_telegram_text(text)
+            await _tg_call(
+                bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text=parts[0]),
+                timeout_s=15.0,
+                what="edit result",
+            )
+            for extra in parts[1:]:
+                await _tg_call(bot.send_message(chat_id=chat_id, text=extra), timeout_s=15.0, what="reply extra")
+
+        asyncio.create_task(_work(), name=f"tg_task:{proxy_id}:{task_id}")
 
 
 def main() -> int:
