@@ -23,6 +23,7 @@
 - `scripts/verify_phase2_appserver_rpc.sh` - 阶段 2：manager<->proxy app-server RPC 透传验证（需要开启 control server）
 - `docs/verify_phase3_tg.md` - 阶段 3：TG 端到端验证说明
 - `codex_app_server_client.py` / `codex_app_server_probe.py` - 历史兼容文件（转到新实现）
+- `manager_config.example.json` - manager 配置示例（复制为 `manager_config.json` 后填写；不要提交真实 token）
 - `requirements.txt` - Python 依赖
 - `scripts/install.sh` - 创建 venv 并安装依赖
 - `scripts/run.sh` - 使用 venv 启动 manager
@@ -53,9 +54,9 @@
 
 ### 2. 配置（Manager）
 
-Manager 的 Telegram token 推荐放 `codex_config.json`（不要提交，已在 `.gitignore`），也可以用环境变量 `TELEGRAM_BOT_TOKEN` 覆盖。
+Manager 的 Telegram token 推荐放 `manager_config.json`（不要提交，已在 `.gitignore`），也可以用环境变量 `TELEGRAM_BOT_TOKEN` 覆盖。
 
-最小 `codex_config.json` 示例（只需要 Telegram token + WS 监听地址即可）：
+最小 `manager_config.json` 示例（只需要 Telegram token + WS 监听地址即可）：
 
 ```json
 {
@@ -67,6 +68,9 @@ Manager 的 Telegram token 推荐放 `codex_config.json`（不要提交，已在
 
 本项目会在 `sessions.json` 中保存每个聊天选择的 `proxy_id` 以及 per-proxy 的 `current_thread_id`。
 
+兼容说明：
+- 老版本使用 `codex_config.json` 作为 manager 配置文件名。当前仍会读取它（如果 `manager_config.json` 不存在），但会在日志里提示迁移。
+
 推荐用环境变量（systemd 也会用）：
 
 - `TELEGRAM_BOT_TOKEN`: Telegram Bot token
@@ -77,7 +81,7 @@ Manager 的 Telegram token 推荐放 `codex_config.json`（不要提交，已在
 - `CODEX_MANAGER_CONTROL_LISTEN`: 可选，本地 control server 监听地址（用于阶段 2 验证，例如 `127.0.0.1:18766`）
 - `CODEX_MANAGER_CONTROL_TOKEN`: 可选，control server 必需 token（用于阶段 2 验证）
 
-也可以在 `codex_config.json` 里显式配置 Telegram 代理（优先级低于 `TELEGRAM_PROXY`）：
+也可以在 `manager_config.json` 里显式配置 Telegram 代理（优先级低于 `TELEGRAM_PROXY`）：
 
 ```json
 {
@@ -89,7 +93,7 @@ Manager 的 Telegram token 推荐放 `codex_config.json`（不要提交，已在
 
 - `TELEGRAM_ALLOWED_USER_IDS`: 允许使用的 Telegram user id 列表(逗号分隔)，为空表示不限制
 
-Proxy allowlist（可选，后续要收紧安全建议开启）也写在 `codex_config.json`：
+Proxy allowlist（可选，后续要收紧安全建议开启）也写在 `manager_config.json`：
 
 ```json
 {
@@ -252,7 +256,7 @@ sudo journalctl -u codex-proxy.service -f
 1. Telegram 收不到消息：
    - 看 `journalctl -u codex-manager.service -f`
    - 很多环境需要设置 `TELEGRAM_PROXY`
-   - 为了避免被系统 `HTTP_PROXY/HTTPS_PROXY` 环境变量干扰，本项目默认 `trust_env=false`，不会自动继承系统代理；需要的话请显式配置 `TELEGRAM_PROXY` 或 `codex_config.json` 的 `telegram_proxy`
+   - 为了避免被系统 `HTTP_PROXY/HTTPS_PROXY` 环境变量干扰，本项目默认 `trust_env=false`，不会自动继承系统代理；需要的话请显式配置 `TELEGRAM_PROXY` 或 `manager_config.json` 的 `telegram_proxy`
 2. Manager 看不到在线 proxy：
    - 看 `journalctl -u codex-proxy.service -f`
    - 确认 `CODEX_MANAGER_WS` 可达、端口放通

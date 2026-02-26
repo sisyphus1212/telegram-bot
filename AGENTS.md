@@ -15,7 +15,7 @@
 
 - 不要使用 opencode/opencode-server（弃用方案）。
 - 不要在日志里输出 Telegram bot token（token 在 URL 路径中，尤其要避免 httpx 的 INFO 请求日志）。
-- `codex_config.json`、`proxy_config.json` 均为本地机密配置文件：不提交到 Git（已在 `.gitignore`）。
+- `manager_config.json`、`proxy_config.json` 均为本地机密配置文件：不提交到 Git（已在 `.gitignore`）。
 
 ## 3. 项目结构（你会经常碰到的文件）
 
@@ -24,7 +24,8 @@
 - `codex_stdio_client.py`：Proxy 侧 stdio JSON-RPC 客户端（驱动 `codex app-server --listen stdio://`）
 - `sessions.json`：Manager 保存每个 Telegram 会话的路由状态（运行后生成，gitignored）
 - `sessions.json`：Manager 保存每个 Telegram 会话的路由元数据（chat -> proxy + per-proxy threadId），而 thread 内容由 Codex 自己持久化在 `~/.codex/`。
-- `codex_config.json`：Manager 配置（运行时读取，gitignored）
+- `manager_config.json`：Manager 配置（运行时读取，gitignored）
+  - 兼容：若 `manager_config.json` 不存在，会回退读取旧文件名 `codex_config.json`
 - `proxy_config.json`：Proxy 配置（运行时读取，gitignored）
 - `systemd/`：systemd unit 与 env 示例
 - `scripts/`：启动脚本（使用本 repo 的 `.venv`）
@@ -37,7 +38,7 @@
 
 ### 4.1 Manager（Telegram + WS）
 
-优先从 `codex_config.json` 读取（也支持环境变量覆盖），常用键：
+优先从 `manager_config.json` 读取（也支持环境变量覆盖），常用键：
 
 - `telegram_bot_token`：Telegram bot token
 - `manager_ws_listen`：WS 监听地址，例如 `0.0.0.0:8765`

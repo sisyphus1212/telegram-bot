@@ -18,7 +18,10 @@ venv/
 # Session data (user specific)
 sessions.json
 
-# Codex bot config (contains Telegram bot token)
+# Manager config (contains Telegram bot token)
+manager_config.json
+
+# Legacy manager config filename (deprecated; migrate to manager_config.json)
 codex_config.json
 
 # Local proxy config (contains machine-specific endpoints/tokens)

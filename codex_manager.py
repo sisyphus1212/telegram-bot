@@ -27,8 +27,14 @@ LOG_DIR = BASE_DIR / "log"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "manager.log"
 SESSIONS_FILE = BASE_DIR / "sessions.json"
-CONFIG_FILE = BASE_DIR / "codex_config.json"
-LEGACY_CONFIG_FILE = BASE_DIR / "opencode_config.json"
+CONFIG_FILE = BASE_DIR / "manager_config.json"
+# Backward compatibility:
+# - codex_config.json: old manager config filename (historically used in this repo)
+# - opencode_config.json: older legacy filename
+LEGACY_CONFIG_FILES = [
+    BASE_DIR / "codex_config.json",
+    BASE_DIR / "opencode_config.json",
+]
 
 
 def setup_logging() -> logging.Logger:
@@ -87,10 +93,22 @@ async def _tg_call(coro, *, timeout_s: float, what: str, retries: int = 3) -> An
 
 
 def _load_config() -> dict:
-    cfg_path = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
-    if not cfg_path.exists():
+    cfg_path = None
+    if CONFIG_FILE.exists():
+        cfg_path = CONFIG_FILE
+    else:
+        for p in LEGACY_CONFIG_FILES:
+            if p.exists():
+                cfg_path = p
+                break
+    if cfg_path is None:
         return {}
     try:
+        if cfg_path != CONFIG_FILE:
+            logger.warning(
+                f"Using legacy manager config file {cfg_path.name}. "
+                f"Please migrate to {CONFIG_FILE.name} to avoid mixing proxy/manager configs."
+            )
         with open(cfg_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
@@ -1618,7 +1636,7 @@ def main() -> int:
                 tg = None
                 try:
                     # 只使用显式配置的 Telegram 代理，避免被系统 HTTP(S)_PROXY 环境变量“误伤”。
-                    # 如需代理：在 codex_config.json 里配置 telegram_proxy，或设置 TELEGRAM_PROXY。
+                    # 如需代理：在 manager_config.json 里配置 telegram_proxy，或设置 TELEGRAM_PROXY。
                     proxy = (os.environ.get("TELEGRAM_PROXY") or str(cfg.get("telegram_proxy") or cfg.get("telegram_http_proxy") or "")).strip() or None
                     req = HTTPXRequest(
                         connect_timeout=20.0,
