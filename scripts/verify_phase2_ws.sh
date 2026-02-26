@@ -77,6 +77,7 @@ def rpc(req: dict) -> dict:
     buf=b""
     # Control 端会同步等待 codex 返回，所以这里要等到 timeout_s + buffer。
     wait_s = timeout + 30.0
+    s.settimeout(wait_s)
     t0=time.time()
     while b"\n" not in buf:
       if (time.time() - t0) > wait_s:

@@ -55,6 +55,7 @@ def main() -> int:
 
     f_jsonl = None
     if jsonl_path:
+        Path(jsonl_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         f_jsonl = open(jsonl_path, "a", encoding="utf-8")
 
     try:
