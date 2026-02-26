@@ -156,6 +156,15 @@ python codex_proxy.py --config proxy_config.json
 - 如果当前目录存在 `proxy_config.json`，`codex_proxy.py` 即使不带 `--config` 也会自动读取它。
 - 优先级：命令行参数 > 环境变量 > JSON 配置 > 默认值。
 
+`proxy_config.example.json` 是一个 JSONC 模板（支持注释），里面已经写好了 `sandbox` / `approval_policy` 的“注释开关”示例：
+
+- `sandbox`：
+  - 常用：`workspaceWrite`（允许在工作区写）
+  - 高危：`dangerFullAccess`（几乎全开）
+- `approval_policy`：
+  - `onRequest`：需要审批（当前实现默认自动 `decline`，所以很多命令会失败）
+  - `never`：不走审批（高危，但能避免“权限确认导致失败”）
+
 ### 6. 阶段化验证（强烈建议按顺序）
 
 阶段 1：proxy 本机 codex（每台 proxy 机器都要做）

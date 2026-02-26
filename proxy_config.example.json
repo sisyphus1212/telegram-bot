@@ -1,10 +1,28 @@
 {
+  // ===========================
+  // Codex Proxy 配置模板（JSONC）
+  // 说明：
+  // - 本文件支持 // 与 /* */ 注释（codex_proxy.py 会自动剥离注释后再解析 JSON）。
+  // - “通过注释开关”：把你不想用的那行注释掉即可。
+  // ===========================
+  //
   "manager_ws": "ws://MANAGER_IP:8765",
   "proxy_id": "proxy1",
   "proxy_token": "",
   "max_pending": 10,
+  // sandbox：控制文件系统/命令能力
+  // 常用：workspaceWrite（允许在工作区写）
   "sandbox": "workspaceWrite",
+  // 高危：dangerFullAccess（几乎全开）
+  // "sandbox": "dangerFullAccess",
+  //
+  // approval_policy：控制是否触发“审批”
+  // onRequest：需要审批（但我们当前客户端默认会自动 decline，所以很多命令会失败）
+  // "approval_policy": "onRequest",
+  //
+  // never：不走审批（高危，但能避免“权限确认导致失败”）
   "approval_policy": "unlessTrusted",
+  // "approval_policy": "never",
   "codex_cwd": "/root/telegram-bot",
   "codex_bin": "codex",
   "http_proxy": "http://127.0.0.1:8080",

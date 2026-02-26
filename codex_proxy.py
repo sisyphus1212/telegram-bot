@@ -36,6 +36,9 @@ def _kv(**items: object) -> str:
 def _load_json(path: Path) -> JsonDict:
     try:
         raw = path.read_text("utf-8")
+        # Allow JSON-with-comments (JSONC) in config files for operator convenience.
+        # This lets us ship a single template with "toggle by comment" examples.
+        raw = _strip_jsonc_comments(raw)
         obj = json.loads(raw)
         return obj if isinstance(obj, dict) else {}
     except FileNotFoundError:
@@ -47,6 +50,52 @@ def _load_json(path: Path) -> JsonDict:
 def _cfg_get_str(cfg: JsonDict, key: str) -> str:
     v = cfg.get(key)
     return v.strip() if isinstance(v, str) else ""
+
+def _strip_jsonc_comments(s: str) -> str:
+    # Minimal JSONC stripper supporting:
+    # - // line comments
+    # - /* block comments */
+    # while preserving content inside string literals.
+    out: list[str] = []
+    i = 0
+    in_str = False
+    esc = False
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt == "/":
+                i += 2
+                while i < len(s) and s[i] not in "\r\n":
+                    i += 1
+                continue
+            if nxt == "*":
+                i += 2
+                while i + 1 < len(s) and not (s[i] == "*" and s[i + 1] == "/"):
+                    i += 1
+                i = i + 2 if i + 1 < len(s) else len(s)
+                continue
+
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _maybe_set_env(name: str, value: str) -> None:

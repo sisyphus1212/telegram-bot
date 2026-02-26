@@ -53,6 +53,7 @@ systemd 推荐：
 Proxy 推荐使用 JSON（便于记忆和迁移）：
 
 - `proxy_config.json`（本目录）或通过 `--config /path/to.json`
+  - 支持 JSONC（可写 `//` 与 `/* */` 注释），便于在一个模板里用“注释开关”切换 `sandbox/approval_policy`
 
 关键字段：
 
