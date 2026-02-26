@@ -196,7 +196,7 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 
 1. `/proxy_list` 查看在线 proxy（旧命令 `/servers` 仍可用）
 2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 proxy）
-3. `/proxy_use <proxy_id>` 选择一台机器（也支持 `/proxy_use proxyId=<proxy_id>`；旧命令 `/use <proxy_id>` 仍可用）
+3. `/proxy_use <proxy_id>` 选择一台机器（旧命令 `/use <proxy_id>` 仍可用）
 4. 直接发一条消息，例如 `ping`
 5. 预期会看到占位 `working...`，随后被编辑成 `[{proxy_id}] ...` 的结果或错误
 

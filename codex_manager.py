@@ -999,8 +999,9 @@ class ManagerApp:
             await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/proxy_use reply")
             return
         sk = _session_key(update)
-        kv = self._parse_kv(context.args or [])
-        proxy_id = (kv.get("proxyId") or (context.args[0] if context.args else "")).strip()
+        # Keep /proxy_use strict: only accept a single positional proxy id.
+        # (No proxyId=... form; avoid redundant syntax.)
+        proxy_id = (context.args[0] if context.args else "").strip()
         if not proxy_id:
             await _tg_call(update.message.reply_text("usage: /proxy_use <id>"), timeout_s=15.0, what="/proxy_use reply")
             return
@@ -1043,7 +1044,7 @@ class ManagerApp:
         lines.append("")
         lines.append("1) 选择机器（proxy）")
         lines.append("- /proxy_list  查看在线机器（旧命令: /servers）")
-        lines.append("- /proxy_use <id>  选择机器（也支持: /proxy_use proxyId=<id>；旧命令: /use <id>）")
+        lines.append("- /proxy_use <id>  选择机器（旧命令: /use <id>）")
         lines.append("- /proxy_current  查看当前选择")
         lines.append("")
         lines.append("2) 日常对话（turn）")
