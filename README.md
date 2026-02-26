@@ -116,6 +116,10 @@ Proxy 运行在被控机器上，至少需要：
 
 - `PROXY_TOKEN`：与 allowlist 配合使用的 token（dev 模式可空）
 - `PROXY_MAX_PENDING`：proxy 在 Codex 回答前允许挂起的最大任务数（默认 `10`）。超过会立刻回 `proxy queue full`。
+- `CODEX_SANDBOX`：Codex sandbox（默认 `workspace-write`）。需要执行更高权限操作时可考虑 `danger-full-access`（风险极高）。
+- `CODEX_APPROVAL_POLICY`：审批策略（默认 `on-request`）。如果你不希望出现“权限确认导致命令失败”，可设为 `never`（风险极高）。
+
+> 说明：本项目的 `codex_stdio_client.py` 默认会对 app-server 的 `requestApproval` 请求返回 `decline`。因此当 `approval_policy=on-request` 时，某些命令/改文件会被 Codex 请求确认但被我们拒绝，从而表现为“权限问题”。要避免这一类失败，通常做法是把 `approval_policy` 设为 `never`，让 app-server 不再发起审批请求。
 
 ### 4. 自检
 

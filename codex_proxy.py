@@ -62,11 +62,23 @@ def _json_dumps(obj: Any) -> str:
 
 
 class CodexProxyAgent:
-    def __init__(self, proxy_id: str, token: str, manager_ws: str, codex_bin: str, cwd: str) -> None:
+    def __init__(
+        self,
+        proxy_id: str,
+        token: str,
+        manager_ws: str,
+        codex_bin: str,
+        cwd: str,
+        *,
+        sandbox: str,
+        approval_policy: str,
+    ) -> None:
         self.proxy_id = proxy_id
         self.token = token
         self.manager_ws = manager_ws
         self.cwd = cwd
+        self.sandbox = sandbox
+        self.approval_policy = approval_policy
         self.app = CodexAppServerStdioProcess(CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd))
         self._thread_ids: dict[str, str] = {}  # thread_key -> thread_id
         self._thread_locks: dict[str, asyncio.Lock] = {}
@@ -81,8 +93,8 @@ class CodexProxyAgent:
             return tid
         tid = await self.app.thread_start(
             cwd=self.cwd,
-            sandbox="workspace-write",
-            approval_policy="on-request",
+            sandbox=self.sandbox,
+            approval_policy=self.approval_policy,
             personality="pragmatic",
             base_instructions=None,
         )
@@ -190,7 +202,7 @@ class CodexProxyAgent:
                             err = rep.get("error") if isinstance(rep, dict) else "bad reply"
                             raise RuntimeError(f"register failed: {err}")
 
-                        logger.info(_kv(op="register.ok", proxy_id=self.proxy_id, manager_ws=self.manager_ws))
+                        logger.info(_kv(op="register.ok", proxy_id=self.proxy_id, manager_ws=self.manager_ws, sandbox=self.sandbox, approval_policy=self.approval_policy))
                         backoff_s = 0.5
                         stop_hb = asyncio.Event()
                         stop_exec = asyncio.Event()
@@ -330,6 +342,8 @@ def main() -> int:
     ap.add_argument("--token", default="", help="override proxy token")
     ap.add_argument("--codex-bin", default="", help="override codex bin")
     ap.add_argument("--cwd", default="", help="override codex cwd")
+    ap.add_argument("--sandbox", default="", help="override codex sandbox (e.g. workspace-write / danger-full-access)")
+    ap.add_argument("--approval-policy", default="", help="override approval policy (e.g. on-request / never)")
     args = ap.parse_args()
 
     cfg_path = Path(args.config) if args.config else (BASE_DIR / "proxy_config.json" if (BASE_DIR / "proxy_config.json").exists() else None)
@@ -346,6 +360,8 @@ def main() -> int:
     codex_bin = args.codex_bin or os.environ.get("CODEX_BIN") or _cfg_get_str(cfg, "codex_bin") or "codex"
     cwd = args.cwd or os.environ.get("CODEX_CWD") or _cfg_get_str(cfg, "codex_cwd") or str(BASE_DIR)
     max_pending = int(os.environ.get("PROXY_MAX_PENDING") or str(cfg.get("max_pending") or 10))
+    sandbox = args.sandbox or os.environ.get("CODEX_SANDBOX") or _cfg_get_str(cfg, "sandbox") or "workspace-write"
+    approval_policy = args.approval_policy or os.environ.get("CODEX_APPROVAL_POLICY") or _cfg_get_str(cfg, "approval_policy") or "on-request"
 
     if not proxy_id:
         raise SystemExit("missing PROXY_ID / --proxy-id")
@@ -357,6 +373,8 @@ def main() -> int:
         manager_ws=manager_ws,
         codex_bin=codex_bin,
         cwd=cwd,
+        sandbox=sandbox,
+        approval_policy=approval_policy,
     )
     agent.max_pending = max(1, max_pending)
     try:

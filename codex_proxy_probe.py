@@ -21,12 +21,12 @@ def _kv(**items: object) -> str:
     return " ".join(parts)
 
 
-async def _run(prompt: str, cwd: str, codex_bin: str, *, timeout_s: float) -> dict:
+async def _run(prompt: str, cwd: str, codex_bin: str, *, timeout_s: float, sandbox: str, approval_policy: str) -> dict:
     app = CodexAppServerStdioProcess(CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd))
     try:
         await app.start()
         await app.ensure_started_and_initialized(client_name="codex_proxy_probe", version="0.0")
-        tid = await app.thread_start(cwd=cwd, sandbox="workspace-write", approval_policy="on-request", personality="pragmatic")
+        tid = await app.thread_start(cwd=cwd, sandbox=sandbox, approval_policy=approval_policy, personality="pragmatic")
         turn_id = await app.turn_start_text(thread_id=tid, text=prompt)
         text = await app.run_turn_and_collect_agent_message(thread_id=tid, turn_id=turn_id, timeout_s=float(timeout_s))
         return {"ok": True, "threadId": tid, "turnId": turn_id, "text": (text or "").strip()}
@@ -47,6 +47,8 @@ def main() -> int:
     ap.add_argument("--interval-ms", type=int, default=0, help="sleep between runs")
     ap.add_argument("--jsonl", default="", help="optional jsonl output path (one line per run)")
     ap.add_argument("--json", action="store_true", help="print single-run JSON result (for backward compatibility)")
+    ap.add_argument("--sandbox", default=os.environ.get("CODEX_SANDBOX") or "workspace-write")
+    ap.add_argument("--approval-policy", default=os.environ.get("CODEX_APPROVAL_POLICY") or "on-request")
     args = ap.parse_args()
 
     repeat = max(1, int(args.repeat))
@@ -69,7 +71,16 @@ def main() -> int:
             t0 = time.time()
             print(_kv(op="probe.start", trace_id=trace_id, i=i, repeat=repeat, timeout_s=timeout_s, prompt_len=len(args.prompt)))
             try:
-                out = asyncio.run(_run(args.prompt, cwd=args.cwd, codex_bin=args.codex_bin, timeout_s=timeout_s))
+                out = asyncio.run(
+                    _run(
+                        args.prompt,
+                        cwd=args.cwd,
+                        codex_bin=args.codex_bin,
+                        timeout_s=timeout_s,
+                        sandbox=str(args.sandbox),
+                        approval_policy=str(args.approval_policy),
+                    )
+                )
                 latency_ms = (time.time() - t0) * 1000.0
                 latencies.append(latency_ms)
                 ok = bool(out.get("ok"))
