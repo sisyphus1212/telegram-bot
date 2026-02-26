@@ -45,6 +45,18 @@ export PROMPT
 export REPEAT
 export TIMEOUT
 
+# Wait control server up (use bash /dev/tcp, no extra deps).
+host="${CONTROL_HOSTPORT%:*}"
+port="${CONTROL_HOSTPORT##*:}"
+for _ in $(seq 1 50); do
+  if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+    exec 3<&-
+    exec 3>&-
+    break
+  fi
+  sleep 0.1
+done
+
 python - <<'PY'
 import json, os, socket, sys, time
 
