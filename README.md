@@ -18,6 +18,9 @@
 - `codex_proxy.py` - Proxy（WS client，内部使用本机 `codex app-server`）
 - `codex_stdio_client.py` - Proxy 使用的 stdio JSON-RPC 客户端
 - `codex_proxy_probe.py` - 自检脚本（验证本机 `codex app-server` 链路）
+- `scripts/verify_phase1_probe.sh` - 阶段 1：proxy 本机 codex ping/pong 一键验证
+- `scripts/verify_phase2_ws.sh` - 阶段 2：manager<->proxy WS 一键验证（需要开启 manager control server）
+- `docs/verify_phase3_tg.md` - 阶段 3：TG 端到端验证说明
 - `codex_app_server_client.py` / `codex_app_server_probe.py` - 历史兼容文件（转到新实现）
 - `codex_config.example.json` - 配置示例（不要提交真实 token）
 - `requirements.txt` - Python 依赖
@@ -70,6 +73,8 @@ Manager 的 Telegram token 推荐放 `codex_config.json`（不要提交，已在
 - `CODEX_DEFAULT_PROXY`: 默认 proxy（可选）
 - `CODEX_TASK_TIMEOUT`: 单次任务超时秒数（可选）
 - `TELEGRAM_PROXY`: 如果你的环境需要代理访问 Telegram API（例如 `http://127.0.0.1:8080`）
+- `CODEX_MANAGER_CONTROL_LISTEN`: 可选，本地 control server 监听地址（用于阶段 2 验证，例如 `127.0.0.1:18766`）
+- `CODEX_MANAGER_CONTROL_TOKEN`: 可选，control server 必需 token（用于阶段 2 验证）
 
 也可以在 `codex_config.json` 里显式配置 Telegram 代理（优先级低于 `TELEGRAM_PROXY`）：
 
@@ -117,8 +122,7 @@ Proxy 运行在被控机器上，至少需要：
 先单独验证某台机器上的 `codex app-server` 链路是否正常：
 
 ```bash
-. .venv/bin/activate
-python codex_proxy_probe.py --prompt ping
+./scripts/verify_phase1_probe.sh --prompt ping --repeat 10 --timeout 60
 ```
 
 ### 5. 启动（前台）
@@ -145,7 +149,34 @@ python codex_proxy.py --config proxy_config.json
 - 如果当前目录存在 `proxy_config.json`，`codex_proxy.py` 即使不带 `--config` 也会自动读取它。
 - 优先级：命令行参数 > 环境变量 > JSON 配置 > 默认值。
 
-### 6. 验证链路
+### 6. 阶段化验证（强烈建议按顺序）
+
+阶段 1：proxy 本机 codex（每台 proxy 机器都要做）
+
+```bash
+./scripts/verify_phase1_probe.sh --prompt ping --repeat 10 --timeout 60 --jsonl log/probe_phase1.jsonl
+```
+
+阶段 2：manager<->proxy WS（不经过 Telegram）
+
+1. 在 manager 机器上启用 control server（建议只绑定 `127.0.0.1`）：
+
+```bash
+export CODEX_MANAGER_CONTROL_LISTEN=127.0.0.1:18766
+export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
+systemctl restart codex-manager.service
+```
+
+2. 在 manager 机器上对某个 proxy 做 WS 连通性验证（要求 proxy 已在线注册）：
+
+```bash
+export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
+scripts/verify_phase2_ws.sh proxy27
+```
+
+阶段 3：Telegram 端到端验证见 [docs/verify_phase3_tg.md](/root/telegram-bot/docs/verify_phase3_tg.md)。
+
+### 7. 验证链路（TG）
 
 在 Telegram 对话里：
 
@@ -155,7 +186,7 @@ python codex_proxy.py --config proxy_config.json
 4. 直接发一条消息，例如 `ping`
 5. 预期会看到占位 `working...`，随后被编辑成 `[{proxy_id}] ...` 的结果或错误
 
-### 7. 作为 Linux 服务（systemd）
+### 8. 作为 Linux 服务（systemd）
 
 Manager:
 
@@ -196,8 +227,11 @@ sudo journalctl -u codex-proxy.service -f
    - 确认 `CODEX_MANAGER_WS` 可达、端口放通
 3. Codex 没回复或超时：
    - 在 proxy 机器上跑 `codex --version`
-   - 先跑 `python codex_proxy_probe.py --prompt ping` 确认本机链路
-4. 安全：
+   - 先跑 `./scripts/verify_phase1_probe.sh --prompt ping --repeat 10` 确认本机链路
+4. 阶段 2 验证脚本报 control server 不可用：
+   - 确认 manager 启动时设置了 `CODEX_MANAGER_CONTROL_LISTEN` 和 `CODEX_MANAGER_CONTROL_TOKEN`
+   - 确认 `scripts/verify_phase2_ws.sh` 使用同一个 token
+5. 安全：
    - 真实接管 PC 前必须加 `TELEGRAM_ALLOWED_USER_IDS`，并启用 proxy allowlist + token 强校验
 
 ## 多机管理

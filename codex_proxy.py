@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,15 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("codex_proxy")
+
+def _kv(**items: object) -> str:
+    parts: list[str] = []
+    for k, v in items.items():
+        if v is None:
+            continue
+        s = str(v).replace("\n", "\\n")
+        parts.append(f"{k}={s}")
+    return " ".join(parts)
 
 def _load_json(path: Path) -> JsonDict:
     try:
@@ -80,14 +90,32 @@ class CodexProxyAgent:
         return tid
 
     async def _run_task(self, msg: JsonDict) -> JsonDict:
+        trace_id = str(msg.get("trace_id") or "") or uuid.uuid4().hex
         task_id = str(msg.get("task_id") or "")
         thread_key = str(msg.get("thread_key") or "")
         prompt = str(msg.get("prompt") or "")
         reset_thread = bool(msg.get("reset_thread", False))
         if not task_id or not thread_key:
-            return {"type": "task_result", "task_id": task_id or "?", "ok": False, "error": "missing task_id/thread_key"}
+            return {
+                "type": "task_result",
+                "trace_id": trace_id,
+                "task_id": task_id or "?",
+                "ok": False,
+                "error": "missing task_id/thread_key",
+            }
 
         async with self._busy:
+            t0 = time.time()
+            logger.info(
+                _kv(
+                    op="codex.turn.start",
+                    proxy_id=self.proxy_id,
+                    trace_id=trace_id,
+                    task_id=task_id,
+                    prompt_len=len(prompt),
+                    reset_thread=reset_thread,
+                )
+            )
             try:
                 await self.app.ensure_started_and_initialized(client_name=f"codex_proxy:{self.proxy_id}", version="0.0")
                 thread_id = await self._ensure_thread(thread_key=thread_key, reset=reset_thread)
@@ -98,11 +126,48 @@ class CodexProxyAgent:
                 async with lock:
                     turn_id = await self.app.turn_start_text(thread_id=thread_id, text=prompt)
                     text = await self.app.run_turn_and_collect_agent_message(thread_id=thread_id, turn_id=turn_id, timeout_s=120.0)
-                return {"type": "task_result", "task_id": task_id, "ok": True, "text": (text or "").strip()}
+                latency_ms = int((time.time() - t0) * 1000.0)
+                logger.info(
+                    _kv(
+                        op="codex.turn.done",
+                        proxy_id=self.proxy_id,
+                        trace_id=trace_id,
+                        task_id=task_id,
+                        ok=True,
+                        latency_ms=latency_ms,
+                        text_len=len((text or "").strip()),
+                    )
+                )
+                return {"type": "task_result", "trace_id": trace_id, "task_id": task_id, "ok": True, "text": (text or "").strip()}
             except CodexAppServerError as e:
-                return {"type": "task_result", "task_id": task_id, "ok": False, "error": str(e)}
+                latency_ms = int((time.time() - t0) * 1000.0)
+                logger.info(
+                    _kv(
+                        op="codex.turn.done",
+                        proxy_id=self.proxy_id,
+                        trace_id=trace_id,
+                        task_id=task_id,
+                        ok=False,
+                        latency_ms=latency_ms,
+                        error=str(e),
+                    )
+                )
+                return {"type": "task_result", "trace_id": trace_id, "task_id": task_id, "ok": False, "error": str(e)}
             except Exception as e:
-                return {"type": "task_result", "task_id": task_id, "ok": False, "error": f"{type(e).__name__}: {e}"}
+                err = f"{type(e).__name__}: {e}"
+                latency_ms = int((time.time() - t0) * 1000.0)
+                logger.info(
+                    _kv(
+                        op="codex.turn.done",
+                        proxy_id=self.proxy_id,
+                        trace_id=trace_id,
+                        task_id=task_id,
+                        ok=False,
+                        latency_ms=latency_ms,
+                        error=err,
+                    )
+                )
+                return {"type": "task_result", "trace_id": trace_id, "task_id": task_id, "ok": False, "error": err}
 
     async def run_forever(self) -> None:
         try:
@@ -125,7 +190,7 @@ class CodexProxyAgent:
                             err = rep.get("error") if isinstance(rep, dict) else "bad reply"
                             raise RuntimeError(f"register failed: {err}")
 
-                        logger.info(f"registered to manager as {self.proxy_id} ({self.manager_ws})")
+                        logger.info(_kv(op="register.ok", proxy_id=self.proxy_id, manager_ws=self.manager_ws))
                         backoff_s = 0.5
                         stop_hb = asyncio.Event()
                         stop_exec = asyncio.Event()
@@ -149,19 +214,27 @@ class CodexProxyAgent:
                                 try:
                                     out = await self._run_task(msg)
                                 except Exception as e:
+                                    trace_id = str(msg.get("trace_id") or "") or uuid.uuid4().hex
                                     task_id = str(msg.get("task_id") or "?")
-                                    out = {"type": "task_result", "task_id": task_id, "ok": False, "error": f"{type(e).__name__}: {e}"}
+                                    out = {
+                                        "type": "task_result",
+                                        "trace_id": trace_id,
+                                        "task_id": task_id,
+                                        "ok": False,
+                                        "error": f"{type(e).__name__}: {e}",
+                                    }
                                 try:
-                                    if out.get("ok"):
-                                        logger.info(
-                                            f"task_result sending proxy_id={self.proxy_id} "
-                                            f"task_id={out.get('task_id')!r} ok=True"
+                                    logger.info(
+                                        _kv(
+                                            op="ws.send",
+                                            proxy_id=self.proxy_id,
+                                            type="task_result",
+                                            trace_id=out.get("trace_id"),
+                                            task_id=out.get("task_id"),
+                                            ok=bool(out.get("ok")),
+                                            error=out.get("error") if not out.get("ok") else None,
                                         )
-                                    else:
-                                        logger.info(
-                                            f"task_result sending proxy_id={self.proxy_id} "
-                                            f"task_id={out.get('task_id')!r} ok=False error={out.get('error')!r}"
-                                        )
+                                    )
                                     async with send_lock:
                                         await ws.send(_json_dumps(out))
                                 except Exception:
@@ -183,11 +256,14 @@ class CodexProxyAgent:
                                 if msg.get("type") != "task_assign":
                                     continue
                                 task_id = msg.get("task_id")
-                                logger.info(f"task_assign received proxy_id={self.proxy_id} task_id={task_id!r}")
+                                trace_id = str(msg.get("trace_id") or "") or uuid.uuid4().hex
+                                msg["trace_id"] = trace_id
+                                logger.info(_kv(op="ws.recv", proxy_id=self.proxy_id, type="task_assign", trace_id=trace_id, task_id=task_id))
                                 if pending_count >= self.max_pending:
                                     # Refuse immediately so manager can show error quickly.
                                     out = {
                                         "type": "task_result",
+                                        "trace_id": trace_id,
                                         "task_id": str(task_id or "?"),
                                         "ok": False,
                                         "error": f"proxy queue full (max={self.max_pending})",
@@ -200,9 +276,10 @@ class CodexProxyAgent:
                                     continue
 
                                 pending_count += 1
+                                logger.info(_kv(op="exec.enqueue", proxy_id=self.proxy_id, trace_id=trace_id, task_id=task_id, pending=pending_count, max_pending=self.max_pending))
                                 try:
                                     async with send_lock:
-                                        await ws.send(_json_dumps({"type": "task_ack", "task_id": task_id}))
+                                        await ws.send(_json_dumps({"type": "task_ack", "trace_id": trace_id, "task_id": task_id}))
                                 except Exception:
                                     pending_count = max(0, pending_count - 1)
                                     continue
@@ -214,6 +291,7 @@ class CodexProxyAgent:
                                     pending_count = max(0, pending_count - 1)
                                     out = {
                                         "type": "task_result",
+                                        "trace_id": trace_id,
                                         "task_id": str(task_id or "?"),
                                         "ok": False,
                                         "error": "proxy enqueue failed",
