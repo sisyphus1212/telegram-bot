@@ -68,9 +68,6 @@ Manager 的 Telegram token 推荐放 `manager_config.json`（不要提交，已�
 
 本项目会在 `sessions.json` 中保存每个聊天选择的 `proxy_id` 以及 per-proxy 的 `current_thread_id`。
 
-兼容说明：
-- 老版本使用 `codex_config.json` 作为 manager 配置文件名。当前仍会读取它（如果 `manager_config.json` 不存在），但会在日志里提示迁移。
-
 推荐用环境变量（systemd 也会用）：
 
 - `TELEGRAM_BOT_TOKEN`: Telegram Bot token
@@ -256,7 +253,7 @@ sudo journalctl -u codex-proxy.service -f
 1. Telegram 收不到消息：
    - 看 `journalctl -u codex-manager.service -f`
    - 很多环境需要设置 `TELEGRAM_PROXY`
-   - 为了避免被系统 `HTTP_PROXY/HTTPS_PROXY` 环境变量干扰，本项目默认 `trust_env=false`，不会自动继承系统代理；需要的话请显式配置 `TELEGRAM_PROXY` 或 `manager_config.json` 的 `telegram_proxy`
+   - 代理策略：优先使用 `TELEGRAM_PROXY` 或 `manager_config.json` 的 `telegram_proxy`；若未显式配置，则会继承系统 `HTTP_PROXY/HTTPS_PROXY`
 2. Manager 看不到在线 proxy：
    - 看 `journalctl -u codex-proxy.service -f`
    - 确认 `CODEX_MANAGER_WS` 可达、端口放通

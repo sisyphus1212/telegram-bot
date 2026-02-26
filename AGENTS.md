@@ -25,7 +25,6 @@
 - `sessions.json`：Manager 保存每个 Telegram 会话的路由状态（运行后生成，gitignored）
 - `sessions.json`：Manager 保存每个 Telegram 会话的路由元数据（chat -> proxy + per-proxy threadId），而 thread 内容由 Codex 自己持久化在 `~/.codex/`。
 - `manager_config.json`：Manager 配置（运行时读取，gitignored）
-  - 兼容：若 `manager_config.json` 不存在，会回退读取旧文件名 `codex_config.json`
 - `proxy_config.json`：Proxy 配置（运行时读取，gitignored）
 - `systemd/`：systemd unit 与 env 示例
 - `scripts/`：启动脚本（使用本 repo 的 `.venv`）

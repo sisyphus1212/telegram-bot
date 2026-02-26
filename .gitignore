@@ -21,8 +21,9 @@ sessions.json
 # Manager config (contains Telegram bot token)
 manager_config.json
 
-# Legacy manager config filename (deprecated; migrate to manager_config.json)
+# Legacy/local files (keep ignored to avoid leaking secrets)
 codex_config.json
+opencode_config.json
 
 # Local proxy config (contains machine-specific endpoints/tokens)
 proxy_config.json
