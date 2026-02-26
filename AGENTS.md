@@ -66,8 +66,8 @@ Proxy 推荐使用 JSON（便于记忆和迁移）：
 
 systemd 推荐：
 
-- `/etc/codex-proxy.json`
-- `/etc/codex-proxy.env` 只写：`CODEX_PROXY_CONFIG=/etc/codex-proxy.json`
+- 统一使用 `WorkingDirectory` 下的 `proxy_config.json`（本目录示例：`/root/telegram-bot/proxy_config.json`）
+- 不再使用 `/etc/codex-proxy.env` 与 `/etc/codex-proxy.json`
 
 ## 5. 常用命令（开发/排障）
 

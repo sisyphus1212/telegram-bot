@@ -23,7 +23,6 @@
 - `scripts/verify_phase2_appserver_rpc.sh` - 阶段 2：manager<->proxy app-server RPC 透传验证（需要开启 control server）
 - `docs/verify_phase3_tg.md` - 阶段 3：TG 端到端验证说明
 - `codex_app_server_client.py` / `codex_app_server_probe.py` - 历史兼容文件（转到新实现）
-- `codex_config.example.json` - 配置示例（不要提交真实 token）
 - `requirements.txt` - Python 依赖
 - `scripts/install.sh` - 创建 venv 并安装依赖
 - `scripts/run.sh` - 使用 venv 启动 manager
@@ -31,7 +30,6 @@
 - `systemd/codex-manager.service` - systemd: manager 服务文件
 - `systemd/codex-manager.env.example` - systemd: manager 环境变量示例
 - `systemd/codex-proxy.service` - systemd: proxy 服务文件
-- `systemd/codex-proxy.env.example` - systemd: proxy 环境变量示例
 - `systemd/telegram-bot.service` - legacy: 旧服务名（仍可用，实际启动 manager）
 - `systemd/telegram-bot.env.example` - legacy: 旧 env 示例（仍可用）
 - `log/manager.log` - 运行日志（运行后生成）
@@ -239,8 +237,8 @@ Proxy:
 
 ```bash
 sudo cp systemd/codex-proxy.service /etc/systemd/system/codex-proxy.service
-sudo cp systemd/codex-proxy.env.example /etc/codex-proxy.env
-sudo editor /etc/codex-proxy.env
+# Proxy 统一从 WorkingDirectory（默认 /root/telegram-bot）下的 proxy_config.json 读取配置。
+# 不再使用 /etc/codex-proxy.env。
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now codex-proxy.service

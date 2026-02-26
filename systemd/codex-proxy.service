@@ -6,7 +6,6 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/telegram-bot
-EnvironmentFile=/etc/codex-proxy.env
 ExecStart=/root/telegram-bot/scripts/run_proxy.sh
 Restart=on-failure
 RestartSec=3
@@ -16,4 +15,3 @@ PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
-
