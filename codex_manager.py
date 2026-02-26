@@ -102,6 +102,20 @@ def _split_telegram_text(text: str, limit: int = 3900) -> list[str]:
     return parts
 
 
+def _prefix_and_split_telegram_text(text: str, prefix: str, limit: int = 3900) -> list[str]:
+    """
+    Split text into Telegram-safe chunks and add a proxy prefix to each chunk.
+    Telegram hard limit is 4096; we keep a buffer via default limit.
+    """
+    prefix = prefix or ""
+    if not prefix:
+        return _split_telegram_text(text, limit=limit)
+    # Keep at least 200 chars for payload even if prefix is long.
+    per_part_limit = max(200, limit - len(prefix))
+    parts = _split_telegram_text(text, limit=per_part_limit)
+    return [prefix + p for p in parts]
+
+
 def load_sessions() -> dict[str, dict]:
     if not SESSIONS_FILE.exists():
         return {}
@@ -498,7 +512,11 @@ class ManagerApp:
             except Exception as e:
                 try:
                     await _tg_call(
-                        bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text=f"error: {e}"),
+                        bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=placeholder_id,
+                            text=f"[{proxy_id}] error: {e}",
+                        ),
                         timeout_s=15.0,
                         what="edit error",
                     )
@@ -508,7 +526,11 @@ class ManagerApp:
 
             if not isinstance(res, dict) or res.get("type") != "task_result":
                 await _tg_call(
-                    bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text="error: bad task_result"),
+                    bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=placeholder_id,
+                        text=f"[{proxy_id}] error: bad task_result",
+                    ),
                     timeout_s=15.0,
                     what="edit bad_task_result",
                 )
@@ -518,14 +540,18 @@ class ManagerApp:
                 logger.info(f"task_result not ok proxy={proxy_id} task_id={task_id} res={res}")
                 err = res.get("error") or "unknown error"
                 await _tg_call(
-                    bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text=f"error: {err}"),
+                    bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=placeholder_id,
+                        text=f"[{proxy_id}] error: {err}",
+                    ),
                     timeout_s=15.0,
                     what="edit task_error",
                 )
                 return
 
             text = str(res.get("text") or "").strip() or "(empty)"
-            parts = _split_telegram_text(text)
+            parts = _prefix_and_split_telegram_text(text, prefix=f"[{proxy_id}] ")
             await _tg_call(
                 bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text=parts[0]),
                 timeout_s=15.0,
