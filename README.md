@@ -7,6 +7,8 @@
 
 详细架构见 [ARCHITECTURE.md](/root/telegram-bot/ARCHITECTURE.md)。
 
+后续开发者接入指南见 [AGENTS.md](/root/telegram-bot/AGENTS.md)。
+
 ## 文件说明
 
 - [ARCHITECTURE.md](/root/telegram-bot/ARCHITECTURE.md) - 架构与协议说明
