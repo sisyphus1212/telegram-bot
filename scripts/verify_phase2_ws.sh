@@ -75,9 +75,11 @@ def rpc(req: dict) -> dict:
   try:
     s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
     buf=b""
+    # Control 端会同步等待 codex 返回，所以这里要等到 timeout_s + buffer。
+    wait_s = timeout + 30.0
     t0=time.time()
     while b"\n" not in buf:
-      if (time.time() - t0) > 10.0:
+      if (time.time() - t0) > wait_s:
         raise TimeoutError("control rpc timeout")
       chunk=s.recv(65536)
       if not chunk:
