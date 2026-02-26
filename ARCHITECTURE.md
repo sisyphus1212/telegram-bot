@@ -29,17 +29,16 @@
 ### 一次对话（一个 turn）
 
 1. 用户在 Telegram 发消息
-2. Manager 收到消息后选择一个 Proxy：
-   - 如果该聊天已通过 `/use <proxy_id>` 绑定到某个 Proxy 且在线：用它
-   - 否则如果 `CODEX_DEFAULT_PROXY` 在线：用它
-   - 否则：选择第一个在线 Proxy
-3. Manager 向该 Proxy 下发 `task_assign`
-4. Proxy 在本机保证该聊天对应的 Codex thread 存在，然后执行一次 turn：
+2. **当前设计：必须 `/use <proxy_id>` 选择机器**（不再自动选择默认/第一个在线 proxy）
+3. Manager **立即**向该 Proxy 下发 `task_assign`（不等待执行结果）
+4. Proxy 收到后：
+   - 若 “Codex 回答前未完成任务” 已达到上限（默认 10）：立刻回 `task_result(ok=false, error="proxy queue full")`
+   - 否则立刻回 `task_ack`（表示已入 proxy 队列），并把任务入队
+5. Proxy 在本机按收到顺序（FIFO）把任务喂给 `codex app-server`，并回 `task_result`：
    - 需要时：`thread/start`
    - `turn/start`
    - 等待 `turn/completed`
-5. Proxy 回传 `task_result` 给 Manager
-6. Manager 把最终文本回写到 Telegram（编辑或回复消息）
+6. Manager 收到 `task_result` 后按 `task_id` 找到该条 placeholder，并回写 Telegram（编辑 placeholder；超长则追加多条消息）
 
 ## 状态与持久化
 
@@ -65,6 +64,8 @@
 - `task_result`：
   - 成功：`{"type":"task_result","task_id":"...","ok":true,"text":"..."}`
   - 失败：`{"type":"task_result","task_id":"...","ok":false,"error":"..."}`
+
+注意：当 proxy 队列已满时，proxy 会直接返回 `task_result(ok=false, error="proxy queue full (max=10)")`，Manager 会将错误回写到 Telegram。
 
 ### Manager -> Proxy（下行）
 

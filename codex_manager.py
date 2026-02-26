@@ -6,6 +6,7 @@ import os
 import signal
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -154,6 +155,93 @@ class ProxyConn:
     proxy_id: str
     ws: Any
     last_seen: float
+    send_lock: asyncio.Lock
+
+
+@dataclass
+class TaskContext:
+    task_id: str
+    proxy_id: str
+    chat_id: int
+    placeholder_msg_id: int
+    created_at: float
+
+
+@dataclass
+class TgAction:
+    type: str  # "edit" | "send"
+    chat_id: int
+    text: str
+    message_id: int | None = None
+    timeout_s: float = 15.0
+
+
+class TelegramOutbox:
+    def __init__(self, bot: Any, *, max_active_chats: int = 200, max_queue_per_chat: int = 50, idle_ttl_s: float = 600.0) -> None:
+        self.bot = bot
+        self.max_active_chats = max_active_chats
+        self.max_queue_per_chat = max_queue_per_chat
+        self.idle_ttl_s = idle_ttl_s
+        self._lock = asyncio.Lock()
+        self._queues: dict[int, asyncio.Queue[TgAction]] = {}
+        self._tasks: dict[int, asyncio.Task] = {}
+        self._last_active: dict[int, float] = {}
+
+    async def enqueue(self, action: TgAction) -> bool:
+        now = time.time()
+        async with self._lock:
+            q = self._queues.get(action.chat_id)
+            if q is None:
+                if len(self._queues) >= self.max_active_chats:
+                    return False
+                q = asyncio.Queue(maxsize=self.max_queue_per_chat)
+                self._queues[action.chat_id] = q
+                self._last_active[action.chat_id] = now
+                self._tasks[action.chat_id] = asyncio.create_task(self._sender_loop(action.chat_id), name=f"tg_sender:{action.chat_id}")
+            self._last_active[action.chat_id] = now
+            try:
+                q.put_nowait(action)
+            except asyncio.QueueFull:
+                return False
+            return True
+
+    async def _sender_loop(self, chat_id: int) -> None:
+        try:
+            while True:
+                # Exit on idle TTL when no pending actions.
+                async with self._lock:
+                    last = self._last_active.get(chat_id, time.time())
+                    q = self._queues.get(chat_id)
+                if q is None:
+                    return
+                if q.empty() and (time.time() - last) > self.idle_ttl_s:
+                    async with self._lock:
+                        self._queues.pop(chat_id, None)
+                        self._last_active.pop(chat_id, None)
+                        self._tasks.pop(chat_id, None)
+                    return
+
+                try:
+                    action = await asyncio.wait_for(q.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                try:
+                    if action.type == "edit":
+                        await _tg_call(
+                            self.bot.edit_message_text(chat_id=action.chat_id, message_id=action.message_id, text=action.text),
+                            timeout_s=action.timeout_s,
+                            what="tg edit",
+                        )
+                    elif action.type == "send":
+                        await _tg_call(self.bot.send_message(chat_id=action.chat_id, text=action.text), timeout_s=action.timeout_s, what="tg send")
+                except Exception as e:
+                    logger.warning(f"tg outbox send failed chat={chat_id}: {type(e).__name__}: {e}")
+                finally:
+                    async with self._lock:
+                        self._last_active[chat_id] = time.time()
+        except asyncio.CancelledError:
+            raise
 
 
 class ProxyRegistry:
@@ -161,9 +249,6 @@ class ProxyRegistry:
         self._allowed = allowed  # proxy_id -> token
         self._lock = asyncio.Lock()
         self._conns: dict[str, ProxyConn] = {}
-        self._tasks_by_proxy: dict[str, set[str]] = {}
-        self._task_ack_futures: dict[str, asyncio.Future[None]] = {}
-        self._task_futures: dict[str, asyncio.Future[JsonDict]] = {}
 
     def allowed_proxy_ids(self) -> list[str]:
         return sorted(self._allowed.keys())
@@ -185,8 +270,7 @@ class ProxyRegistry:
                 logger.warning(f"proxy_id {proxy_id!r} token mismatch; accepting (dev mode).")
         async with self._lock:
             # Replace existing connection if any.
-            self._conns[proxy_id] = ProxyConn(proxy_id=proxy_id, ws=ws, last_seen=time.time())
-            self._tasks_by_proxy.setdefault(proxy_id, set())
+            self._conns[proxy_id] = ProxyConn(proxy_id=proxy_id, ws=ws, last_seen=time.time(), send_lock=asyncio.Lock())
         return True
 
     async def unregister_if_matches(self, proxy_id: str, ws: Any) -> None:
@@ -195,11 +279,6 @@ class ProxyRegistry:
             if not cur or cur.ws is not ws:
                 return
             self._conns.pop(proxy_id, None)
-            task_ids = self._tasks_by_proxy.pop(proxy_id, set())
-            for tid in task_ids:
-                fut = self._task_futures.pop(tid, None)
-                if fut and not fut.done():
-                    fut.set_exception(RuntimeError(f"proxy disconnected: {proxy_id}"))
 
     async def heartbeat(self, proxy_id: str, ws: Any) -> None:
         async with self._lock:
@@ -207,91 +286,200 @@ class ProxyRegistry:
             if cur and cur.ws is ws:
                 cur.last_seen = time.time()
 
-    async def deliver_task_result(self, proxy_id: str, ws: Any, msg: JsonDict) -> None:
-        task_id = msg.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
-            return
-        async with self._lock:
-            cur = self._conns.get(proxy_id)
-            if not cur or cur.ws is not ws:
-                return
-            ack = self._task_ack_futures.pop(task_id, None)
-            if ack and not ack.done():
-                ack.set_result(None)
-            fut = self._task_futures.pop(task_id, None)
-            if fut and not fut.done():
-                fut.set_result(msg)
-            self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
-
-    async def deliver_task_ack(self, proxy_id: str, ws: Any, msg: JsonDict) -> None:
-        task_id = msg.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
-            return
-        async with self._lock:
-            cur = self._conns.get(proxy_id)
-            if not cur or cur.ws is not ws:
-                return
-            ack = self._task_ack_futures.pop(task_id, None)
-            if ack and not ack.done():
-                ack.set_result(None)
-
-    async def dispatch(self, proxy_id: str, task_msg: JsonDict, timeout_s: float) -> JsonDict:
-        task_id = task_msg.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
-            raise RuntimeError("missing task_id")
-
+    async def send_json(self, proxy_id: str, msg: JsonDict) -> None:
         async with self._lock:
             conn = self._conns.get(proxy_id)
             if not conn:
                 raise RuntimeError(f"proxy offline: {proxy_id}")
             ws = conn.ws
-            if getattr(ws, "closed", False):
-                raise RuntimeError(f"proxy ws closed: {proxy_id}")
-            ack_fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-            fut: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
-            self._task_ack_futures[task_id] = ack_fut
-            self._task_futures[task_id] = fut
-            self._tasks_by_proxy.setdefault(proxy_id, set()).add(task_id)
-
-        payload = json.dumps(task_msg, ensure_ascii=False, separators=(",", ":"))
-        logger.info(f"ws send start proxy={proxy_id} task_id={task_id}")
-        try:
+            lock = conn.send_lock
+        payload = json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
+        async with lock:
+            logger.info(f"ws send start proxy={proxy_id} type={msg.get('type')!r} bytes={len(payload)}")
             await asyncio.wait_for(ws.send(payload), timeout=5.0)
-            logger.info(f"ws send done proxy={proxy_id} task_id={task_id} bytes={len(payload)}")
-        except Exception as e:
-            logger.warning(f"ws send failed proxy={proxy_id} task_id={task_id}: {type(e).__name__}: {e}")
-            async with self._lock:
-                self._task_ack_futures.pop(task_id, None)
-                self._task_futures.pop(task_id, None)
-                self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
-            raise
+            logger.info(f"ws send done proxy={proxy_id} type={msg.get('type')!r}")
 
-        try:
-            await asyncio.wait_for(ack_fut, timeout=5.0)
-        except Exception as e:
-            logger.warning(f"task_ack timeout proxy={proxy_id} task_id={task_id}: {type(e).__name__}: {e}")
-            async with self._lock:
-                self._task_ack_futures.pop(task_id, None)
-                self._task_futures.pop(task_id, None)
-                self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
-            # Force reconnect: better to drop a half-dead ws than hang handlers.
-            try:
-                await ws.close()
-            except Exception:
-                pass
-            raise RuntimeError("proxy no ack (connection likely stale)")
 
+class ManagerCore:
+    def __init__(
+        self,
+        registry: ProxyRegistry,
+        *,
+        task_timeout_s: float,
+        recent_ttl_s: float = 1800.0,
+        recent_max: int = 10000,
+    ) -> None:
+        self.registry = registry
+        self.task_timeout_s = float(task_timeout_s)
+        self.recent_ttl_s = float(recent_ttl_s)
+        self.recent_max = int(recent_max)
+
+        self._lock = asyncio.Lock()
+        self._tasks_inflight: dict[str, TaskContext] = {}
+        self._recent: "OrderedDict[str, tuple[TaskContext, float]]" = OrderedDict()
+        self._outbox: TelegramOutbox | None = None
+        self._timeout_task: asyncio.Task | None = None
+        self._waiters: dict[str, asyncio.Future[JsonDict]] = {}
+
+    def set_outbox(self, outbox: TelegramOutbox) -> None:
+        self._outbox = outbox
+        if self._timeout_task is None:
+            self._timeout_task = asyncio.create_task(self._timeout_loop(), name="task_timeout_loop")
+
+    async def register_task(self, ctx: TaskContext) -> None:
+        async with self._lock:
+            self._tasks_inflight[ctx.task_id] = ctx
+            self._gc_recent_locked()
+
+    async def dispatch_once(self, proxy_id: str, prompt: str, *, timeout_s: float) -> JsonDict:
+        task_id = uuid.uuid4().hex
+        fut: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
+        async with self._lock:
+            self._waiters[task_id] = fut
+        msg: JsonDict = {
+            "type": "task_assign",
+            "task_id": task_id,
+            "thread_key": "probe:local",
+            "prompt": prompt,
+            "reset_thread": True,
+        }
+        await self.registry.send_json(proxy_id, msg)
         try:
             return await asyncio.wait_for(fut, timeout=timeout_s)
-        except Exception:
+        finally:
             async with self._lock:
-                self._task_ack_futures.pop(task_id, None)
-                self._task_futures.pop(task_id, None)
-                self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
-            raise
+                self._waiters.pop(task_id, None)
+
+    async def send_task_assign(self, *, proxy_id: str, task_msg: JsonDict) -> None:
+        task_id = str(task_msg.get("task_id") or "")
+        if not task_id:
+            return
+        try:
+            await self.registry.send_json(proxy_id, task_msg)
+        except Exception as e:
+            await self._fail_task(task_id, f"ws send failed: {type(e).__name__}: {e}", proxy_id=proxy_id)
+
+    async def on_proxy_message(self, proxy_id: str, msg: JsonDict) -> None:
+        t = msg.get("type")
+        if t == "task_ack":
+            return
+        if t != "task_result":
+            return
+        task_id = str(msg.get("task_id") or "")
+        if not task_id:
+            return
+
+        async with self._lock:
+            waiter = self._waiters.get(task_id)
+            if waiter and not waiter.done():
+                waiter.set_result(msg)
+                return
+        await self._handle_task_result(proxy_id=proxy_id, msg=msg)
+
+    async def _handle_task_result(self, *, proxy_id: str, msg: JsonDict) -> None:
+        task_id = str(msg.get("task_id") or "")
+        ok = bool(msg.get("ok"))
+        text = str(msg.get("text") or "")
+        err = str(msg.get("error") or "")
+        if not task_id:
+            return
+
+        ctx: TaskContext | None = None
+        late_ctx: TaskContext | None = None
+        async with self._lock:
+            ctx = self._tasks_inflight.pop(task_id, None)
+            if ctx is None:
+                item = self._recent.get(task_id)
+                if item:
+                    late_ctx = item[0]
+            if ctx is not None:
+                self._recent[task_id] = (ctx, time.time())
+                self._recent.move_to_end(task_id)
+                self._gc_recent_locked()
+
+        outbox = self._outbox
+        if outbox is None:
+            logger.warning(f"task_result dropped (no outbox): proxy={proxy_id} task_id={task_id} ok={ok}")
+            return
+
+        if ctx is None and late_ctx is not None:
+            body = text.strip() if ok else f"error: {err or 'unknown error'}"
+            body = body or "(empty)"
+            parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}][late task_id={task_id}] ")
+            for p in parts:
+                await outbox.enqueue(TgAction(type="send", chat_id=late_ctx.chat_id, text=p))
+            return
+
+        if ctx is None:
+            logger.info(f"orphan task_result: proxy={proxy_id} task_id={task_id} ok={ok} err={err!r}")
+            return
+
+        if ok:
+            body = text.strip() or "(empty)"
+            parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}] ")
+            await outbox.enqueue(TgAction(type="edit", chat_id=ctx.chat_id, message_id=ctx.placeholder_msg_id, text=parts[0]))
+            for extra in parts[1:]:
+                await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text=extra))
+            return
+
+        body = f"error: {err or 'unknown error'}"
+        parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}] ")
+        await outbox.enqueue(TgAction(type="edit", chat_id=ctx.chat_id, message_id=ctx.placeholder_msg_id, text=parts[0]))
+        for extra in parts[1:]:
+            await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text=extra))
+
+    async def _fail_task(self, task_id: str, reason: str, *, proxy_id: str) -> None:
+        ctx: TaskContext | None = None
+        async with self._lock:
+            ctx = self._tasks_inflight.pop(task_id, None)
+            if ctx is not None:
+                self._recent[task_id] = (ctx, time.time())
+                self._recent.move_to_end(task_id)
+                self._gc_recent_locked()
+        outbox = self._outbox
+        if outbox is None or ctx is None:
+            return
+        parts = _prefix_and_split_telegram_text(f"error: {reason}", prefix=f"[{proxy_id}] ")
+        await outbox.enqueue(TgAction(type="edit", chat_id=ctx.chat_id, message_id=ctx.placeholder_msg_id, text=parts[0]))
+        for extra in parts[1:]:
+            await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text=extra))
+
+    async def _timeout_loop(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            now = time.time()
+            expired: list[tuple[str, TaskContext]] = []
+            async with self._lock:
+                for tid, ctx in list(self._tasks_inflight.items()):
+                    if (now - ctx.created_at) > self.task_timeout_s:
+                        expired.append((tid, ctx))
+                        self._tasks_inflight.pop(tid, None)
+                        self._recent[tid] = (ctx, now)
+                        self._recent.move_to_end(tid)
+                self._gc_recent_locked()
+            if not expired:
+                continue
+            outbox = self._outbox
+            if outbox is None:
+                continue
+            for _tid, ctx in expired:
+                parts = _prefix_and_split_telegram_text("error: timeout", prefix=f"[{ctx.proxy_id}] ")
+                await outbox.enqueue(TgAction(type="edit", chat_id=ctx.chat_id, message_id=ctx.placeholder_msg_id, text=parts[0]))
+                for extra in parts[1:]:
+                    await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text=extra))
+
+    def _gc_recent_locked(self) -> None:
+        now = time.time()
+        while self._recent:
+            tid, (_ctx, ts) = next(iter(self._recent.items()))
+            if (now - ts) <= self.recent_ttl_s:
+                break
+            self._recent.pop(tid, None)
+        while len(self._recent) > self.recent_max:
+            self._recent.popitem(last=False)
 
 
-async def run_ws_server(listen: str, registry: ProxyRegistry) -> None:
+async def run_ws_server(listen: str, registry: ProxyRegistry, core: ManagerCore) -> None:
     host, port_s = listen.rsplit(":", 1)
     port = int(port_s)
 
@@ -326,11 +514,8 @@ async def run_ws_server(listen: str, registry: ProxyRegistry) -> None:
                 if t == "heartbeat":
                     await registry.heartbeat(proxy_id, ws)
                     continue
-                if t == "task_ack":
-                    await registry.deliver_task_ack(proxy_id, ws, m)
-                    continue
-                if t == "task_result":
-                    await registry.deliver_task_result(proxy_id, ws, m)
+                if t in ("task_ack", "task_result"):
+                    await core.on_proxy_message(proxy_id, m)
                     continue
         except websockets.ConnectionClosed:
             return
@@ -470,9 +655,13 @@ class ManagerApp:
 
         sk = _session_key(update)
         sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
-        proxy_id = self._choose_proxy(str(sess.get("proxy") or ""))
-        if not proxy_id:
-            await _tg_call(update.message.reply_text("no proxy online. use /servers"), timeout_s=15.0, what="msg reply")
+        selected_proxy = str(sess.get("proxy") or "").strip()
+        if not selected_proxy:
+            await _tg_call(update.message.reply_text("请先 /servers 查看在线代理，然后 /use <proxy_id> 选择一台机器"), timeout_s=15.0, what="msg reply")
+            return
+        proxy_id = selected_proxy
+        if not self.registry.is_online(proxy_id):
+            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /servers)"), timeout_s=15.0, what="msg reply")
             return
 
         task_id = uuid.uuid4().hex
@@ -496,71 +685,24 @@ class ManagerApp:
             "reset_thread": reset_thread,
         }
 
-        # Do not block Telegram's update processing on slow/failed proxies.
-        # PTB defaults to sequential update handling; a single hung task would make the bot appear "no response".
-        bot = context.bot
+        # Event-driven: send immediately, do not await result here.
+        core = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(placeholder.edit_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="edit error")
+            return
         chat_id = update.effective_chat.id if update.effective_chat else None
-        placeholder_id = placeholder.message_id
         if chat_id is None:
             return
-
-        async def _work() -> None:
-            try:
-                logger.info(f"dispatch start proxy={proxy_id} task_id={task_id} reset={reset_thread}")
-                res = await self.registry.dispatch(proxy_id=proxy_id, task_msg=task_msg, timeout_s=self.task_timeout_s)
-                logger.info(f"dispatch done proxy={proxy_id} task_id={task_id} ok={bool(isinstance(res, dict) and res.get('ok'))}")
-            except Exception as e:
-                try:
-                    await _tg_call(
-                        bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=placeholder_id,
-                            text=f"[{proxy_id}] error: {e}",
-                        ),
-                        timeout_s=15.0,
-                        what="edit error",
-                    )
-                except Exception as ee:
-                    logger.warning(f"telegram edit_message_text failed: {type(ee).__name__}: {ee}")
-                return
-
-            if not isinstance(res, dict) or res.get("type") != "task_result":
-                await _tg_call(
-                    bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=placeholder_id,
-                        text=f"[{proxy_id}] error: bad task_result",
-                    ),
-                    timeout_s=15.0,
-                    what="edit bad_task_result",
-                )
-                return
-
-            if not res.get("ok"):
-                logger.info(f"task_result not ok proxy={proxy_id} task_id={task_id} res={res}")
-                err = res.get("error") or "unknown error"
-                await _tg_call(
-                    bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=placeholder_id,
-                        text=f"[{proxy_id}] error: {err}",
-                    ),
-                    timeout_s=15.0,
-                    what="edit task_error",
-                )
-                return
-
-            text = str(res.get("text") or "").strip() or "(empty)"
-            parts = _prefix_and_split_telegram_text(text, prefix=f"[{proxy_id}] ")
-            await _tg_call(
-                bot.edit_message_text(chat_id=chat_id, message_id=placeholder_id, text=parts[0]),
-                timeout_s=15.0,
-                what="edit result",
+        await core.register_task(
+            TaskContext(
+                task_id=task_id,
+                proxy_id=proxy_id,
+                chat_id=int(chat_id),
+                placeholder_msg_id=int(placeholder.message_id),
+                created_at=time.time(),
             )
-            for extra in parts[1:]:
-                await _tg_call(bot.send_message(chat_id=chat_id, text=extra), timeout_s=15.0, what="reply extra")
-
-        asyncio.create_task(_work(), name=f"tg_task:{proxy_id}:{task_id}")
+        )
+        asyncio.create_task(core.send_task_assign(proxy_id=proxy_id, task_msg=task_msg), name=f"send:{proxy_id}:{task_id}")
 
 
 def main() -> int:
@@ -606,7 +748,8 @@ def main() -> int:
     sessions = load_sessions()
 
     async def runner():
-        ws_task = asyncio.create_task(run_ws_server(args.ws_listen, registry), name="ws_server")
+        core = ManagerCore(registry, task_timeout_s=args.timeout)
+        ws_task = asyncio.create_task(run_ws_server(args.ws_listen, registry, core), name="ws_server")
         stop_event = asyncio.Event()
 
         def _stop() -> None:
@@ -628,15 +771,7 @@ def main() -> int:
                 await asyncio.sleep(0.2)
             if not registry.is_online(args.dispatch_proxy):
                 raise SystemExit(f"proxy not online: {args.dispatch_proxy}")
-            task_id = uuid.uuid4().hex
-            msg = {
-                "type": "task_assign",
-                "task_id": task_id,
-                "thread_key": "probe:local",
-                "prompt": args.prompt or "ping",
-                "reset_thread": True,
-            }
-            res = await registry.dispatch(args.dispatch_proxy, msg, timeout_s=args.timeout)
+            res = await core.dispatch_once(args.dispatch_proxy, args.prompt or "ping", timeout_s=args.timeout)
             print(json.dumps(res, ensure_ascii=False, indent=2))
             stop_event.set()
 
@@ -676,6 +811,7 @@ def main() -> int:
                         proxy=proxy,
                     )
                     tg = Application.builder().token(bot_token).request(req).build()
+                    tg.bot_data["core"] = core
                     tg.add_handler(CommandHandler("servers", app.cmd_servers))
                     tg.add_handler(CommandHandler("ping", app.cmd_ping))
                     tg.add_handler(CommandHandler("use", app.cmd_use))
@@ -691,6 +827,7 @@ def main() -> int:
                     except Exception as e:
                         logger.warning(f"delete_webhook failed: {type(e).__name__}: {e}")
                     await tg.start()
+                    core.set_outbox(TelegramOutbox(tg.bot))
                     assert tg.updater is not None
                     await tg.updater.start_polling()
                     logger.info("Telegram polling started")

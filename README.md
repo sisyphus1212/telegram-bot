@@ -110,6 +110,7 @@ Proxy 运行在被控机器上，至少需要：
 可选：
 
 - `PROXY_TOKEN`：与 allowlist 配合使用的 token（dev 模式可空）
+- `PROXY_MAX_PENDING`：proxy 在 Codex 回答前允许挂起的最大任务数（默认 `10`）。超过会立刻回 `proxy queue full`。
 
 ### 4. 自检
 
@@ -150,8 +151,9 @@ python codex_proxy.py --config proxy_config.json
 
 1. `/servers` 查看在线 proxy
 2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 proxy）
-2. 直接发一条消息，例如 `ping`
-3. 预期会看到 `pong` 或 Codex 的回复
+3. `/use <proxy_id>` 选择一台机器（当前版本不再自动挑选默认 proxy）
+4. 直接发一条消息，例如 `ping`
+5. 预期会看到占位 `working...`，随后被编辑成 `[{proxy_id}] ...` 的结果或错误
 
 ### 7. 作为 Linux 服务（systemd）
 

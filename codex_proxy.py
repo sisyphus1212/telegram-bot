@@ -60,7 +60,8 @@ class CodexProxyAgent:
         self.app = CodexAppServerStdioProcess(CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd))
         self._thread_ids: dict[str, str] = {}  # thread_key -> thread_id
         self._thread_locks: dict[str, asyncio.Lock] = {}
-        self._busy = asyncio.Lock()  # minimal: single-task execution
+        self._busy = asyncio.Lock()  # single execution loop (proxy feeds Codex sequentially)
+        self.max_pending = int(os.environ.get("PROXY_MAX_PENDING", "10") or "10")
 
     async def _ensure_thread(self, thread_key: str, reset: bool) -> str:
         if reset:
@@ -85,9 +86,6 @@ class CodexProxyAgent:
         reset_thread = bool(msg.get("reset_thread", False))
         if not task_id or not thread_key:
             return {"type": "task_result", "task_id": task_id or "?", "ok": False, "error": "missing task_id/thread_key"}
-
-        if self._busy.locked():
-            return {"type": "task_result", "task_id": task_id, "ok": False, "error": "busy"}
 
         async with self._busy:
             try:
@@ -116,6 +114,10 @@ class CodexProxyAgent:
             while True:
                 try:
                     async with websockets.connect(self.manager_ws, ping_interval=20, ping_timeout=20, max_size=8 * 1024 * 1024) as ws:
+                        send_lock = asyncio.Lock()
+                        exec_queue: asyncio.Queue[JsonDict] = asyncio.Queue()
+                        pending_count = 0
+
                         await ws.send(_json_dumps({"type": "register", "proxy_id": self.proxy_id, "token": self.token}))
                         raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
                         rep = json.loads(raw)
@@ -126,16 +128,50 @@ class CodexProxyAgent:
                         logger.info(f"registered to manager as {self.proxy_id} ({self.manager_ws})")
                         backoff_s = 0.5
                         stop_hb = asyncio.Event()
+                        stop_exec = asyncio.Event()
 
                         async def _hb_loop() -> None:
                             while not stop_hb.is_set():
                                 try:
-                                    await ws.send(_json_dumps({"type": "heartbeat", "proxy_id": self.proxy_id}))
+                                    async with send_lock:
+                                        await ws.send(_json_dumps({"type": "heartbeat", "proxy_id": self.proxy_id}))
                                 except Exception:
                                     return
                                 await asyncio.sleep(10.0)
 
+                        async def _exec_loop() -> None:
+                            nonlocal pending_count
+                            while not stop_exec.is_set():
+                                try:
+                                    msg = await exec_queue.get()
+                                except Exception:
+                                    continue
+                                try:
+                                    out = await self._run_task(msg)
+                                except Exception as e:
+                                    task_id = str(msg.get("task_id") or "?")
+                                    out = {"type": "task_result", "task_id": task_id, "ok": False, "error": f"{type(e).__name__}: {e}"}
+                                try:
+                                    if out.get("ok"):
+                                        logger.info(
+                                            f"task_result sending proxy_id={self.proxy_id} "
+                                            f"task_id={out.get('task_id')!r} ok=True"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"task_result sending proxy_id={self.proxy_id} "
+                                            f"task_id={out.get('task_id')!r} ok=False error={out.get('error')!r}"
+                                        )
+                                    async with send_lock:
+                                        await ws.send(_json_dumps(out))
+                                except Exception:
+                                    # Connection likely gone; manager will timeout.
+                                    pass
+                                finally:
+                                    pending_count = max(0, pending_count - 1)
+
                         hb_task = asyncio.create_task(_hb_loop(), name="heartbeat")
+                        exec_task = asyncio.create_task(_exec_loop(), name="exec_loop")
                         try:
                             async for raw in ws:
                                 try:
@@ -148,27 +184,52 @@ class CodexProxyAgent:
                                     continue
                                 task_id = msg.get("task_id")
                                 logger.info(f"task_assign received proxy_id={self.proxy_id} task_id={task_id!r}")
-                                try:
-                                    await ws.send(_json_dumps({"type": "task_ack", "task_id": task_id}))
-                                except Exception:
-                                    # If we can't ack, there's no point running the task.
+                                if pending_count >= self.max_pending:
+                                    # Refuse immediately so manager can show error quickly.
+                                    out = {
+                                        "type": "task_result",
+                                        "task_id": str(task_id or "?"),
+                                        "ok": False,
+                                        "error": f"proxy queue full (max={self.max_pending})",
+                                    }
+                                    try:
+                                        async with send_lock:
+                                            await ws.send(_json_dumps(out))
+                                    except Exception:
+                                        pass
                                     continue
-                                out = await self._run_task(msg)
-                                if out.get("ok"):
-                                    logger.info(
-                                        f"task_result sending proxy_id={self.proxy_id} "
-                                        f"task_id={out.get('task_id')!r} ok=True"
-                                    )
-                                else:
-                                    logger.info(
-                                        f"task_result sending proxy_id={self.proxy_id} "
-                                        f"task_id={out.get('task_id')!r} ok=False error={out.get('error')!r}"
-                                    )
-                                await ws.send(_json_dumps(out))
+
+                                pending_count += 1
+                                try:
+                                    async with send_lock:
+                                        await ws.send(_json_dumps({"type": "task_ack", "task_id": task_id}))
+                                except Exception:
+                                    pending_count = max(0, pending_count - 1)
+                                    continue
+
+                                # Queue for sequential Codex feeding (FIFO).
+                                try:
+                                    exec_queue.put_nowait(msg)
+                                except Exception:
+                                    pending_count = max(0, pending_count - 1)
+                                    out = {
+                                        "type": "task_result",
+                                        "task_id": str(task_id or "?"),
+                                        "ok": False,
+                                        "error": "proxy enqueue failed",
+                                    }
+                                    try:
+                                        async with send_lock:
+                                            await ws.send(_json_dumps(out))
+                                    except Exception:
+                                        pass
                         finally:
                             stop_hb.set()
+                            stop_exec.set()
                             hb_task.cancel()
+                            exec_task.cancel()
                             await asyncio.gather(hb_task, return_exceptions=True)
+                            await asyncio.gather(exec_task, return_exceptions=True)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -206,6 +267,7 @@ def main() -> int:
     token = args.token or os.environ.get("PROXY_TOKEN") or _cfg_get_str(cfg, "proxy_token")
     codex_bin = args.codex_bin or os.environ.get("CODEX_BIN") or _cfg_get_str(cfg, "codex_bin") or "codex"
     cwd = args.cwd or os.environ.get("CODEX_CWD") or _cfg_get_str(cfg, "codex_cwd") or str(BASE_DIR)
+    max_pending = int(os.environ.get("PROXY_MAX_PENDING") or str(cfg.get("max_pending") or 10))
 
     if not proxy_id:
         raise SystemExit("missing PROXY_ID / --proxy-id")
@@ -218,6 +280,7 @@ def main() -> int:
         codex_bin=codex_bin,
         cwd=cwd,
     )
+    agent.max_pending = max(1, max_pending)
     try:
         asyncio.run(agent.run_forever())
     except KeyboardInterrupt:
