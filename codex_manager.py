@@ -1030,6 +1030,56 @@ class ManagerApp:
             return
         await _tg_call(update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
 
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /help chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/help reply")
+            return
+
+        lines: list[str] = []
+        lines.append("Codex Manager (TG -> Manager -> Proxy -> Codex app-server)")
+        lines.append("")
+        lines.append("1) 选择机器（proxy）")
+        lines.append("- /proxy_list  查看在线机器（旧命令: /servers）")
+        lines.append("- /proxy_use proxyId=<id>  选择机器（旧命令: /use <id>）")
+        lines.append("- /proxy_current  查看当前选择")
+        lines.append("")
+        lines.append("2) 日常对话（turn）")
+        lines.append("- 直接发送文本即可。")
+        lines.append("- 若当前 proxy 没有 thread，会自动 thread/start。")
+        lines.append("")
+        lines.append("3) Thread 会话（对齐 app-server method）")
+        lines.append("- /thread_current  显示当前 threadId（按 proxy 隔离保存）")
+        lines.append("- /thread_start [cwd=...] [sandbox=workspaceWrite] [approvalPolicy=onRequest] [personality=pragmatic]")
+        lines.append("- /thread_resume threadId=<id>")
+        lines.append("- /thread_list [limit=5] [archived=true|false] [cursor=...] [sortKey=created_at|updated_at]")
+        lines.append("- /thread_read threadId=<id> [includeTurns=true|false]")
+        lines.append("- /thread_archive [threadId=<id>]   (不填则归档当前 thread)")
+        lines.append("- /thread_unarchive threadId=<id>")
+        lines.append("")
+        lines.append("4) 其它 app-server 查询/配置")
+        lines.append("- /model_list [limit=10]")
+        lines.append("- /skills_list [cwds=/a,/b] [forceReload=true|false]")
+        lines.append("- /config_read [includeLayers=true|false]")
+        lines.append("- /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]")
+        lines.append("- /collaborationmode_list")
+        lines.append("")
+        lines.append("参数格式：key=value（多个参数用空格分隔）。JSON 参数用 value=<json>。")
+        lines.append("示例：")
+        lines.append("- /proxy_use proxyId=proxy27")
+        lines.append("- /thread_list limit=3 archived=false")
+        lines.append("- /config_value_write keyPath=apps._default.enabled value=true mergeStrategy=replace")
+        lines.append("")
+        lines.append("提示：thread 内容由 Codex 保存在 proxy 机器的 ~/.codex/；manager 只保存 chat->(proxy, threadId) 路由。")
+
+        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/help reply")
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Telegram common entrypoint.
+        await self.cmd_help(update, context)
+
     async def _require_proxy_online(self, update: Update) -> str | None:
         if not update.message:
             return None
@@ -1579,6 +1629,8 @@ def main() -> int:
                     )
                     tg = Application.builder().token(bot_token).request(req).build()
                     tg.bot_data["core"] = core
+                    tg.add_handler(CommandHandler("help", app.cmd_help))
+                    tg.add_handler(CommandHandler("start", app.cmd_start))
                     tg.add_handler(CommandHandler("ping", app.cmd_ping))
                     # Back-compat aliases.
                     tg.add_handler(CommandHandler("servers", app.cmd_proxy_list))
