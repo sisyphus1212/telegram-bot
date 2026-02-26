@@ -25,15 +25,13 @@ journalctl -u codex-manager.service -n 200 --no-pager | rg 'Telegram polling sta
 ## 3. TG 端到端验证（依赖 proxy）
 
 在 Telegram 对话里：
-1. `/servers` 确认目标 proxy 在线（例如 `proxy27`）
-2. `/use proxy27`
-3. `/sessions`（预期 depth=0 或 1，取决于是否已有历史 thread_store）
-4. `/new`（预期 depth 增加）
-5. `/back`（预期切回上一个；若没有上一个，会提示 error）
-3. 发送文本：`ping`（连续发 5 条也可以，用于验证“可连续下发”）
+1. `/proxy_list` 确认目标 proxy 在线（例如 `proxy27`，旧命令 `/servers` 仍可用）
+2. `/proxy_use proxyId=proxy27`（旧命令 `/use proxy27` 仍可用）
+3. `/thread_start`（可选：显式新建 thread；不做也行，首次发文本会自动创建）
+4. 发送文本：`ping`（连续发 5 条也可以，用于验证“可连续下发”）
 
 验收：
-- 先出现占位消息：`working (proxy=..., reset=...) ...`
+- 先出现占位消息：`working (proxy=..., threadId=...) ...`
 - 随后占位消息被编辑为：`[proxy_id] ...`（成功或错误）
 
 ## 4. 关键日志（必须能串起来）
@@ -53,7 +51,7 @@ journalctl -u codex-manager.service -n 400 --no-pager | rg 'op=tg.update|op=tg.s
 - `op=tg.edit ... trace_id=... kind=result`
 
 会话(thread)命令链路（可选观察）：
-- `cmd /sessions ...`
-- `op=thread_op.send ...`
-- `op=ws.send ... type=thread_op ...`
-- `op=ws.recv ... type=thread_op_result ...`
+- `cmd /thread_start ...`
+- `op=appserver.send ... method=thread/start ...`
+- `op=ws.send ... type=appserver_request ...`
+- `op=ws.recv ... type=appserver_response ...`

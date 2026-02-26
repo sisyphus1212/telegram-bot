@@ -20,6 +20,7 @@
 - `codex_proxy_probe.py` - 自检脚本（验证本机 `codex app-server` 链路）
 - `scripts/verify_phase1_probe.sh` - 阶段 1：proxy 本机 codex ping/pong 一键验证
 - `scripts/verify_phase2_ws.sh` - 阶段 2：manager<->proxy WS 一键验证（需要开启 manager control server）
+- `scripts/verify_phase2_appserver_rpc.sh` - 阶段 2：manager<->proxy app-server RPC 透传验证（需要开启 control server）
 - `docs/verify_phase3_tg.md` - 阶段 3：TG 端到端验证说明
 - `codex_app_server_client.py` / `codex_app_server_probe.py` - 历史兼容文件（转到新实现）
 - `codex_config.example.json` - 配置示例（不要提交真实 token）
@@ -35,7 +36,8 @@
 - `systemd/telegram-bot.env.example` - legacy: 旧 env 示例（仍可用）
 - `log/manager.log` - 运行日志（运行后生成）
 - `sessions.json` - 会话存储文件（运行后生成）
-- `thread_store.json` - Proxy 端会话(thread)栈持久化文件（运行后生成，可配置路径）
+  - v2 会保存 chat -> proxy 以及 per-proxy 的 current threadId
+  - thread 内容由 Codex 自己保存在 `~/.codex/`，我们只保存“指针/路由”
 
 ## 依赖
 
@@ -65,7 +67,7 @@ Manager 的 Telegram token 推荐放 `codex_config.json`（不要提交，已在
 }
 ```
 
-本项目还会在 `sessions.json` 中保存每个聊天选择的 `proxy_id`（Codex thread 由 proxy 端维护）。
+本项目会在 `sessions.json` 中保存每个聊天选择的 `proxy_id` 以及 per-proxy 的 `current_thread_id`。
 
 推荐用环境变量（systemd 也会用）：
 
@@ -118,8 +120,7 @@ Proxy 运行在被控机器上，至少需要：
 - `PROXY_TOKEN`：与 allowlist 配合使用的 token（dev 模式可空）
 - `PROXY_MAX_PENDING`：proxy 在 Codex 回答前允许挂起的最大任务数（默认 `10`）。超过会立刻回 `proxy queue full`。
 - `CODEX_SANDBOX`：Codex sandbox（默认 `workspace-write`）。需要执行更高权限操作时可考虑 `danger-full-access`（风险极高）。
-- `CODEX_APPROVAL_POLICY`：审批策略（默认 `on-request`）。如果你不希望出现“权限确认导致命令失败”，可设为 `never`（风险极高）。
-- `CODEX_THREAD_STORE`：Proxy 端 thread 栈持久化文件路径（默认 `./thread_store.json`）
+- `CODEX_APPROVAL_POLICY`：审批策略（不同 codex 版本枚举可能不同；本项目会尽量兼容官方文档值与本地实际值）。
 
 > 说明：本项目的 `codex_stdio_client.py` 默认会对 app-server 的 `requestApproval` 请求返回 `decline`。因此当 `approval_policy=on-request` 时，某些命令/改文件会被 Codex 请求确认但被我们拒绝，从而表现为“权限问题”。要避免这一类失败，通常做法是把 `approval_policy` 设为 `never`，让 app-server 不再发起审批请求。
 
@@ -180,11 +181,11 @@ export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
 scripts/verify_phase2_ws.sh proxy27
 ```
 
-可选：验证会话(thread)管理协议（不经过 Telegram）：
+可选：验证 app-server 透传（不经过 Telegram）：
 
 ```bash
 export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
-scripts/verify_phase2_thread_ops.sh proxy27
+scripts/verify_phase2_appserver_rpc.sh proxy27
 ```
 
 阶段 3：Telegram 端到端验证见 [docs/verify_phase3_tg.md](/root/telegram-bot/docs/verify_phase3_tg.md)。
@@ -193,20 +194,21 @@ scripts/verify_phase2_thread_ops.sh proxy27
 
 在 Telegram 对话里：
 
-1. `/servers` 查看在线 proxy
+1. `/proxy_list` 查看在线 proxy（旧命令 `/servers` 仍可用）
 2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 proxy）
-3. `/use <proxy_id>` 选择一台机器（当前版本不再自动挑选默认 proxy）
+3. `/proxy_use proxyId=<proxy_id>` 选择一台机器（旧命令 `/use <proxy_id>` 仍可用）
 4. 直接发一条消息，例如 `ping`
 5. 预期会看到占位 `working...`，随后被编辑成 `[{proxy_id}] ...` 的结果或错误
 
-### 7.1 会话(thread)管理命令
+### 7.1 Thread 管理命令（尽量对齐 app-server 官方 method）
 
-这些命令由 **Manager 转发给当前选中的 Proxy** 执行，Proxy 会把每个聊天的 Codex thread 维护为一个“会话栈”（最多同时挂起任务 10 条，与会话栈无关）。
-
-- `/new`：新建一个 thread，并把当前 thread 压栈（切到新的会话）
-- `/back`：回到上一个 thread（从栈顶恢复）
-- `/sessions`：列出当前会话栈（最后一个为 current）
-- `/sessiondel <idx>`：删除会话栈中的某一项（索引从 1 开始，最后一个通常是 current）
+- `/thread_start` -> `thread/start`（并设置当前聊天在当前 proxy 上的 `current_thread_id`）
+- `/thread_resume threadId=<id>` -> `thread/resume`
+- `/thread_list limit=5` -> `thread/list`
+- `/thread_read threadId=<id>` -> `thread/read`
+- `/thread_archive [threadId=<id>]` -> `thread/archive`
+- `/thread_unarchive threadId=<id>` -> `thread/unarchive`
+- `/thread_current` 显示当前聊天在当前 proxy 上保存的 threadId（这是客户端路由元数据，不是 app-server method）
 
 ### 8. 作为 Linux 服务（systemd）
 

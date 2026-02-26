@@ -139,6 +139,21 @@ def _prefix_and_split_telegram_text(text: str, prefix: str, limit: int = 3900) -
 
 
 def load_sessions() -> dict[str, dict]:
+    """
+    sessions.json v2 schema (持久化路由元数据，而不是 Codex thread 内容):
+
+      {
+        "version": 2,
+        "saved_at": 1700000000,
+        "sessions": {
+          "tg:<chat>:<user>": {
+            "proxy": "proxy1",
+            "by_proxy": { "proxy1": { "current_thread_id": "thr_...", "last_used_at": 1700000000 } },
+            "defaults": { "cwd": "...", "sandbox": "workspaceWrite", "approvalPolicy": "onRequest", "personality": "pragmatic", "model": "" }
+          }
+        }
+      }
+    """
     if not SESSIONS_FILE.exists():
         return {}
     try:
@@ -146,17 +161,30 @@ def load_sessions() -> dict[str, dict]:
             data = json.load(f)
         if not isinstance(data, dict):
             return {}
-        # Migration: old format stored Codex thread ids in "id" or was {user_id: session_id}.
+
+        # v2
+        if data.get("version") == 2 and isinstance(data.get("sessions"), dict):
+            out: dict[str, dict] = {}
+            for k, v in data["sessions"].items():
+                if not isinstance(k, str) or not k:
+                    continue
+                if not isinstance(v, dict):
+                    continue
+                proxy = str(v.get("proxy") or "")
+                by_proxy = v.get("by_proxy") if isinstance(v.get("by_proxy"), dict) else {}
+                defaults = v.get("defaults") if isinstance(v.get("defaults"), dict) else {}
+                out[k] = {"proxy": proxy, "by_proxy": by_proxy, "defaults": defaults}
+            return out
+
+        # Legacy migration (v0/v1): { session_key: {proxy, pc_mode, reset_next, ...} }
         upgraded: dict[str, dict] = {}
         for k, v in data.items():
+            if not isinstance(k, str) or not k:
+                continue
             if isinstance(v, dict):
-                upgraded[k] = {
-                    "proxy": str(v.get("proxy") or v.get("server") or ""),
-                    "pc_mode": bool(v.get("pc_mode", False)),
-                    "reset_next": bool(v.get("reset_next", False)),
-                }
+                upgraded[k] = {"proxy": str(v.get("proxy") or v.get("server") or ""), "by_proxy": {}, "defaults": {}}
             else:
-                upgraded[k] = {"proxy": "", "pc_mode": False, "reset_next": False}
+                upgraded[k] = {"proxy": "", "by_proxy": {}, "defaults": {}}
         return upgraded
     except Exception as e:
         logger.warning(f"Failed to load sessions: {e}")
@@ -165,8 +193,9 @@ def load_sessions() -> dict[str, dict]:
 
 def save_sessions(sessions: dict[str, dict]) -> None:
     try:
+        payload = {"version": 2, "saved_at": int(time.time()), "sessions": sessions}
         with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sessions, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"Failed to save sessions: {e}")
 
@@ -184,6 +213,7 @@ class TaskContext:
     task_id: str
     trace_id: str
     proxy_id: str
+    thread_id: str
     chat_id: int
     placeholder_msg_id: int
     created_at: float
@@ -358,7 +388,7 @@ class ManagerCore:
         self._outbox: TelegramOutbox | None = None
         self._timeout_task: asyncio.Task | None = None
         self._waiters: dict[str, asyncio.Future[JsonDict]] = {}
-        self._thread_waiters: dict[str, asyncio.Future[JsonDict]] = {}
+        self._rpc_waiters: dict[str, asyncio.Future[JsonDict]] = {}
 
     def set_outbox(self, outbox: TelegramOutbox) -> None:
         self._outbox = outbox
@@ -371,6 +401,22 @@ class ManagerCore:
             self._gc_recent_locked()
 
     async def dispatch_once(self, proxy_id: str, prompt: str, *, timeout_s: float) -> JsonDict:
+        rep = await self.appserver_call(
+            proxy_id,
+            "thread/start",
+            {"cwd": str(BASE_DIR), "sandbox": "workspaceWrite", "approvalPolicy": "onRequest", "personality": "pragmatic"},
+            timeout_s=min(timeout_s, 60.0),
+        )
+        if not bool(rep.get("ok")):
+            raise RuntimeError(f"thread/start failed: {rep.get('error')}")
+        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        thread_id = str(thread.get("id") or "")
+        if not thread_id:
+            raise RuntimeError(f"thread/start missing id: {result!r}")
+        return await self.dispatch_task(proxy_id, thread_id, prompt, thread_key="probe:local", timeout_s=timeout_s)
+
+    async def dispatch_task(self, proxy_id: str, thread_id: str, prompt: str, *, thread_key: str, timeout_s: float) -> JsonDict:
         task_id = uuid.uuid4().hex
         trace_id = uuid.uuid4().hex
         fut: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
@@ -380,58 +426,43 @@ class ManagerCore:
             "type": "task_assign",
             "trace_id": trace_id,
             "task_id": task_id,
-            "thread_key": "probe:local",
+            "thread_key": thread_key,
+            "thread_id": thread_id,
             "prompt": prompt,
-            "reset_thread": True,
         }
         t0 = time.time()
-        logger.info(f"op=dispatch.enqueue proxy_id={proxy_id} trace_id={trace_id} task_id={task_id} prompt_len={len(prompt)}")
+        logger.info(f"op=dispatch.enqueue proxy_id={proxy_id} trace_id={trace_id} task_id={task_id} thread_id={thread_id[-8:]} prompt_len={len(prompt)}")
         await self.registry.send_json(proxy_id, msg)
         try:
             res = await asyncio.wait_for(fut, timeout=timeout_s)
             latency_ms = int((time.time() - t0) * 1000.0)
-            logger.info(f"op=dispatch.done proxy_id={proxy_id} trace_id={trace_id} task_id={task_id} ok={bool(res.get('ok'))} latency_ms={latency_ms}")
-            return res
-        finally:
-            async with self._lock:
-                self._waiters.pop(task_id, None)
-
-    async def thread_op(self, proxy_id: str, thread_key: str, op: str, *, index: int | None = None, timeout_s: float = 30.0) -> JsonDict:
-        """
-        向某个 proxy 发送 thread 操作（会话栈），并等待 thread_op_result。
-
-        协议：
-          manager -> proxy: {"type":"thread_op","req_id":...,"trace_id":...,"thread_key":...,"op":"new|back|list|del","index":...}
-          proxy -> manager: {"type":"thread_op_result","req_id":...,"trace_id":...,"ok":...,"sessions":[...],"depth":...,"error":...}
-        """
-        req_id = uuid.uuid4().hex
-        trace_id = uuid.uuid4().hex
-        fut: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
-        async with self._lock:
-            self._thread_waiters[req_id] = fut
-        msg: JsonDict = {
-            "type": "thread_op",
-            "req_id": req_id,
-            "trace_id": trace_id,
-            "thread_key": thread_key,
-            "op": op,
-        }
-        if index is not None:
-            msg["index"] = int(index)
-        t0 = time.time()
-        logger.info(f"op=thread_op.send proxy_id={proxy_id} trace_id={trace_id} req_id={req_id} op={op} thread_key={thread_key}")
-        try:
-            await self.registry.send_json(proxy_id, msg)
-            res = await asyncio.wait_for(fut, timeout=timeout_s)
-            latency_ms = int((time.time() - t0) * 1000.0)
             logger.info(
-                f"op=thread_op.done proxy_id={proxy_id} trace_id={trace_id} req_id={req_id} "
+                f"op=dispatch.done proxy_id={proxy_id} trace_id={trace_id} task_id={task_id} thread_id={thread_id[-8:]} "
                 f"ok={bool(res.get('ok'))} latency_ms={latency_ms}"
             )
             return res
         finally:
             async with self._lock:
-                self._thread_waiters.pop(req_id, None)
+                self._waiters.pop(task_id, None)
+
+    async def appserver_call(self, proxy_id: str, method: str, params: JsonDict | None, *, timeout_s: float = 30.0) -> JsonDict:
+        req_id = uuid.uuid4().hex
+        trace_id = uuid.uuid4().hex
+        fut: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
+        async with self._lock:
+            self._rpc_waiters[req_id] = fut
+        msg: JsonDict = {"type": "appserver_request", "req_id": req_id, "trace_id": trace_id, "method": method, "params": params or {}}
+        t0 = time.time()
+        logger.info(f"op=appserver.send proxy_id={proxy_id} trace_id={trace_id} req_id={req_id} method={method}")
+        try:
+            await self.registry.send_json(proxy_id, msg)
+            res = await asyncio.wait_for(fut, timeout=timeout_s)
+            latency_ms = int((time.time() - t0) * 1000.0)
+            logger.info(f"op=appserver.done proxy_id={proxy_id} trace_id={trace_id} req_id={req_id} ok={bool(res.get('ok'))} latency_ms={latency_ms}")
+            return res
+        finally:
+            async with self._lock:
+                self._rpc_waiters.pop(req_id, None)
 
     async def send_task_assign(self, *, proxy_id: str, task_msg: JsonDict) -> None:
         task_id = str(task_msg.get("task_id") or "")
@@ -449,18 +480,18 @@ class ManagerCore:
             trace_id = str(msg.get("trace_id") or "")
             logger.info(f"op=ws.recv proxy_id={proxy_id} type=task_ack trace_id={trace_id} task_id={task_id}")
             return
-        if t == "thread_op_result":
+        if t == "appserver_response":
             req_id = str(msg.get("req_id") or "")
             trace_id = str(msg.get("trace_id") or "")
-            logger.info(f"op=ws.recv proxy_id={proxy_id} type=thread_op_result trace_id={trace_id} req_id={req_id} ok={bool(msg.get('ok'))}")
+            logger.info(f"op=ws.recv proxy_id={proxy_id} type=appserver_response trace_id={trace_id} req_id={req_id} ok={bool(msg.get('ok'))}")
             if not req_id:
                 return
             async with self._lock:
-                waiter = self._thread_waiters.get(req_id)
+                waiter = self._rpc_waiters.get(req_id)
                 if waiter and not waiter.done():
                     waiter.set_result(msg)
                     return
-            logger.info(f"orphan thread_op_result: proxy={proxy_id} req_id={req_id} ok={bool(msg.get('ok'))}")
+            logger.info(f"orphan appserver_response: proxy={proxy_id} req_id={req_id} ok={bool(msg.get('ok'))}")
             return
         if t != "task_result":
             return
@@ -674,7 +705,7 @@ async def run_ws_server(listen: str, registry: ProxyRegistry, core: ManagerCore)
                 if t == "heartbeat":
                     await registry.heartbeat(proxy_id, ws)
                     continue
-                if t in ("task_ack", "task_result", "thread_op_result"):
+                if t in ("task_ack", "task_result", "appserver_response"):
                     await core.on_proxy_message(proxy_id, m)
                     continue
         except websockets.ConnectionClosed:
@@ -700,7 +731,8 @@ async def run_control_server(listen: str, token: str, registry: ProxyRegistry, c
     Request (one line):
       {"type":"servers","token":"..."}
       {"type":"dispatch","token":"...","proxy_id":"proxy27","prompt":"ping","timeout":60}
-      {"type":"thread_op","token":"...","proxy_id":"proxy27","thread_key":"tg:1:2","op":"list|new|back|del","index":1,"timeout":30}
+      {"type":"appserver","token":"...","proxy_id":"proxy27","method":"thread/list","params":{"limit":1},"timeout":30}
+      {"type":"dispatch_text","token":"...","proxy_id":"proxy27","session_key":"tg:1:2","text":"ping","timeout":60}
 
     Response (one line JSON):
       {"ok":true,"type":"servers","online":["proxy1"],"allowed":["proxy1","proxy2"]}
@@ -766,35 +798,74 @@ async def run_control_server(listen: str, token: str, registry: ProxyRegistry, c
                         await writer.drain()
                         logger.info(f"op=ctl.send peer={peer} type=dispatch ok=false proxy_id={proxy_id} error={type(e).__name__}")
                     continue
-                if t == "thread_op":
+                if t == "appserver":
                     proxy_id = str(req.get("proxy_id") or "").strip()
-                    thread_key = str(req.get("thread_key") or "").strip()
-                    op = str(req.get("op") or "").strip()
-                    index = req.get("index")
+                    method = str(req.get("method") or "").strip()
+                    params = req.get("params")
                     timeout_s = float(req.get("timeout") or 30.0)
                     if not proxy_id:
-                        writer.write((json.dumps({"ok": False, "type": "thread_op", "error": "missing proxy_id"}) + "\n").encode("utf-8"))
+                        writer.write((json.dumps({"ok": False, "type": "appserver", "error": "missing proxy_id"}) + "\n").encode("utf-8"))
                         await writer.drain()
                         continue
-                    if not thread_key:
-                        writer.write((json.dumps({"ok": False, "type": "thread_op", "error": "missing thread_key"}) + "\n").encode("utf-8"))
-                        await writer.drain()
-                        continue
-                    if op not in ("list", "new", "back", "del"):
-                        writer.write((json.dumps({"ok": False, "type": "thread_op", "error": f"bad op: {op}"}) + "\n").encode("utf-8"))
+                    if not method:
+                        writer.write((json.dumps({"ok": False, "type": "appserver", "error": "missing method"}) + "\n").encode("utf-8"))
                         await writer.drain()
                         continue
                     try:
-                        res = await core.thread_op(proxy_id, thread_key, op, index=(int(index) if index is not None else None), timeout_s=timeout_s)
-                        resp = {"ok": True, "type": "thread_op", "result": res}
+                        res = await core.appserver_call(proxy_id, method, params if isinstance(params, dict) else {}, timeout_s=timeout_s)
+                        resp = {"ok": True, "type": "appserver", "result": res}
                         writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()
-                        logger.info(f"op=ctl.send peer={peer} type=thread_op ok=true proxy_id={proxy_id} op={op}")
+                        logger.info(f"op=ctl.send peer={peer} type=appserver ok=true proxy_id={proxy_id} method={method}")
                     except Exception as e:
-                        resp = {"ok": False, "type": "thread_op", "error": f"{type(e).__name__}: {e}"}
+                        resp = {"ok": False, "type": "appserver", "error": f"{type(e).__name__}: {e}"}
                         writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()
-                        logger.info(f"op=ctl.send peer={peer} type=thread_op ok=false proxy_id={proxy_id} op={op} error={type(e).__name__}")
+                        logger.info(f"op=ctl.send peer={peer} type=appserver ok=false proxy_id={proxy_id} method={method} error={type(e).__name__}")
+                    continue
+                if t == "dispatch_text":
+                    proxy_id = str(req.get("proxy_id") or "").strip()
+                    session_key = str(req.get("session_key") or "").strip()
+                    text = str(req.get("text") or "")
+                    timeout_s = float(req.get("timeout") or 60.0)
+                    if not proxy_id or not session_key:
+                        writer.write((json.dumps({"ok": False, "type": "dispatch_text", "error": "missing proxy_id/session_key"}) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        continue
+                    # Ensure thread for this (session_key, proxy_id)
+                    try:
+                        # Load mapping via sessions.json on disk each time (control plane only).
+                        sessions = load_sessions()
+                        sess = sessions.get(session_key) or {"proxy": proxy_id, "by_proxy": {}, "defaults": {}}
+                        byp = sess.get("by_proxy") if isinstance(sess.get("by_proxy"), dict) else {}
+                        entry = byp.get(proxy_id) if isinstance(byp.get(proxy_id), dict) else {}
+                        thread_id = str(entry.get("current_thread_id") or "")
+                        if not thread_id:
+                            rep = await core.appserver_call(
+                                proxy_id,
+                                "thread/start",
+                                {"cwd": str(BASE_DIR), "sandbox": "workspaceWrite", "approvalPolicy": "onRequest", "personality": "pragmatic"},
+                                timeout_s=min(timeout_s, 60.0),
+                            )
+                            if not bool(rep.get("ok")):
+                                raise RuntimeError(f"thread/start failed: {rep.get('error')}")
+                            result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+                            thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+                            thread_id = str(thread.get("id") or "")
+                            if not thread_id:
+                                raise RuntimeError(f"thread/start missing id: {result!r}")
+                            byp.setdefault(proxy_id, {})["current_thread_id"] = thread_id
+                            sess["by_proxy"] = byp
+                            sessions[session_key] = sess
+                            save_sessions(sessions)
+                        res = await core.dispatch_task(proxy_id, thread_id, text, thread_key=session_key, timeout_s=timeout_s)
+                        writer.write((json.dumps({"ok": True, "type": "dispatch_text", "thread_id": thread_id, "result": res}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=dispatch_text ok=true proxy_id={proxy_id} session_key={session_key}")
+                    except Exception as e:
+                        writer.write((json.dumps({"ok": False, "type": "dispatch_text", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=dispatch_text ok=false proxy_id={proxy_id} error={type(e).__name__}")
                     continue
                 writer.write((json.dumps({"ok": False, "error": "unknown type"}) + "\n").encode("utf-8"))
                 await writer.drain()
@@ -846,22 +917,108 @@ class ManagerApp:
         online = self.registry.online_proxy_ids()
         return online[0] if online else None
 
-    async def cmd_servers(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /servers from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+    def _get_sess(self, sk: str) -> dict:
+        sess = self.sessions.get(sk)
+        if not isinstance(sess, dict):
+            sess = {"proxy": "", "by_proxy": {}, "defaults": {}}
+            self.sessions[sk] = sess
+        if not isinstance(sess.get("by_proxy"), dict):
+            sess["by_proxy"] = {}
+        if not isinstance(sess.get("defaults"), dict):
+            sess["defaults"] = {}
+        return sess
+
+    def _get_selected_proxy(self, sk: str) -> str:
+        sess = self._get_sess(sk)
+        return str(sess.get("proxy") or "").strip()
+
+    def _set_selected_proxy(self, sk: str, proxy_id: str) -> None:
+        sess = self._get_sess(sk)
+        sess["proxy"] = str(proxy_id or "").strip()
+        self.sessions[sk] = sess
+
+    def _get_current_thread_id(self, sk: str, proxy_id: str) -> str:
+        sess = self._get_sess(sk)
+        byp = sess["by_proxy"]
+        entry = byp.get(proxy_id)
+        if not isinstance(entry, dict):
+            return ""
+        return str(entry.get("current_thread_id") or "").strip()
+
+    def _set_current_thread_id(self, sk: str, proxy_id: str, thread_id: str) -> None:
+        sess = self._get_sess(sk)
+        byp = sess["by_proxy"]
+        entry = byp.get(proxy_id)
+        if not isinstance(entry, dict):
+            entry = {}
+            byp[proxy_id] = entry
+        entry["current_thread_id"] = str(thread_id or "")
+        entry["last_used_at"] = int(time.time())
+        sess["by_proxy"] = byp
+        self.sessions[sk] = sess
+
+    def _parse_kv(self, args: list[str]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for a in args:
+            if "=" not in a:
+                continue
+            k, v = a.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if not k:
+                continue
+            out[k] = v
+        return out
+
+    def _pretty_json(self, obj: Any, *, limit: int = 3000) -> str:
+        s = json.dumps(obj, ensure_ascii=False, indent=2)
+        if len(s) <= limit:
+            return s
+        return s[:limit] + f"\n...(truncated, total={len(s)})"
+
+    async def cmd_proxy_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /proxy_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/servers reply")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/proxy_list reply")
             return
         sk = _session_key(update)
-        sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
-        selected = str(sess.get("proxy") or "")
+        selected = self._get_selected_proxy(sk)
         online = self.registry.online_proxy_ids()
         allowed = self.registry.allowed_proxy_ids()
         lines = []
         lines.append(f"online: {', '.join(online) if online else '(none)'}")
-        lines.append(f"selected: {selected or '(auto)'}")
+        lines.append(f"selected: {selected or '(none)'}")
         if allowed:
             lines.append(f"allowed: {', '.join(allowed)}")
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/servers reply")
+        lines.append("use: /proxy_use proxyId=<id>")
+        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/proxy_list reply")
+
+    async def cmd_proxy_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /proxy_use chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/proxy_use reply")
+            return
+        sk = _session_key(update)
+        kv = self._parse_kv(context.args or [])
+        proxy_id = (kv.get("proxyId") or (context.args[0] if context.args else "")).strip()
+        if not proxy_id:
+            await _tg_call(update.message.reply_text("usage: /proxy_use proxyId=<id>"), timeout_s=15.0, what="/proxy_use reply")
+            return
+        if not self.registry.is_online(proxy_id):
+            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id}"), timeout_s=15.0, what="/proxy_use reply")
+            return
+        self._set_selected_proxy(sk, proxy_id)
+        save_sessions(self.sessions)
+        await _tg_call(update.message.reply_text(f"ok proxy={proxy_id}"), timeout_s=15.0, what="/proxy_use reply")
+
+    async def cmd_proxy_current(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /proxy_current chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/proxy_current reply")
+            return
+        sk = _session_key(update)
+        proxy_id = self._get_selected_proxy(sk)
+        await _tg_call(update.message.reply_text(f"proxy: {proxy_id or '(none)'}"), timeout_s=15.0, what="/proxy_current reply")
 
     async def cmd_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(
@@ -873,131 +1030,359 @@ class ManagerApp:
             return
         await _tg_call(update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
 
-    async def cmd_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /use from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/use reply")
-            return
+    async def _require_proxy_online(self, update: Update) -> str | None:
+        if not update.message:
+            return None
         sk = _session_key(update)
-        if not context.args:
-            await _tg_call(update.message.reply_text("usage: /use <proxy_id>"), timeout_s=15.0, what="/use reply")
-            return
-        proxy_id = str(context.args[0]).strip()
+        proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("usage: /use <proxy_id>"), timeout_s=15.0, what="/use reply")
-            return
+            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use proxyId=<id> 选择一台机器"), timeout_s=15.0, what="require proxy")
+            return None
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id}"), timeout_s=15.0, what="/use reply")
-            return
-        sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
-        sess["proxy"] = proxy_id
-        sess["reset_next"] = True  # switch machine => reset remote thread mapping
-        self.sessions[sk] = sess
-        save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"using proxy: {proxy_id} (next turn will reset)"), timeout_s=15.0, what="/use reply")
+            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /proxy_list)"), timeout_s=15.0, what="require proxy")
+            return None
+        return proxy_id
 
-    async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /reset from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+    async def cmd_thread_current(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /thread_current chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/reset reply")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_current reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
             return
         sk = _session_key(update)
-        sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
-        sess["reset_next"] = True
-        self.sessions[sk] = sess
-        save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text("ok (next turn will reset)"), timeout_s=15.0, what="/reset reply")
+        tid = self._get_current_thread_id(sk, proxy_id)
+        await _tg_call(update.message.reply_text(f"threadId: {tid or '(none)'}"), timeout_s=15.0, what="/thread_current reply")
 
-    async def cmd_pc(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /pc from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/pc reply")
-            return
-        sk = _session_key(update)
-        if not context.args or context.args[0] not in ("on", "off"):
-            await _tg_call(update.message.reply_text("usage: /pc on|off"), timeout_s=15.0, what="/pc reply")
-            return
-        mode = context.args[0] == "on"
-        sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
-        sess["pc_mode"] = mode
-        self.sessions[sk] = sess
-        save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"pc_mode={mode} (currently not used by protocol)"), timeout_s=15.0, what="/pc reply")
-
-    def _require_selected_proxy(self, update: Update) -> str | None:
-        sk = _session_key(update)
-        sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
-        selected_proxy = str(sess.get("proxy") or "").strip()
-        return selected_proxy or None
-
-    async def _thread_op_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE, op: str, *, index: int | None = None) -> None:
+    async def cmd_thread_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /thread_start chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what=f"/{op} reply")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_start reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        params: JsonDict = {}
+        for k in ("cwd", "sandbox", "approvalPolicy", "personality", "model", "baseInstructions"):
+            if k in kv:
+                params[k] = kv[k]
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_start reply")
+            return
+        rep = await core.appserver_call(proxy_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_start reply")
+            return
+        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        thread_id = str(thread.get("id") or "")
+        if not thread_id:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="/thread_start reply")
             return
         sk = _session_key(update)
-        proxy_id = self._require_selected_proxy(update)
-        if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /servers 查看在线代理，然后 /use <proxy_id> 选择一台机器"), timeout_s=15.0, what=f"/{op} reply")
+        self._set_current_thread_id(sk, proxy_id, thread_id)
+        save_sessions(self.sessions)
+        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_start reply")
+
+    async def cmd_thread_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /thread_resume chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
             return
-        if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /servers)"), timeout_s=15.0, what=f"/{op} reply")
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_resume reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        if not thread_id:
+            await _tg_call(update.message.reply_text("usage: /thread_resume threadId=<id>"), timeout_s=15.0, what="/thread_resume reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what=f"/{op} reply")
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_resume reply")
             return
-        try:
-            res = await core.thread_op(proxy_id, sk, op, index=index, timeout_s=min(30.0, self.task_timeout_s))
-        except Exception as e:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {type(e).__name__}: {e}"), timeout_s=15.0, what=f"/{op} reply")
+        rep = await core.appserver_call(proxy_id, "thread/resume", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_resume reply")
             return
-        if not bool(res.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {res.get('error') or 'unknown error'}"), timeout_s=15.0, what=f"/{op} reply")
-            return
-        sessions = res.get("sessions") if isinstance(res.get("sessions"), list) else []
-        depth = int(res.get("depth") or 0)
-        lines: list[str] = []
-        lines.append(f"proxy: {proxy_id}")
-        lines.append(f"depth: {depth}")
-        if sessions:
-            for i, sid in enumerate(sessions, start=1):
-                mark = " (current)" if i == len(sessions) else ""
-                lines.append(f"{i}. {sid}{mark}")
-        else:
-            lines.append("(empty)")
-        lines.append("commands: /new /back /sessions /sessiondel <idx>")
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what=f"/{op} reply")
+        sk = _session_key(update)
+        self._set_current_thread_id(sk, proxy_id, thread_id)
+        save_sessions(self.sessions)
+        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_resume reply")
 
-    async def cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /new from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
-        await self._thread_op_cmd(update, context, "new")
-
-    async def cmd_back(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /back from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
-        await self._thread_op_cmd(update, context, "back")
-
-    async def cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /sessions from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
-        await self._thread_op_cmd(update, context, "list")
-
-    async def cmd_sessiondel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(
-            f"cmd /sessiondel from chat={update.effective_chat.id if update.effective_chat else '?'} "
-            f"user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}"
-        )
+    async def cmd_thread_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /thread_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
-        if not context.args:
-            await _tg_call(update.message.reply_text("usage: /sessiondel <idx>"), timeout_s=15.0, what="/sessiondel reply")
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_list reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        params: JsonDict = {}
+        for k in ("cursor", "limit", "sortKey", "archived", "cwd", "modelProviders", "sourceKinds"):
+            if k in kv:
+                v: Any = kv[k]
+                if k in ("limit",):
+                    try:
+                        v = int(v)
+                    except Exception:
+                        pass
+                if k in ("archived",):
+                    v = str(v).lower() in ("1", "true", "yes", "y", "on")
+                if k in ("modelProviders", "sourceKinds"):
+                    v = [x for x in str(v).split(",") if x]
+                params[k] = v
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_list reply")
+            return
+        rep = await core.appserver_call(proxy_id, "thread/list", params, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_list reply")
+            return
+        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+        data = result.get("data") if isinstance(result.get("data"), list) else []
+        lines: list[str] = [f"proxy: {proxy_id}", f"count: {len(data)}"]
+        for i, item in enumerate(data[:20], start=1):
+            if not isinstance(item, dict):
+                continue
+            tid = str(item.get("id") or "")
+            preview = str(item.get("preview") or "")
+            status = item.get("status") if isinstance(item.get("status"), dict) else {}
+            stype = str(status.get("type") or "")
+            lines.append(f"{i}. {tid} [{stype}] {preview[:80]}")
+        if result.get("nextCursor"):
+            lines.append(f"nextCursor: {result.get('nextCursor')}")
+        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/thread_list reply")
+
+    async def cmd_thread_read(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /thread_read chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_read reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        if not thread_id:
+            await _tg_call(update.message.reply_text("usage: /thread_read threadId=<id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
+            return
+        include_turns = str(kv.get("includeTurns") or "false").lower() in ("1", "true", "yes", "y", "on")
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_read reply")
+            return
+        rep = await core.appserver_call(proxy_id, "thread/read", {"threadId": thread_id, "includeTurns": include_turns}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_read reply")
+            return
+        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/thread_read reply")
+
+    async def cmd_thread_archive(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /thread_archive chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_archive reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        if not thread_id:
+            sk = _session_key(update)
+            thread_id = self._get_current_thread_id(sk, proxy_id)
+        if not thread_id:
+            await _tg_call(update.message.reply_text("usage: /thread_archive threadId=<id> (or set current thread first)"), timeout_s=15.0, what="/thread_archive reply")
+            return
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_archive reply")
+            return
+        rep = await core.appserver_call(proxy_id, "thread/archive", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_archive reply")
+            return
+        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok archived threadId={thread_id}"), timeout_s=15.0, what="/thread_archive reply")
+
+    async def cmd_thread_unarchive(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /thread_unarchive chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_unarchive reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        if not thread_id:
+            await _tg_call(update.message.reply_text("usage: /thread_unarchive threadId=<id>"), timeout_s=15.0, what="/thread_unarchive reply")
+            return
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_unarchive reply")
+            return
+        rep = await core.appserver_call(proxy_id, "thread/unarchive", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_unarchive reply")
+            return
+        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok unarchived threadId={thread_id}"), timeout_s=15.0, what="/thread_unarchive reply")
+
+    async def cmd_model_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /model_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/model_list reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        params: JsonDict = {}
+        if "limit" in kv:
+            try:
+                params["limit"] = int(kv["limit"])
+            except Exception:
+                pass
+        if "includeHidden" in kv:
+            params["includeHidden"] = str(kv["includeHidden"]).lower() in ("1", "true", "yes", "y", "on")
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/model_list reply")
+            return
+        rep = await core.appserver_call(proxy_id, "model/list", params, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/model_list reply")
+            return
+        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+        data = result.get("data") if isinstance(result.get("data"), list) else []
+        lines = [f"proxy: {proxy_id}", f"count: {len(data)}"]
+        for i, item in enumerate(data[:30], start=1):
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("id") or "")
+            lines.append(f"{i}. {mid}")
+        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/model_list reply")
+
+    async def cmd_skills_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /skills_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/skills_list reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        params: JsonDict = {}
+        if "cwds" in kv:
+            params["cwds"] = [x for x in str(kv["cwds"]).split(",") if x]
+        if "forceReload" in kv:
+            params["forceReload"] = str(kv["forceReload"]).lower() in ("1", "true", "yes", "y", "on")
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/skills_list reply")
+            return
+        rep = await core.appserver_call(proxy_id, "skills/list", params, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/skills_list reply")
+            return
+        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/skills_list reply")
+
+    async def cmd_config_read(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /config_read chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_read reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        params: JsonDict = {}
+        if "includeLayers" in kv:
+            params["includeLayers"] = str(kv["includeLayers"]).lower() in ("1", "true", "yes", "y", "on")
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_read reply")
+            return
+        rep = await core.appserver_call(proxy_id, "config/read", params, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_read reply")
+            return
+        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/config_read reply")
+
+    async def cmd_config_value_write(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /config_value_write chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_value_write reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        kv = self._parse_kv(context.args or [])
+        key_path = (kv.get("keyPath") or "").strip()
+        if not key_path or "value" not in kv:
+            await _tg_call(update.message.reply_text("usage: /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]"), timeout_s=15.0, what="/config_value_write reply")
             return
         try:
-            idx = int(str(context.args[0]).strip())
-        except Exception:
-            await _tg_call(update.message.reply_text("usage: /sessiondel <idx>"), timeout_s=15.0, what="/sessiondel reply")
+            value_obj = json.loads(kv["value"])
+        except Exception as e:
+            await _tg_call(update.message.reply_text(f"bad value json: {type(e).__name__}: {e}"), timeout_s=15.0, what="/config_value_write reply")
             return
-        await self._thread_op_cmd(update, context, "del", index=idx)
+        params: JsonDict = {"keyPath": key_path, "value": value_obj}
+        if "mergeStrategy" in kv:
+            params["mergeStrategy"] = kv["mergeStrategy"]
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_value_write reply")
+            return
+        rep = await core.appserver_call(proxy_id, "config/value/write", params, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_value_write reply")
+            return
+        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok"), timeout_s=15.0, what="/config_value_write reply")
+
+    async def cmd_collaborationmode_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /collaborationmode_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/collaborationmode_list reply")
+            return
+        proxy_id = await self._require_proxy_online(update)
+        if not proxy_id:
+            return
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/collaborationmode_list reply")
+            return
+        rep = await core.appserver_call(proxy_id, "collaborationMode/list", {}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/collaborationmode_list reply")
+            return
+        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/collaborationmode_list reply")
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         trace_id = uuid.uuid4().hex
@@ -1012,25 +1397,39 @@ class ManagerApp:
             return
 
         sk = _session_key(update)
-        sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
-        selected_proxy = str(sess.get("proxy") or "").strip()
-        if not selected_proxy:
-            await _tg_call(update.message.reply_text("请先 /servers 查看在线代理，然后 /use <proxy_id> 选择一台机器"), timeout_s=15.0, what="msg reply")
+        proxy_id = self._get_selected_proxy(sk)
+        if not proxy_id:
+            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use proxyId=<id> 选择一台机器"), timeout_s=15.0, what="msg reply")
             return
-        proxy_id = selected_proxy
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /servers)"), timeout_s=15.0, what="msg reply")
+            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /proxy_list)"), timeout_s=15.0, what="msg reply")
             return
 
         task_id = uuid.uuid4().hex
-        reset_thread = bool(sess.get("reset_next", False))
-        sess["reset_next"] = False
-        self.sessions[sk] = sess
-        save_sessions(self.sessions)
+        thread_id = self._get_current_thread_id(sk, proxy_id)
+        core = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="msg reply")
+            return
+        if not thread_id:
+            # Auto-create a thread on first message for this (chat, proxy).
+            params: JsonDict = {"cwd": str(BASE_DIR), "sandbox": "workspaceWrite", "approvalPolicy": "onRequest", "personality": "pragmatic"}
+            rep = await core.appserver_call(proxy_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
+            if not bool(rep.get("ok")):
+                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start failed: {rep.get('error')}"), timeout_s=15.0, what="msg reply")
+                return
+            result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+            thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+            thread_id = str(thread.get("id") or "")
+            if not thread_id:
+                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="msg reply")
+                return
+            self._set_current_thread_id(sk, proxy_id, thread_id)
+            save_sessions(self.sessions)
 
         prompt = update.message.text
         placeholder = await _tg_call(
-            update.message.reply_text(f"working (proxy={proxy_id}, reset={reset_thread}) ..."),
+            update.message.reply_text(f"working (proxy={proxy_id}, threadId={thread_id[-8:]}) ..."),
             timeout_s=15.0,
             what="placeholder",
         )
@@ -1041,15 +1440,11 @@ class ManagerApp:
             "trace_id": trace_id,
             "task_id": task_id,
             "thread_key": sk,
+            "thread_id": thread_id,
             "prompt": prompt,
-            "reset_thread": reset_thread,
         }
 
         # Event-driven: send immediately, do not await result here.
-        core = context.application.bot_data.get("core")
-        if core is None:
-            await _tg_call(placeholder.edit_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="edit error")
-            return
         if chat_id is None:
             return
         await core.register_task(
@@ -1057,12 +1452,16 @@ class ManagerApp:
                 task_id=task_id,
                 trace_id=trace_id,
                 proxy_id=proxy_id,
+                thread_id=thread_id,
                 chat_id=int(chat_id),
                 placeholder_msg_id=int(placeholder.message_id),
                 created_at=time.time(),
             )
         )
-        logger.info(f"op=dispatch.enqueue trace_id={trace_id} proxy_id={proxy_id} task_id={task_id} chat_id={chat_id} msg_id={placeholder.message_id} prompt_len={len(prompt)}")
+        logger.info(
+            f"op=dispatch.enqueue trace_id={trace_id} proxy_id={proxy_id} task_id={task_id} thread_id={thread_id[-8:]} "
+            f"chat_id={chat_id} msg_id={placeholder.message_id} prompt_len={len(prompt)}"
+        )
         asyncio.create_task(core.send_task_assign(proxy_id=proxy_id, task_msg=task_msg), name=f"send:{proxy_id}:{task_id}")
 
 
@@ -1180,15 +1579,25 @@ def main() -> int:
                     )
                     tg = Application.builder().token(bot_token).request(req).build()
                     tg.bot_data["core"] = core
-                    tg.add_handler(CommandHandler("servers", app.cmd_servers))
                     tg.add_handler(CommandHandler("ping", app.cmd_ping))
-                    tg.add_handler(CommandHandler("use", app.cmd_use))
-                    tg.add_handler(CommandHandler("reset", app.cmd_reset))
-                    tg.add_handler(CommandHandler("pc", app.cmd_pc))
-                    tg.add_handler(CommandHandler("new", app.cmd_new))
-                    tg.add_handler(CommandHandler("back", app.cmd_back))
-                    tg.add_handler(CommandHandler("sessions", app.cmd_sessions))
-                    tg.add_handler(CommandHandler("sessiondel", app.cmd_sessiondel))
+                    # Back-compat aliases.
+                    tg.add_handler(CommandHandler("servers", app.cmd_proxy_list))
+                    tg.add_handler(CommandHandler("use", app.cmd_proxy_use))
+                    tg.add_handler(CommandHandler("proxy_list", app.cmd_proxy_list))
+                    tg.add_handler(CommandHandler("proxy_use", app.cmd_proxy_use))
+                    tg.add_handler(CommandHandler("proxy_current", app.cmd_proxy_current))
+                    tg.add_handler(CommandHandler("thread_current", app.cmd_thread_current))
+                    tg.add_handler(CommandHandler("thread_start", app.cmd_thread_start))
+                    tg.add_handler(CommandHandler("thread_resume", app.cmd_thread_resume))
+                    tg.add_handler(CommandHandler("thread_list", app.cmd_thread_list))
+                    tg.add_handler(CommandHandler("thread_read", app.cmd_thread_read))
+                    tg.add_handler(CommandHandler("thread_archive", app.cmd_thread_archive))
+                    tg.add_handler(CommandHandler("thread_unarchive", app.cmd_thread_unarchive))
+                    tg.add_handler(CommandHandler("model_list", app.cmd_model_list))
+                    tg.add_handler(CommandHandler("skills_list", app.cmd_skills_list))
+                    tg.add_handler(CommandHandler("config_read", app.cmd_config_read))
+                    tg.add_handler(CommandHandler("config_value_write", app.cmd_config_value_write))
+                    tg.add_handler(CommandHandler("collaborationmode_list", app.cmd_collaborationmode_list))
                     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app.on_text))
                     tg.add_error_handler(lambda _u, c: logger.warning(f"telegram handler error: {c.error!r}"), block=False)
 

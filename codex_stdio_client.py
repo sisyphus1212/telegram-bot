@@ -164,6 +164,18 @@ class CodexAppServerStdioProcess:
         personality: str = "pragmatic",
         base_instructions: str | None = None,
     ) -> str:
+        # NOTE: Different codex versions have slightly different enum spellings.
+        # - thread/start sandbox: legacy kebab-case in some versions (workspace-write/read-only/danger-full-access)
+        # - thread/start approvalPolicy: legacy kebab-case or other variants (on-request/untrusted/never/...)
+        sandbox = {
+            "workspaceWrite": "workspace-write",
+            "readOnly": "read-only",
+            "dangerFullAccess": "danger-full-access",
+        }.get(sandbox, sandbox)
+        approval_policy = {
+            "onRequest": "on-request",
+            "unlessTrusted": "untrusted",
+        }.get(approval_policy, approval_policy)
         params: JsonDict = {
             "cwd": cwd,
             "sandbox": sandbox,
@@ -178,6 +190,39 @@ class CodexAppServerStdioProcess:
         if not isinstance(thread_id, str) or not thread_id:
             raise CodexAppServerError(f"thread/start missing id: {result}")
         return thread_id
+
+    async def thread_resume(self, thread_id: str) -> JsonDict:
+        return await self.request("thread/resume", {"threadId": thread_id})
+
+    async def thread_list(self, params: JsonDict | None = None) -> JsonDict:
+        return await self.request("thread/list", params or {})
+
+    async def thread_read(self, thread_id: str, include_turns: bool = False) -> JsonDict:
+        return await self.request("thread/read", {"threadId": thread_id, "includeTurns": bool(include_turns)})
+
+    async def thread_archive(self, thread_id: str) -> JsonDict:
+        return await self.request("thread/archive", {"threadId": thread_id})
+
+    async def thread_unarchive(self, thread_id: str) -> JsonDict:
+        return await self.request("thread/unarchive", {"threadId": thread_id})
+
+    async def thread_loaded_list(self) -> JsonDict:
+        return await self.request("thread/loaded/list", {})
+
+    async def model_list(self, params: JsonDict | None = None) -> JsonDict:
+        return await self.request("model/list", params or {})
+
+    async def skills_list(self, params: JsonDict | None = None) -> JsonDict:
+        return await self.request("skills/list", params or {})
+
+    async def config_read(self, params: JsonDict | None = None) -> JsonDict:
+        return await self.request("config/read", params or {})
+
+    async def config_value_write(self, params: JsonDict) -> JsonDict:
+        return await self.request("config/value/write", params)
+
+    async def collaborationmode_list(self) -> JsonDict:
+        return await self.request("collaborationMode/list", {})
 
     async def turn_start_text(self, thread_id: str, text: str) -> str:
         result = await self.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": text}]})
@@ -275,4 +320,3 @@ class CodexAppServerStdioProcess:
                     fut.set_exception(CodexAppServerError("app-server reader stopped"))
             self._pending.clear()
             return
-

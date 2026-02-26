@@ -23,7 +23,7 @@
 - `codex_proxy.py`：Proxy 主程序（WS 注册 + 本机执行）
 - `codex_stdio_client.py`：Proxy 侧 stdio JSON-RPC 客户端（驱动 `codex app-server --listen stdio://`）
 - `sessions.json`：Manager 保存每个 Telegram 会话的路由状态（运行后生成，gitignored）
-- `thread_store.json`：Proxy 保存每个 Telegram 会话的 Codex thread 会话栈（运行后生成，gitignored；路径可配置）
+- `sessions.json`：Manager 保存每个 Telegram 会话的路由元数据（chat -> proxy + per-proxy threadId），而 thread 内容由 Codex 自己持久化在 `~/.codex/`。
 - `codex_config.json`：Manager 配置（运行时读取，gitignored）
 - `proxy_config.json`：Proxy 配置（运行时读取，gitignored）
 - `systemd/`：systemd unit 与 env 示例

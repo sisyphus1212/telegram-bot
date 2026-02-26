@@ -44,10 +44,8 @@
 
 - Manager 持久化 **路由状态** 到 `sessions.json`：
   - `proxy`：当前聊天选用的 proxy（空字符串表示自动选择）
-  - `reset_next`：下一次对话是否要求重置远端 thread（由 `/use` 和 `/reset` 触发）
-- Proxy 维护 **thread 会话栈**（并持久化到 `thread_store.json`，可配置路径）：
-  - `thread_key`（来自 Telegram chat+user） -> `{stack: [...], current: ...}`
-  - 当收到 `reset_thread=true` 时，proxy 清空该 `thread_key` 的栈与 current，下次会创建新的 thread
+  - `by_proxy.<proxy_id>.current_thread_id`：当前聊天在该 proxy 上的 current threadId
+- Codex thread 内容由 Codex 自己保存在 proxy 机器的 `~/.codex/`，本项目只保存 threadId “指针/路由”。
 
 该设计避免把 Codex thread id 泄漏到 Manager，也让“在机器上执行”的逻辑尽可能本地化。
 
@@ -64,9 +62,9 @@
 - `task_result`：
   - 成功：`{"type":"task_result","task_id":"...","ok":true,"text":"..."}`
   - 失败：`{"type":"task_result","task_id":"...","ok":false,"error":"..."}`
-- `thread_op_result`：
-  - `{"type":"thread_op_result","req_id":"...","ok":true,"depth":3,"sessions":["a1b2c3d4","...","..."]}`
-  - `{"type":"thread_op_result","req_id":"...","ok":false,"error":"..."}`
+- `appserver_response`（app-server JSON-RPC 透传结果）：
+  - `{"type":"appserver_response","req_id":"...","ok":true,"result":{...}}`
+  - `{"type":"appserver_response","req_id":"...","ok":false,"error":"..."}`
 
 注意：当 proxy 队列已满时，proxy 会直接返回 `task_result(ok=false, error="proxy queue full (max=10)")`，Manager 会将错误回写到 Telegram。
 
@@ -74,12 +72,9 @@
 
 - `register_ok` / `register_error`
 - `task_assign`：
-  - `{"type":"task_assign","task_id":"...","thread_key":"tg:<chat>:<user>","prompt":"...","reset_thread":false}`
-- `thread_op`（会话栈操作）：
-  - list: `{"type":"thread_op","req_id":"...","thread_key":"tg:<chat>:<user>","op":"list"}`
-  - new: `{"type":"thread_op","req_id":"...","thread_key":"tg:<chat>:<user>","op":"new"}`
-  - back: `{"type":"thread_op","req_id":"...","thread_key":"tg:<chat>:<user>","op":"back"}`
-  - del: `{"type":"thread_op","req_id":"...","thread_key":"tg:<chat>:<user>","op":"del","index":2}`
+  - `{"type":"task_assign","task_id":"...","thread_key":"tg:<chat>:<user>","thread_id":"<threadId>","prompt":"..."}`
+- `appserver_request`（app-server JSON-RPC 透传）：
+  - `{"type":"appserver_request","req_id":"...","method":"thread/list","params":{"limit":1}}`
 
 ## 安全说明（当前开发模式）
 
