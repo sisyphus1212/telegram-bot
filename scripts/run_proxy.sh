@@ -8,4 +8,4 @@ if [[ ! -x .venv/bin/python ]]; then
   exit 1
 fi
 
-exec .venv/bin/python codex_manager.py
+exec .venv/bin/python codex_proxy.py
