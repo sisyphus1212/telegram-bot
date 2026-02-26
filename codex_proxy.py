@@ -137,6 +137,7 @@ class CodexProxyAgent:
         manager_ws: str,
         codex_bin: str,
         cwd: str,
+        env: dict[str, str] | None,
         *,
         sandbox: str,
         approval_policy: str,
@@ -188,7 +189,7 @@ class CodexProxyAgent:
                 self._approval_waiters.pop(approval_id, None)
 
         self.app = CodexAppServerStdioProcess(
-            CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd),
+            CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd, env=env),
             on_log=lambda s: logger.info(_kv(op="appserver.log", proxy_id=self.proxy_id, msg=s[:500])),
             on_approval_request=_on_approval,
         )
@@ -524,10 +525,22 @@ def main() -> int:
     cfg_path = Path(args.config) if args.config else (BASE_DIR / "proxy_config.json" if (BASE_DIR / "proxy_config.json").exists() else None)
     cfg = _load_json(cfg_path) if cfg_path else {}
 
-    # Optional network proxy config for Telegram/codex connectivity on some hosts.
-    _maybe_set_env("HTTP_PROXY", _cfg_get_str(cfg, "http_proxy"))
-    _maybe_set_env("HTTPS_PROXY", _cfg_get_str(cfg, "https_proxy"))
-    _maybe_set_env("NO_PROXY", _cfg_get_str(cfg, "no_proxy"))
+    # Optional network proxy config for codex connectivity on some hosts.
+    # Do NOT rely on mutating current process env (not always reflected in /proc and harder to debug).
+    # Instead pass env explicitly to the codex app-server subprocess.
+    env: dict[str, str] = {}
+    hp = _cfg_get_str(cfg, "http_proxy")
+    hsp = _cfg_get_str(cfg, "https_proxy")
+    np = _cfg_get_str(cfg, "no_proxy")
+    if hp:
+        env["HTTP_PROXY"] = hp
+        env["http_proxy"] = hp
+    if hsp:
+        env["HTTPS_PROXY"] = hsp
+        env["https_proxy"] = hsp
+    if np:
+        env["NO_PROXY"] = np
+        env["no_proxy"] = np
 
     manager_ws = args.manager_ws or os.environ.get("CODEX_MANAGER_WS") or _cfg_get_str(cfg, "manager_ws") or "ws://127.0.0.1:8765"
     proxy_id = args.proxy_id or os.environ.get("PROXY_ID") or _cfg_get_str(cfg, "proxy_id")
@@ -542,12 +555,16 @@ def main() -> int:
         raise SystemExit("missing PROXY_ID / --proxy-id")
     # Dev mode: allow empty PROXY_TOKEN if manager doesn't enforce an allowlist.
 
+    if env:
+        logger.info(_kv(op="env.proxy", proxy_id=proxy_id, HTTP_PROXY=env.get("HTTP_PROXY"), HTTPS_PROXY=env.get("HTTPS_PROXY"), NO_PROXY=env.get("NO_PROXY")))
+
     agent = CodexProxyAgent(
         proxy_id=proxy_id,
         token=token,
         manager_ws=manager_ws,
         codex_bin=codex_bin,
         cwd=cwd,
+        env=env or None,
         sandbox=sandbox,
         approval_policy=approval_policy,
     )
