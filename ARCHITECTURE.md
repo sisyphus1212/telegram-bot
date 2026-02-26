@@ -45,9 +45,9 @@
 - Manager 持久化 **路由状态** 到 `sessions.json`：
   - `proxy`：当前聊天选用的 proxy（空字符串表示自动选择）
   - `reset_next`：下一次对话是否要求重置远端 thread（由 `/use` 和 `/reset` 触发）
-- Proxy 在内存中维护 **thread 映射**：
-  - `thread_key`（来自 Telegram chat+user） -> `thread_id`
-  - 当收到 `reset_thread=true` 时，proxy 丢弃映射，下次会创建新的 thread
+- Proxy 维护 **thread 会话栈**（并持久化到 `thread_store.json`，可配置路径）：
+  - `thread_key`（来自 Telegram chat+user） -> `{stack: [...], current: ...}`
+  - 当收到 `reset_thread=true` 时，proxy 清空该 `thread_key` 的栈与 current，下次会创建新的 thread
 
 该设计避免把 Codex thread id 泄漏到 Manager，也让“在机器上执行”的逻辑尽可能本地化。
 
@@ -64,6 +64,9 @@
 - `task_result`：
   - 成功：`{"type":"task_result","task_id":"...","ok":true,"text":"..."}`
   - 失败：`{"type":"task_result","task_id":"...","ok":false,"error":"..."}`
+- `thread_op_result`：
+  - `{"type":"thread_op_result","req_id":"...","ok":true,"depth":3,"sessions":["a1b2c3d4","...","..."]}`
+  - `{"type":"thread_op_result","req_id":"...","ok":false,"error":"..."}`
 
 注意：当 proxy 队列已满时，proxy 会直接返回 `task_result(ok=false, error="proxy queue full (max=10)")`，Manager 会将错误回写到 Telegram。
 
@@ -72,6 +75,11 @@
 - `register_ok` / `register_error`
 - `task_assign`：
   - `{"type":"task_assign","task_id":"...","thread_key":"tg:<chat>:<user>","prompt":"...","reset_thread":false}`
+- `thread_op`（会话栈操作）：
+  - list: `{"type":"thread_op","req_id":"...","thread_key":"tg:<chat>:<user>","op":"list"}`
+  - new: `{"type":"thread_op","req_id":"...","thread_key":"tg:<chat>:<user>","op":"new"}`
+  - back: `{"type":"thread_op","req_id":"...","thread_key":"tg:<chat>:<user>","op":"back"}`
+  - del: `{"type":"thread_op","req_id":"...","thread_key":"tg:<chat>:<user>","op":"del","index":2}`
 
 ## 安全说明（当前开发模式）
 

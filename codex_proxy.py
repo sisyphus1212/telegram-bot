@@ -60,6 +60,23 @@ def _maybe_set_env(name: str, value: str) -> None:
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
+def _atomic_write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), "utf-8")
+    tmp.replace(path)
+
+
+def _load_thread_store(path: Path) -> JsonDict:
+    try:
+        raw = path.read_text("utf-8")
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
 
 class CodexProxyAgent:
     def __init__(
@@ -72,6 +89,7 @@ class CodexProxyAgent:
         *,
         sandbox: str,
         approval_policy: str,
+        thread_store_path: str,
     ) -> None:
         self.proxy_id = proxy_id
         self.token = token
@@ -80,15 +98,78 @@ class CodexProxyAgent:
         self.sandbox = sandbox
         self.approval_policy = approval_policy
         self.app = CodexAppServerStdioProcess(CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd))
-        self._thread_ids: dict[str, str] = {}  # thread_key -> thread_id
+        self.thread_store_path = Path(thread_store_path) if thread_store_path else (BASE_DIR / "thread_store.json")
+        # thread_key -> {"current": str, "stack": list[str]}
+        self._threads: dict[str, dict[str, Any]] = {}
+        self._threads_lock = asyncio.Lock()
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._busy = asyncio.Lock()  # single execution loop (proxy feeds Codex sequentially)
         self.max_pending = int(os.environ.get("PROXY_MAX_PENDING", "10") or "10")
 
+    async def _load_threads(self) -> None:
+        store = _load_thread_store(self.thread_store_path)
+        threads = store.get("threads")
+        if not isinstance(threads, dict):
+            return
+        async with self._threads_lock:
+            out: dict[str, dict[str, Any]] = {}
+            for k, v in threads.items():
+                if not isinstance(k, str) or not k:
+                    continue
+                if not isinstance(v, dict):
+                    continue
+                cur = v.get("current")
+                st = v.get("stack")
+                cur_s = cur if isinstance(cur, str) else ""
+                stack_s = [x for x in st if isinstance(x, str) and x] if isinstance(st, list) else []
+                out[k] = {"current": cur_s, "stack": stack_s}
+            self._threads = out
+
+    async def _save_threads_locked(self) -> None:
+        store = {
+            "version": 1,
+            "proxy_id": self.proxy_id,
+            "saved_at": int(time.time()),
+            "threads": self._threads,
+        }
+        try:
+            _atomic_write_json(self.thread_store_path, store)
+        except Exception as e:
+            logger.warning(_kv(op="thread.store.save_failed", proxy_id=self.proxy_id, error=f"{type(e).__name__}: {e}"))
+
+    async def _get_entry_locked(self, thread_key: str) -> dict[str, Any]:
+        entry = self._threads.get(thread_key)
+        if not entry:
+            entry = {"current": "", "stack": []}
+            self._threads[thread_key] = entry
+        # normalize
+        cur = entry.get("current")
+        st = entry.get("stack")
+        entry["current"] = cur if isinstance(cur, str) else ""
+        entry["stack"] = [x for x in st if isinstance(x, str) and x] if isinstance(st, list) else []
+        return entry
+
+    async def _get_current_thread_id(self, thread_key: str) -> str:
+        async with self._threads_lock:
+            entry = await self._get_entry_locked(thread_key)
+            return str(entry.get("current") or "")
+
+    async def _set_current_thread_id(self, thread_key: str, thread_id: str) -> None:
+        async with self._threads_lock:
+            entry = await self._get_entry_locked(thread_key)
+            entry["current"] = str(thread_id or "")
+            self._threads[thread_key] = entry
+            await self._save_threads_locked()
+
+    async def _reset_threads(self, thread_key: str) -> None:
+        async with self._threads_lock:
+            self._threads[thread_key] = {"current": "", "stack": []}
+            await self._save_threads_locked()
+
     async def _ensure_thread(self, thread_key: str, reset: bool) -> str:
         if reset:
-            self._thread_ids.pop(thread_key, None)
-        tid = self._thread_ids.get(thread_key)
+            await self._reset_threads(thread_key)
+        tid = await self._get_current_thread_id(thread_key)
         if tid:
             return tid
         tid = await self.app.thread_start(
@@ -98,8 +179,69 @@ class CodexProxyAgent:
             personality="pragmatic",
             base_instructions=None,
         )
-        self._thread_ids[thread_key] = tid
+        await self._set_current_thread_id(thread_key, tid)
         return tid
+
+    async def _thread_op_new(self, thread_key: str) -> dict[str, Any]:
+        await self.app.ensure_started_and_initialized(client_name=f"codex_proxy:{self.proxy_id}", version="0.0")
+        async with self._threads_lock:
+            entry = await self._get_entry_locked(thread_key)
+            cur = str(entry.get("current") or "")
+            if cur:
+                entry["stack"].append(cur)
+            entry["current"] = ""
+            self._threads[thread_key] = entry
+            await self._save_threads_locked()
+        tid = await self.app.thread_start(
+            cwd=self.cwd,
+            sandbox=self.sandbox,
+            approval_policy=self.approval_policy,
+            personality="pragmatic",
+            base_instructions=None,
+        )
+        await self._set_current_thread_id(thread_key, tid)
+        return await self._thread_op_list(thread_key)
+
+    async def _thread_op_back(self, thread_key: str) -> dict[str, Any]:
+        async with self._threads_lock:
+            entry = await self._get_entry_locked(thread_key)
+            stack: list[str] = entry["stack"]
+            if not stack:
+                return {"ok": False, "error": "no previous session"}
+            prev = stack.pop()
+            entry["current"] = prev
+            self._threads[thread_key] = entry
+            await self._save_threads_locked()
+        return await self._thread_op_list(thread_key)
+
+    async def _thread_op_list(self, thread_key: str) -> dict[str, Any]:
+        async with self._threads_lock:
+            entry = await self._get_entry_locked(thread_key)
+            cur = str(entry.get("current") or "")
+            stack: list[str] = entry["stack"]
+        def short(x: str) -> str:
+            return x[-8:] if isinstance(x, str) else ""
+        sessions = [short(x) for x in stack] + ([short(cur)] if cur else [])
+        return {"ok": True, "depth": len(sessions), "sessions": sessions, "has_current": bool(cur)}
+
+    async def _thread_op_del(self, thread_key: str, index: int) -> dict[str, Any]:
+        async with self._threads_lock:
+            entry = await self._get_entry_locked(thread_key)
+            cur = str(entry.get("current") or "")
+            stack: list[str] = entry["stack"]
+            items = stack + ([cur] if cur else [])
+            if index < 1 or index > len(items):
+                return {"ok": False, "error": f"index out of range: {index}"}
+            del items[index - 1]
+            if items:
+                entry["current"] = items[-1]
+                entry["stack"] = items[:-1]
+            else:
+                entry["current"] = ""
+                entry["stack"] = []
+            self._threads[thread_key] = entry
+            await self._save_threads_locked()
+        return await self._thread_op_list(thread_key)
 
     async def _run_task(self, msg: JsonDict) -> JsonDict:
         trace_id = str(msg.get("trace_id") or "") or uuid.uuid4().hex
@@ -186,6 +328,7 @@ class CodexProxyAgent:
             # Keep local app-server warm even if manager is temporarily down.
             await self.app.start()
             await self.app.ensure_started_and_initialized(client_name=f"codex_proxy:{self.proxy_id}", version="0.0")
+            await self._load_threads()
 
             backoff_s = 0.5
             while True:
@@ -265,7 +408,38 @@ class CodexProxyAgent:
                                     continue
                                 if not isinstance(msg, dict):
                                     continue
-                                if msg.get("type") != "task_assign":
+                                mtype = msg.get("type")
+                                if mtype == "thread_op":
+                                    req_id = str(msg.get("req_id") or "")
+                                    trace_id = str(msg.get("trace_id") or "") or uuid.uuid4().hex
+                                    thread_key = str(msg.get("thread_key") or "")
+                                    op = str(msg.get("op") or "")
+                                    if not req_id or not thread_key:
+                                        out = {"type": "thread_op_result", "req_id": req_id or "?", "trace_id": trace_id, "ok": False, "error": "missing req_id/thread_key"}
+                                    else:
+                                        try:
+                                            logger.info(_kv(op="thread.op", proxy_id=self.proxy_id, trace_id=trace_id, req_id=req_id, thread_key=thread_key, action=op))
+                                            if op == "new":
+                                                res = await self._thread_op_new(thread_key)
+                                            elif op == "back":
+                                                res = await self._thread_op_back(thread_key)
+                                            elif op == "list":
+                                                res = await self._thread_op_list(thread_key)
+                                            elif op == "del":
+                                                idx = int(msg.get("index") or 0)
+                                                res = await self._thread_op_del(thread_key, idx)
+                                            else:
+                                                res = {"ok": False, "error": f"unknown op: {op}"}
+                                            out = {"type": "thread_op_result", "req_id": req_id, "trace_id": trace_id, **res}
+                                        except Exception as e:
+                                            out = {"type": "thread_op_result", "req_id": req_id, "trace_id": trace_id, "ok": False, "error": f"{type(e).__name__}: {e}"}
+                                    try:
+                                        async with send_lock:
+                                            await ws.send(_json_dumps(out))
+                                    except Exception:
+                                        pass
+                                    continue
+                                if mtype != "task_assign":
                                     continue
                                 task_id = msg.get("task_id")
                                 trace_id = str(msg.get("trace_id") or "") or uuid.uuid4().hex
@@ -344,6 +518,7 @@ def main() -> int:
     ap.add_argument("--cwd", default="", help="override codex cwd")
     ap.add_argument("--sandbox", default="", help="override codex sandbox (e.g. workspace-write / danger-full-access)")
     ap.add_argument("--approval-policy", default="", help="override approval policy (e.g. on-request / never)")
+    ap.add_argument("--thread-store", default="", help="override thread store path (default: ./thread_store.json)")
     args = ap.parse_args()
 
     cfg_path = Path(args.config) if args.config else (BASE_DIR / "proxy_config.json" if (BASE_DIR / "proxy_config.json").exists() else None)
@@ -362,6 +537,7 @@ def main() -> int:
     max_pending = int(os.environ.get("PROXY_MAX_PENDING") or str(cfg.get("max_pending") or 10))
     sandbox = args.sandbox or os.environ.get("CODEX_SANDBOX") or _cfg_get_str(cfg, "sandbox") or "workspace-write"
     approval_policy = args.approval_policy or os.environ.get("CODEX_APPROVAL_POLICY") or _cfg_get_str(cfg, "approval_policy") or "on-request"
+    thread_store = args.thread_store or os.environ.get("CODEX_THREAD_STORE") or _cfg_get_str(cfg, "thread_store") or str(BASE_DIR / "thread_store.json")
 
     if not proxy_id:
         raise SystemExit("missing PROXY_ID / --proxy-id")
@@ -375,6 +551,7 @@ def main() -> int:
         cwd=cwd,
         sandbox=sandbox,
         approval_policy=approval_policy,
+        thread_store_path=thread_store,
     )
     agent.max_pending = max(1, max_pending)
     try:

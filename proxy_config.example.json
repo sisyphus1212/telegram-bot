@@ -5,6 +5,7 @@
   "max_pending": 10,
   "sandbox": "workspace-write",
   "approval_policy": "on-request",
+  "thread_store": "./thread_store.json",
   "codex_cwd": "/root/telegram-bot",
   "codex_bin": "codex",
   "http_proxy": "http://127.0.0.1:8080",

@@ -358,6 +358,7 @@ class ManagerCore:
         self._outbox: TelegramOutbox | None = None
         self._timeout_task: asyncio.Task | None = None
         self._waiters: dict[str, asyncio.Future[JsonDict]] = {}
+        self._thread_waiters: dict[str, asyncio.Future[JsonDict]] = {}
 
     def set_outbox(self, outbox: TelegramOutbox) -> None:
         self._outbox = outbox
@@ -395,6 +396,43 @@ class ManagerCore:
             async with self._lock:
                 self._waiters.pop(task_id, None)
 
+    async def thread_op(self, proxy_id: str, thread_key: str, op: str, *, index: int | None = None, timeout_s: float = 30.0) -> JsonDict:
+        """
+        向某个 proxy 发送 thread 操作（会话栈），并等待 thread_op_result。
+
+        协议：
+          manager -> proxy: {"type":"thread_op","req_id":...,"trace_id":...,"thread_key":...,"op":"new|back|list|del","index":...}
+          proxy -> manager: {"type":"thread_op_result","req_id":...,"trace_id":...,"ok":...,"sessions":[...],"depth":...,"error":...}
+        """
+        req_id = uuid.uuid4().hex
+        trace_id = uuid.uuid4().hex
+        fut: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
+        async with self._lock:
+            self._thread_waiters[req_id] = fut
+        msg: JsonDict = {
+            "type": "thread_op",
+            "req_id": req_id,
+            "trace_id": trace_id,
+            "thread_key": thread_key,
+            "op": op,
+        }
+        if index is not None:
+            msg["index"] = int(index)
+        t0 = time.time()
+        logger.info(f"op=thread_op.send proxy_id={proxy_id} trace_id={trace_id} req_id={req_id} op={op} thread_key={thread_key}")
+        try:
+            await self.registry.send_json(proxy_id, msg)
+            res = await asyncio.wait_for(fut, timeout=timeout_s)
+            latency_ms = int((time.time() - t0) * 1000.0)
+            logger.info(
+                f"op=thread_op.done proxy_id={proxy_id} trace_id={trace_id} req_id={req_id} "
+                f"ok={bool(res.get('ok'))} latency_ms={latency_ms}"
+            )
+            return res
+        finally:
+            async with self._lock:
+                self._thread_waiters.pop(req_id, None)
+
     async def send_task_assign(self, *, proxy_id: str, task_msg: JsonDict) -> None:
         task_id = str(task_msg.get("task_id") or "")
         if not task_id:
@@ -410,6 +448,19 @@ class ManagerCore:
             task_id = str(msg.get("task_id") or "")
             trace_id = str(msg.get("trace_id") or "")
             logger.info(f"op=ws.recv proxy_id={proxy_id} type=task_ack trace_id={trace_id} task_id={task_id}")
+            return
+        if t == "thread_op_result":
+            req_id = str(msg.get("req_id") or "")
+            trace_id = str(msg.get("trace_id") or "")
+            logger.info(f"op=ws.recv proxy_id={proxy_id} type=thread_op_result trace_id={trace_id} req_id={req_id} ok={bool(msg.get('ok'))}")
+            if not req_id:
+                return
+            async with self._lock:
+                waiter = self._thread_waiters.get(req_id)
+                if waiter and not waiter.done():
+                    waiter.set_result(msg)
+                    return
+            logger.info(f"orphan thread_op_result: proxy={proxy_id} req_id={req_id} ok={bool(msg.get('ok'))}")
             return
         if t != "task_result":
             return
@@ -623,7 +674,7 @@ async def run_ws_server(listen: str, registry: ProxyRegistry, core: ManagerCore)
                 if t == "heartbeat":
                     await registry.heartbeat(proxy_id, ws)
                     continue
-                if t in ("task_ack", "task_result"):
+                if t in ("task_ack", "task_result", "thread_op_result"):
                     await core.on_proxy_message(proxy_id, m)
                     continue
         except websockets.ConnectionClosed:
@@ -649,6 +700,7 @@ async def run_control_server(listen: str, token: str, registry: ProxyRegistry, c
     Request (one line):
       {"type":"servers","token":"..."}
       {"type":"dispatch","token":"...","proxy_id":"proxy27","prompt":"ping","timeout":60}
+      {"type":"thread_op","token":"...","proxy_id":"proxy27","thread_key":"tg:1:2","op":"list|new|back|del","index":1,"timeout":30}
 
     Response (one line JSON):
       {"ok":true,"type":"servers","online":["proxy1"],"allowed":["proxy1","proxy2"]}
@@ -713,6 +765,36 @@ async def run_control_server(listen: str, token: str, registry: ProxyRegistry, c
                         writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()
                         logger.info(f"op=ctl.send peer={peer} type=dispatch ok=false proxy_id={proxy_id} error={type(e).__name__}")
+                    continue
+                if t == "thread_op":
+                    proxy_id = str(req.get("proxy_id") or "").strip()
+                    thread_key = str(req.get("thread_key") or "").strip()
+                    op = str(req.get("op") or "").strip()
+                    index = req.get("index")
+                    timeout_s = float(req.get("timeout") or 30.0)
+                    if not proxy_id:
+                        writer.write((json.dumps({"ok": False, "type": "thread_op", "error": "missing proxy_id"}) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        continue
+                    if not thread_key:
+                        writer.write((json.dumps({"ok": False, "type": "thread_op", "error": "missing thread_key"}) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        continue
+                    if op not in ("list", "new", "back", "del"):
+                        writer.write((json.dumps({"ok": False, "type": "thread_op", "error": f"bad op: {op}"}) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        continue
+                    try:
+                        res = await core.thread_op(proxy_id, thread_key, op, index=(int(index) if index is not None else None), timeout_s=timeout_s)
+                        resp = {"ok": True, "type": "thread_op", "result": res}
+                        writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=thread_op ok=true proxy_id={proxy_id} op={op}")
+                    except Exception as e:
+                        resp = {"ok": False, "type": "thread_op", "error": f"{type(e).__name__}: {e}"}
+                        writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=thread_op ok=false proxy_id={proxy_id} op={op} error={type(e).__name__}")
                     continue
                 writer.write((json.dumps({"ok": False, "error": "unknown type"}) + "\n").encode("utf-8"))
                 await writer.drain()
@@ -841,6 +923,81 @@ class ManagerApp:
         self.sessions[sk] = sess
         save_sessions(self.sessions)
         await _tg_call(update.message.reply_text(f"pc_mode={mode} (currently not used by protocol)"), timeout_s=15.0, what="/pc reply")
+
+    def _require_selected_proxy(self, update: Update) -> str | None:
+        sk = _session_key(update)
+        sess = self.sessions.get(sk) or {"proxy": "", "pc_mode": False, "reset_next": False}
+        selected_proxy = str(sess.get("proxy") or "").strip()
+        return selected_proxy or None
+
+    async def _thread_op_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE, op: str, *, index: int | None = None) -> None:
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what=f"/{op} reply")
+            return
+        sk = _session_key(update)
+        proxy_id = self._require_selected_proxy(update)
+        if not proxy_id:
+            await _tg_call(update.message.reply_text("请先 /servers 查看在线代理，然后 /use <proxy_id> 选择一台机器"), timeout_s=15.0, what=f"/{op} reply")
+            return
+        if not self.registry.is_online(proxy_id):
+            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /servers)"), timeout_s=15.0, what=f"/{op} reply")
+            return
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what=f"/{op} reply")
+            return
+        try:
+            res = await core.thread_op(proxy_id, sk, op, index=index, timeout_s=min(30.0, self.task_timeout_s))
+        except Exception as e:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {type(e).__name__}: {e}"), timeout_s=15.0, what=f"/{op} reply")
+            return
+        if not bool(res.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {res.get('error') or 'unknown error'}"), timeout_s=15.0, what=f"/{op} reply")
+            return
+        sessions = res.get("sessions") if isinstance(res.get("sessions"), list) else []
+        depth = int(res.get("depth") or 0)
+        lines: list[str] = []
+        lines.append(f"proxy: {proxy_id}")
+        lines.append(f"depth: {depth}")
+        if sessions:
+            for i, sid in enumerate(sessions, start=1):
+                mark = " (current)" if i == len(sessions) else ""
+                lines.append(f"{i}. {sid}{mark}")
+        else:
+            lines.append("(empty)")
+        lines.append("commands: /new /back /sessions /sessiondel <idx>")
+        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what=f"/{op} reply")
+
+    async def cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /new from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        await self._thread_op_cmd(update, context, "new")
+
+    async def cmd_back(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /back from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        await self._thread_op_cmd(update, context, "back")
+
+    async def cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /sessions from chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        await self._thread_op_cmd(update, context, "list")
+
+    async def cmd_sessiondel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(
+            f"cmd /sessiondel from chat={update.effective_chat.id if update.effective_chat else '?'} "
+            f"user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}"
+        )
+        if not update.message:
+            return
+        if not context.args:
+            await _tg_call(update.message.reply_text("usage: /sessiondel <idx>"), timeout_s=15.0, what="/sessiondel reply")
+            return
+        try:
+            idx = int(str(context.args[0]).strip())
+        except Exception:
+            await _tg_call(update.message.reply_text("usage: /sessiondel <idx>"), timeout_s=15.0, what="/sessiondel reply")
+            return
+        await self._thread_op_cmd(update, context, "del", index=idx)
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         trace_id = uuid.uuid4().hex
@@ -1028,6 +1185,10 @@ def main() -> int:
                     tg.add_handler(CommandHandler("use", app.cmd_use))
                     tg.add_handler(CommandHandler("reset", app.cmd_reset))
                     tg.add_handler(CommandHandler("pc", app.cmd_pc))
+                    tg.add_handler(CommandHandler("new", app.cmd_new))
+                    tg.add_handler(CommandHandler("back", app.cmd_back))
+                    tg.add_handler(CommandHandler("sessions", app.cmd_sessions))
+                    tg.add_handler(CommandHandler("sessiondel", app.cmd_sessiondel))
                     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app.on_text))
                     tg.add_error_handler(lambda _u, c: logger.warning(f"telegram handler error: {c.error!r}"), block=False)
 

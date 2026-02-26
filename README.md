@@ -35,6 +35,7 @@
 - `systemd/telegram-bot.env.example` - legacy: 旧 env 示例（仍可用）
 - `log/manager.log` - 运行日志（运行后生成）
 - `sessions.json` - 会话存储文件（运行后生成）
+- `thread_store.json` - Proxy 端会话(thread)栈持久化文件（运行后生成，可配置路径）
 
 ## 依赖
 
@@ -118,6 +119,7 @@ Proxy 运行在被控机器上，至少需要：
 - `PROXY_MAX_PENDING`：proxy 在 Codex 回答前允许挂起的最大任务数（默认 `10`）。超过会立刻回 `proxy queue full`。
 - `CODEX_SANDBOX`：Codex sandbox（默认 `workspace-write`）。需要执行更高权限操作时可考虑 `danger-full-access`（风险极高）。
 - `CODEX_APPROVAL_POLICY`：审批策略（默认 `on-request`）。如果你不希望出现“权限确认导致命令失败”，可设为 `never`（风险极高）。
+- `CODEX_THREAD_STORE`：Proxy 端 thread 栈持久化文件路径（默认 `./thread_store.json`）
 
 > 说明：本项目的 `codex_stdio_client.py` 默认会对 app-server 的 `requestApproval` 请求返回 `decline`。因此当 `approval_policy=on-request` 时，某些命令/改文件会被 Codex 请求确认但被我们拒绝，从而表现为“权限问题”。要避免这一类失败，通常做法是把 `approval_policy` 设为 `never`，让 app-server 不再发起审批请求。
 
@@ -178,6 +180,13 @@ export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
 scripts/verify_phase2_ws.sh proxy27
 ```
 
+可选：验证会话(thread)管理协议（不经过 Telegram）：
+
+```bash
+export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
+scripts/verify_phase2_thread_ops.sh proxy27
+```
+
 阶段 3：Telegram 端到端验证见 [docs/verify_phase3_tg.md](/root/telegram-bot/docs/verify_phase3_tg.md)。
 
 ### 7. 验证链路（TG）
@@ -189,6 +198,15 @@ scripts/verify_phase2_ws.sh proxy27
 3. `/use <proxy_id>` 选择一台机器（当前版本不再自动挑选默认 proxy）
 4. 直接发一条消息，例如 `ping`
 5. 预期会看到占位 `working...`，随后被编辑成 `[{proxy_id}] ...` 的结果或错误
+
+### 7.1 会话(thread)管理命令
+
+这些命令由 **Manager 转发给当前选中的 Proxy** 执行，Proxy 会把每个聊天的 Codex thread 维护为一个“会话栈”（最多同时挂起任务 10 条，与会话栈无关）。
+
+- `/new`：新建一个 thread，并把当前 thread 压栈（切到新的会话）
+- `/back`：回到上一个 thread（从栈顶恢复）
+- `/sessions`：列出当前会话栈（最后一个为 current）
+- `/sessiondel <idx>`：删除会话栈中的某一项（索引从 1 开始，最后一个通常是 current）
 
 ### 8. 作为 Linux 服务（systemd）
 

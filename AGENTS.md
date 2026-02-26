@@ -23,6 +23,7 @@
 - `codex_proxy.py`：Proxy 主程序（WS 注册 + 本机执行）
 - `codex_stdio_client.py`：Proxy 侧 stdio JSON-RPC 客户端（驱动 `codex app-server --listen stdio://`）
 - `sessions.json`：Manager 保存每个 Telegram 会话的路由状态（运行后生成，gitignored）
+- `thread_store.json`：Proxy 保存每个 Telegram 会话的 Codex thread 会话栈（运行后生成，gitignored；路径可配置）
 - `codex_config.json`：Manager 配置（运行时读取，gitignored）
 - `proxy_config.json`：Proxy 配置（运行时读取，gitignored）
 - `systemd/`：systemd unit 与 env 示例
@@ -137,4 +138,3 @@ journalctl -u codex-proxy.service -f
 2. 可靠性：任务 ACK、超时重试、断线任务恢复策略
 3. 体验：流式输出、消息节流编辑、长回复分段策略优化
 4. 调度：capacity/health/标签路由（linux/windows、GPU/CPU 等）
-

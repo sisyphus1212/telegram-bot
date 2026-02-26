@@ -27,6 +27,9 @@ journalctl -u codex-manager.service -n 200 --no-pager | rg 'Telegram polling sta
 在 Telegram 对话里：
 1. `/servers` 确认目标 proxy 在线（例如 `proxy27`）
 2. `/use proxy27`
+3. `/sessions`（预期 depth=0 或 1，取决于是否已有历史 thread_store）
+4. `/new`（预期 depth 增加）
+5. `/back`（预期切回上一个；若没有上一个，会提示 error）
 3. 发送文本：`ping`（连续发 5 条也可以，用于验证“可连续下发”）
 
 验收：
@@ -49,3 +52,8 @@ journalctl -u codex-manager.service -n 400 --no-pager | rg 'op=tg.update|op=tg.s
 - `op=ws.recv ... trace_id=...`
 - `op=tg.edit ... trace_id=... kind=result`
 
+会话(thread)命令链路（可选观察）：
+- `cmd /sessions ...`
+- `op=thread_op.send ...`
+- `op=ws.send ... type=thread_op ...`
+- `op=ws.recv ... type=thread_op_result ...`
