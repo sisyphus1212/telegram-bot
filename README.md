@@ -120,13 +120,19 @@ python codex_proxy_probe.py --prompt ping
 
 再启动 proxy（在每台需要执行 Codex 的机器上）：
 
+推荐用 `proxy_config.json` 来配置，避免记环境变量。
+
 ```bash
 . .venv/bin/activate
-export CODEX_MANAGER_WS=ws://MANAGER_IP:8765
-export PROXY_ID=proxy1
-export PROXY_TOKEN=REPLACE_ME
-python codex_proxy.py
+cp proxy_config.example.json proxy_config.json
+editor proxy_config.json
+python codex_proxy.py --config proxy_config.json
 ```
+
+说明：
+
+- 如果当前目录存在 `proxy_config.json`，`codex_proxy.py` 即使不带 `--config` 也会自动读取它。
+- 优先级：命令行参数 > 环境变量 > JSON 配置 > 默认值。
 
 ### 6. 验证链路
 

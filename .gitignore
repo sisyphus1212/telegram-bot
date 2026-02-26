@@ -20,3 +20,6 @@ sessions.json
 
 # Codex bot config (contains Telegram bot token)
 codex_config.json
+
+# Local proxy config (contains machine-specific endpoints/tokens)
+proxy_config.json

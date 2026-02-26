@@ -1,0 +1,11 @@
+{
+  "manager_ws": "ws://MANAGER_IP:8765",
+  "proxy_id": "proxy1",
+  "proxy_token": "",
+  "codex_cwd": "/root/telegram-bot",
+  "codex_bin": "codex",
+  "http_proxy": "http://127.0.0.1:8080",
+  "https_proxy": "http://127.0.0.1:8080",
+  "no_proxy": "localhost,127.0.0.1,::1"
+}
+

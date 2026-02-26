@@ -32,10 +32,9 @@ python codex_manager.py --ws-only
 
 ```bash
 . .venv/bin/activate
-export CODEX_MANAGER_WS=ws://127.0.0.1:8765
-export PROXY_ID=proxy1
-export PROXY_TOKEN=
-python codex_proxy.py
+cp proxy_config.example.json proxy_config.json
+editor proxy_config.json
+python codex_proxy.py --config proxy_config.json
 ```
 
 终端 3（派发一次任务并退出）：
