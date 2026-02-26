@@ -148,11 +148,22 @@ class CodexProxyAgent:
                                     continue
                                 task_id = msg.get("task_id")
                                 logger.info(f"task_assign received proxy_id={self.proxy_id} task_id={task_id!r}")
+                                try:
+                                    await ws.send(_json_dumps({"type": "task_ack", "task_id": task_id}))
+                                except Exception:
+                                    # If we can't ack, there's no point running the task.
+                                    continue
                                 out = await self._run_task(msg)
-                                logger.info(
-                                    f"task_result sending proxy_id={self.proxy_id} "
-                                    f"task_id={out.get('task_id')!r} ok={out.get('ok')!r}"
-                                )
+                                if out.get("ok"):
+                                    logger.info(
+                                        f"task_result sending proxy_id={self.proxy_id} "
+                                        f"task_id={out.get('task_id')!r} ok=True"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"task_result sending proxy_id={self.proxy_id} "
+                                        f"task_id={out.get('task_id')!r} ok=False error={out.get('error')!r}"
+                                    )
                                 await ws.send(_json_dumps(out))
                         finally:
                             stop_hb.set()

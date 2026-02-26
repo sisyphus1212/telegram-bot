@@ -148,6 +148,7 @@ class ProxyRegistry:
         self._lock = asyncio.Lock()
         self._conns: dict[str, ProxyConn] = {}
         self._tasks_by_proxy: dict[str, set[str]] = {}
+        self._task_ack_futures: dict[str, asyncio.Future[None]] = {}
         self._task_futures: dict[str, asyncio.Future[JsonDict]] = {}
 
     def allowed_proxy_ids(self) -> list[str]:
@@ -200,10 +201,25 @@ class ProxyRegistry:
             cur = self._conns.get(proxy_id)
             if not cur or cur.ws is not ws:
                 return
+            ack = self._task_ack_futures.pop(task_id, None)
+            if ack and not ack.done():
+                ack.set_result(None)
             fut = self._task_futures.pop(task_id, None)
             if fut and not fut.done():
                 fut.set_result(msg)
             self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
+
+    async def deliver_task_ack(self, proxy_id: str, ws: Any, msg: JsonDict) -> None:
+        task_id = msg.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return
+        async with self._lock:
+            cur = self._conns.get(proxy_id)
+            if not cur or cur.ws is not ws:
+                return
+            ack = self._task_ack_futures.pop(task_id, None)
+            if ack and not ack.done():
+                ack.set_result(None)
 
     async def dispatch(self, proxy_id: str, task_msg: JsonDict, timeout_s: float) -> JsonDict:
         task_id = task_msg.get("task_id")
@@ -215,7 +231,11 @@ class ProxyRegistry:
             if not conn:
                 raise RuntimeError(f"proxy offline: {proxy_id}")
             ws = conn.ws
+            if getattr(ws, "closed", False):
+                raise RuntimeError(f"proxy ws closed: {proxy_id}")
+            ack_fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             fut: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
+            self._task_ack_futures[task_id] = ack_fut
             self._task_futures[task_id] = fut
             self._tasks_by_proxy.setdefault(proxy_id, set()).add(task_id)
 
@@ -227,14 +247,31 @@ class ProxyRegistry:
         except Exception as e:
             logger.warning(f"ws send failed proxy={proxy_id} task_id={task_id}: {type(e).__name__}: {e}")
             async with self._lock:
+                self._task_ack_futures.pop(task_id, None)
                 self._task_futures.pop(task_id, None)
                 self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
             raise
 
         try:
+            await asyncio.wait_for(ack_fut, timeout=5.0)
+        except Exception as e:
+            logger.warning(f"task_ack timeout proxy={proxy_id} task_id={task_id}: {type(e).__name__}: {e}")
+            async with self._lock:
+                self._task_ack_futures.pop(task_id, None)
+                self._task_futures.pop(task_id, None)
+                self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
+            # Force reconnect: better to drop a half-dead ws than hang handlers.
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            raise RuntimeError("proxy no ack (connection likely stale)")
+
+        try:
             return await asyncio.wait_for(fut, timeout=timeout_s)
         except Exception:
             async with self._lock:
+                self._task_ack_futures.pop(task_id, None)
                 self._task_futures.pop(task_id, None)
                 self._tasks_by_proxy.get(proxy_id, set()).discard(task_id)
             raise
@@ -274,6 +311,9 @@ async def run_ws_server(listen: str, registry: ProxyRegistry) -> None:
                 t = m.get("type")
                 if t == "heartbeat":
                     await registry.heartbeat(proxy_id, ws)
+                    continue
+                if t == "task_ack":
+                    await registry.deliver_task_ack(proxy_id, ws, m)
                     continue
                 if t == "task_result":
                     await registry.deliver_task_result(proxy_id, ws, m)
