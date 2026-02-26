@@ -990,7 +990,7 @@ class ManagerApp:
         lines.append(f"selected: {selected or '(none)'}")
         if allowed:
             lines.append(f"allowed: {', '.join(allowed)}")
-        lines.append("use: /proxy_use proxyId=<id>")
+        lines.append("use: /proxy_use <id>")
         await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/proxy_list reply")
 
     async def cmd_proxy_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1002,7 +1002,7 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         proxy_id = (kv.get("proxyId") or (context.args[0] if context.args else "")).strip()
         if not proxy_id:
-            await _tg_call(update.message.reply_text("usage: /proxy_use proxyId=<id>"), timeout_s=15.0, what="/proxy_use reply")
+            await _tg_call(update.message.reply_text("usage: /proxy_use <id>"), timeout_s=15.0, what="/proxy_use reply")
             return
         if not self.registry.is_online(proxy_id):
             await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id}"), timeout_s=15.0, what="/proxy_use reply")
@@ -1043,7 +1043,7 @@ class ManagerApp:
         lines.append("")
         lines.append("1) 选择机器（proxy）")
         lines.append("- /proxy_list  查看在线机器（旧命令: /servers）")
-        lines.append("- /proxy_use proxyId=<id>  选择机器（旧命令: /use <id>）")
+        lines.append("- /proxy_use <id>  选择机器（也支持: /proxy_use proxyId=<id>；旧命令: /use <id>）")
         lines.append("- /proxy_current  查看当前选择")
         lines.append("")
         lines.append("2) 日常对话（turn）")
@@ -1053,11 +1053,11 @@ class ManagerApp:
         lines.append("3) Thread 会话（对齐 app-server method）")
         lines.append("- /thread_current  显示当前 threadId（按 proxy 隔离保存）")
         lines.append("- /thread_start [cwd=...] [sandbox=workspaceWrite] [approvalPolicy=onRequest] [personality=pragmatic]")
-        lines.append("- /thread_resume threadId=<id>")
+        lines.append("- /thread_resume <id>  (也支持: /thread_resume threadId=<id>)")
         lines.append("- /thread_list [limit=5] [archived=true|false] [cursor=...] [sortKey=created_at|updated_at]")
-        lines.append("- /thread_read threadId=<id> [includeTurns=true|false]")
+        lines.append("- /thread_read <id> [includeTurns=true|false]  (也支持: threadId=<id>)")
         lines.append("- /thread_archive [threadId=<id>]   (不填则归档当前 thread)")
-        lines.append("- /thread_unarchive threadId=<id>")
+        lines.append("- /thread_unarchive <id>  (也支持: threadId=<id>)")
         lines.append("")
         lines.append("4) 其它 app-server 查询/配置")
         lines.append("- /model_list [limit=10]")
@@ -1068,7 +1068,7 @@ class ManagerApp:
         lines.append("")
         lines.append("参数格式：key=value（多个参数用空格分隔）。JSON 参数用 value=<json>。")
         lines.append("示例：")
-        lines.append("- /proxy_use proxyId=proxy27")
+        lines.append("- /proxy_use proxy27")
         lines.append("- /thread_list limit=3 archived=false")
         lines.append("- /config_value_write keyPath=apps._default.enabled value=true mergeStrategy=replace")
         lines.append("")
@@ -1086,7 +1086,7 @@ class ManagerApp:
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use proxyId=<id> 选择一台机器"), timeout_s=15.0, what="require proxy")
+            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use <id> 选择一台机器"), timeout_s=15.0, what="require proxy")
             return None
         if not self.registry.is_online(proxy_id):
             await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /proxy_list)"), timeout_s=15.0, what="require proxy")
@@ -1152,7 +1152,7 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_resume threadId=<id>"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(update.message.reply_text("usage: /thread_resume <id>"), timeout_s=15.0, what="/thread_resume reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
@@ -1228,7 +1228,7 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_read threadId=<id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(update.message.reply_text("usage: /thread_read <id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
             return
         include_turns = str(kv.get("includeTurns") or "false").lower() in ("1", "true", "yes", "y", "on")
         core: ManagerCore | None = context.application.bot_data.get("core")
@@ -1282,7 +1282,7 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_unarchive threadId=<id>"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(update.message.reply_text("usage: /thread_unarchive <id>"), timeout_s=15.0, what="/thread_unarchive reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
@@ -1449,7 +1449,7 @@ class ManagerApp:
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use proxyId=<id> 选择一台机器"), timeout_s=15.0, what="msg reply")
+            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use <id> 选择一台机器"), timeout_s=15.0, what="msg reply")
             return
         if not self.registry.is_online(proxy_id):
             await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /proxy_list)"), timeout_s=15.0, what="msg reply")
