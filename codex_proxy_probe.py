@@ -23,13 +23,18 @@ def _kv(**items: object) -> str:
 
 async def _run(prompt: str, cwd: str, codex_bin: str, *, timeout_s: float) -> dict:
     app = CodexAppServerStdioProcess(CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd))
-    await app.start()
-    await app.ensure_started_and_initialized(client_name="codex_proxy_probe", version="0.0")
-    tid = await app.thread_start(cwd=cwd, sandbox="workspace-write", approval_policy="on-request", personality="pragmatic")
-    turn_id = await app.turn_start_text(thread_id=tid, text=prompt)
-    text = await app.run_turn_and_collect_agent_message(thread_id=tid, turn_id=turn_id, timeout_s=float(timeout_s))
-    await app.stop()
-    return {"ok": True, "threadId": tid, "turnId": turn_id, "text": (text or "").strip()}
+    try:
+        await app.start()
+        await app.ensure_started_and_initialized(client_name="codex_proxy_probe", version="0.0")
+        tid = await app.thread_start(cwd=cwd, sandbox="workspace-write", approval_policy="on-request", personality="pragmatic")
+        turn_id = await app.turn_start_text(thread_id=tid, text=prompt)
+        text = await app.run_turn_and_collect_agent_message(thread_id=tid, turn_id=turn_id, timeout_s=float(timeout_s))
+        return {"ok": True, "threadId": tid, "turnId": turn_id, "text": (text or "").strip()}
+    finally:
+        try:
+            await app.stop()
+        except Exception:
+            pass
 
 
 def main() -> int:
