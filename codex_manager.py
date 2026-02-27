@@ -2693,10 +2693,12 @@ def main() -> int:
                     proxy = (os.environ.get("TELEGRAM_PROXY") or str(cfg.get("telegram_proxy") or cfg.get("telegram_http_proxy") or "")).strip() or None
                     trust_env = proxy is None
                     req = HTTPXRequest(
+                        # Ensure the long-polling request doesn't block other API calls (send/edit/delete webhook).
+                        connection_pool_size=16,
                         connect_timeout=20.0,
                         read_timeout=60.0,
                         write_timeout=60.0,
-                        pool_timeout=20.0,
+                        pool_timeout=60.0,
                         proxy=proxy,
                         httpx_kwargs={"trust_env": trust_env},
                     )
