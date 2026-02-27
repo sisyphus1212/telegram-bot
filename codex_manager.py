@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import faulthandler
 import json
 import logging
 import os
@@ -2668,6 +2669,15 @@ def main() -> int:
                 loop.add_signal_handler(sig, _stop)
             except NotImplementedError:
                 pass
+
+        # Debug aid: dump stack traces on SIGUSR1 to diagnose hangs in the field.
+        # Usage: kill -USR1 <pid> (see journalctl for the dump)
+        try:
+            faulthandler.enable()
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
+            logger.info("faulthandler enabled (SIGUSR1 dumps stacks)")
+        except Exception as e:
+            logger.warning(f"faulthandler setup failed: {type(e).__name__}: {e}")
 
         if args.dispatch_proxy:
             # WS-only probe mode: wait for proxy then dispatch once and exit.
