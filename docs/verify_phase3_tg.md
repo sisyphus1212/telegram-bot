@@ -27,12 +27,15 @@ journalctl -u codex-manager.service -n 200 --no-pager | rg 'Telegram polling sta
 在 Telegram 对话里：
 1. `/proxy_list` 确认目标 proxy 在线（例如 `proxy27`，旧命令 `/servers` 仍可用）
 2. `/proxy_use proxy27`（旧命令 `/use proxy27` 仍可用）
-3. `/thread_start`（可选：显式新建 thread；不做也行，首次发文本会自动创建）
-4. 发送文本：`ping`（连续发 5 条也可以，用于验证“可连续下发”）
+3. `/result_mode replace` 或 `/result_mode send`
+4. `/thread_start`（可选：显式新建 thread；不做也行，首次发文本会自动创建）
+5. 发送文本：`请先说明计划，再执行 uname -a 和 ip -4 addr show，并返回摘要`
 
 验收：
 - 先出现占位消息：`working (proxy=..., threadId=...) ...`
-- 随后占位消息被编辑为：`[proxy_id] ...`（成功或错误）
+- 如果任务持续时间较长，占位消息中间会被编辑成增量进度日志，新的步骤会追加到同一条 placeholder 中；重复噪音会被过滤，超长时会折叠中间步骤
+- `replace` 模式下：随后占位消息被编辑为 `[{proxy_id}] ...`
+- `send` 模式下：占位消息变成 `working done/failed ...`，结果作为新消息单独发送
 
 ## 4. 关键日志（必须能串起来）
 
@@ -47,6 +50,8 @@ journalctl -u codex-manager.service -n 400 --no-pager | rg 'op=tg.update|op=tg.s
 - `op=tg.send ... kind=placeholder ... trace_id=...`
 - `op=dispatch.enqueue trace_id=...`
 - `op=ws.send ... trace_id=...`
+- `op=ws.recv ... type=task_progress ... trace_id=...`
+- `op=tg.edit ... trace_id=... kind=progress`
 - `op=ws.recv ... trace_id=...`
 - `op=tg.edit ... trace_id=... kind=result`
 

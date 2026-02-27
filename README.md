@@ -61,7 +61,7 @@ Manager 的 Telegram token 推荐放 `manager_config.json`（不要提交，已�
 }
 ```
 
-本项目会在 `sessions.json` 中保存每个聊天选择的 `proxy_id` 以及 per-proxy 的 `current_thread_id`。
+本项目会在 `sessions.json` 中保存每个聊天选择的 `proxy_id`、per-proxy 的 `current_thread_id`，以及当前会话偏好的 `model`（用于在每次 `turn/start` 下发 per-turn override；按 app-server 语义会写回 thread 默认值）。
 
 推荐用环境变量（systemd 也会用）：
 
@@ -116,7 +116,7 @@ Proxy 运行在被控机器上，至少需要：
 - `CODEX_SANDBOX`：Codex sandbox（默认 `workspace-write`）。需要执行更高权限操作时可考虑 `danger-full-access`（风险极高）。
 - `CODEX_APPROVAL_POLICY`：审批策略（不同 codex 版本枚举可能不同；本项目会尽量兼容官方文档值与本地实际值）。
 
-> 说明：本项目的 `codex_stdio_client.py` 默认会对 app-server 的 `requestApproval` 请求返回 `decline`。因此当 `approval_policy=on-request` 时，某些命令/改文件会被 Codex 请求确认但被我们拒绝，从而表现为“权限问题”。要避免这一类失败，通常做法是把 `approval_policy` 设为 `never`，让 app-server 不再发起审批请求。
+> 说明：当前实现已经支持把 app-server 的审批请求转发到 Telegram。`approval_policy=onRequest` 时，只有当 Codex 主动发起 `requestApproval`，Telegram 才会收到 `/approve <approval_id>`、`/approve_session <approval_id>`、`/decline <approval_id>` 这类审批命令。
 
 ### 4. 自检
 
@@ -156,7 +156,7 @@ python codex_proxy.py --config proxy_config.json
   - 常用：`workspaceWrite`（允许在工作区写）
   - 高危：`dangerFullAccess`（几乎全开）
 - `approval_policy`：
-  - `onRequest`：需要审批（当前实现默认自动 `decline`，所以很多命令会失败）
+  - `onRequest`：按 app-server 原生审批机制处理，需要时会把审批转发到 Telegram
   - `never`：不走审批（高危，但能避免“权限确认导致失败”）
 
 ### 6. 阶段化验证（强烈建议按顺序）
@@ -200,8 +200,14 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 1. `/proxy_list` 查看在线 proxy（旧命令 `/servers` 仍可用）
 2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 proxy）
 3. `/proxy_use <proxy_id>` 选择一台机器（旧命令 `/use <proxy_id>` 仍可用）
-4. 直接发一条消息，例如 `ping`
-5. 预期会看到占位 `working...`，随后被编辑成 `[{proxy_id}] ...` 的结果或错误
+4. 可选：`/model <model_id>` 设置当前会话模型（每次 `turn/start` 都会带上该 model）
+5. 可选：`/result_mode replace` 或 `/result_mode send`
+6. 直接发一条消息，例如 `ping`
+7. 预期会先看到占位 `working...`
+8. 若任务执行较久，占位消息会被周期性编辑，并以“增量日志”的方式保留已发生的进展（默认约 5 秒最多更新一次；会自动去掉重复噪音，并在过长时折叠中间步骤）
+9. 最终结果输出：
+   - `replace`：结果覆盖 placeholder
+   - `send`：placeholder 保留为 done/failed，结果单独发新消息
 
 ### 7.1 Thread 管理命令（尽量对齐 app-server 官方 method）
 

@@ -8,12 +8,13 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import websockets
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
@@ -171,7 +172,8 @@ def load_sessions() -> dict[str, dict]:
                 proxy = str(v.get("proxy") or "")
                 by_proxy = v.get("by_proxy") if isinstance(v.get("by_proxy"), dict) else {}
                 defaults = v.get("defaults") if isinstance(v.get("defaults"), dict) else {}
-                out[k] = {"proxy": proxy, "by_proxy": by_proxy, "defaults": defaults}
+                result_mode = str(v.get("result_mode") or "send")
+                out[k] = {"proxy": proxy, "by_proxy": by_proxy, "defaults": defaults, "result_mode": result_mode}
             return out
 
         # Legacy migration (v0/v1): { session_key: {proxy, pc_mode, reset_next, ...} }
@@ -180,9 +182,9 @@ def load_sessions() -> dict[str, dict]:
             if not isinstance(k, str) or not k:
                 continue
             if isinstance(v, dict):
-                upgraded[k] = {"proxy": str(v.get("proxy") or v.get("server") or ""), "by_proxy": {}, "defaults": {}}
+                upgraded[k] = {"proxy": str(v.get("proxy") or v.get("server") or ""), "by_proxy": {}, "defaults": {}, "result_mode": "send"}
             else:
-                upgraded[k] = {"proxy": "", "by_proxy": {}, "defaults": {}}
+                upgraded[k] = {"proxy": "", "by_proxy": {}, "defaults": {}, "result_mode": "send"}
         return upgraded
     except Exception as e:
         logger.warning(f"Failed to load sessions: {e}")
@@ -215,6 +217,14 @@ class TaskContext:
     chat_id: int
     placeholder_msg_id: int
     created_at: float
+    session_key: str = ""
+    result_mode: str = "send"
+    last_progress_at: float = 0.0
+    last_progress_text: str = ""
+    pending_progress_text: str = ""
+    last_progress_event: str = ""
+    progress_lines: list[str] | None = None
+    progress_last_message_at: float = 0.0
 
 
 @dataclass
@@ -401,6 +411,7 @@ class ManagerCore:
         self._waiters: dict[str, asyncio.Future[JsonDict]] = {}
         self._rpc_waiters: dict[str, asyncio.Future[JsonDict]] = {}
         self._approvals: dict[str, ApprovalContext] = {}
+        self.progress_update_interval_s = 5.0
 
     def set_outbox(self, outbox: TelegramOutbox) -> None:
         self._outbox = outbox
@@ -409,6 +420,8 @@ class ManagerCore:
 
     async def register_task(self, ctx: TaskContext) -> None:
         async with self._lock:
+            if ctx.progress_lines is None:
+                ctx.progress_lines = []
             self._tasks_inflight[ctx.task_id] = ctx
             self._gc_recent_locked()
 
@@ -491,6 +504,9 @@ class ManagerCore:
         if t == "approval_request":
             await self._handle_approval_request(proxy_id=proxy_id, msg=msg)
             return
+        if t == "task_progress":
+            await self._handle_task_progress(proxy_id=proxy_id, msg=msg)
+            return
         if t == "task_ack":
             task_id = str(msg.get("task_id") or "")
             trace_id = str(msg.get("trace_id") or "")
@@ -523,6 +539,121 @@ class ManagerCore:
                 waiter.set_result(msg)
                 return
         await self._handle_task_result(proxy_id=proxy_id, msg=msg)
+
+    def _push_progress_line(self, arr: list[str], text: str, limit: int = 24) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        if arr and arr[-1] == text:
+            return
+        arr.append(text)
+        if len(arr) > limit:
+            del arr[0 : len(arr) - limit]
+
+    def _trim_progress_line(self, text: str, limit: int = 280) -> str:
+        text = (text or "").strip().replace("\n", " ")
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
+    def _normalize_progress_line(self, *, event: str, stage: str, summary: str, ctx: TaskContext, now: float) -> str | None:
+        summary = self._trim_progress_line(summary)
+        if not summary:
+            return None
+        if stage == "turn_started":
+            return "已开始处理本轮请求"
+        if stage == "turn_completed":
+            return "本轮处理完成"
+        if stage == "reasoning":
+            if (now - ctx.progress_last_message_at) < 8.0:
+                return None
+            ctx.progress_last_message_at = now
+            return "正在分析"
+        if stage == "message":
+            if summary == "正在生成回复":
+                if (now - ctx.progress_last_message_at) < 8.0:
+                    return None
+                ctx.progress_last_message_at = now
+                return "正在生成回复"
+            return f"message: {summary}"
+        if stage == "plan":
+            return f"plan: {summary}"
+        if stage == "retrying":
+            return f"retry: {summary}"
+        if stage == "error":
+            return f"error: {summary}"
+        if stage == "command":
+            return summary
+        if stage == "file_change":
+            return summary
+        return summary
+
+    def _render_progress_text(self, ctx: TaskContext) -> str:
+        head = f"working (proxy={ctx.proxy_id}, threadId={ctx.thread_id[-8:]}) ..."
+        lines: list[str] = [head]
+        if ctx.progress_lines:
+            lines.append("")
+            show = ctx.progress_lines
+            if len(show) > 12:
+                show = show[:4] + [f"... ({len(show) - 8} steps omitted) ..."] + show[-4:]
+            lines.extend(show)
+        return "\n".join(lines)
+
+    def _render_progress_done_text(self, ctx: TaskContext, *, ok: bool) -> str:
+        lines = [self._render_progress_text(ctx), ""]
+        status = "working done" if ok else "working failed"
+        lines.append(f"{status} (proxy={ctx.proxy_id}, threadId={ctx.thread_id[-8:]})")
+        return "\n".join(lines)
+
+    async def _handle_task_progress(self, *, proxy_id: str, msg: JsonDict) -> None:
+        task_id = str(msg.get("task_id") or "")
+        trace_id = str(msg.get("trace_id") or "")
+        event = str(msg.get("event") or "")
+        summary = str(msg.get("summary") or "").strip()
+        force = bool(msg.get("force"))
+        if not task_id or not summary:
+            return
+        logger.info(f"op=ws.recv proxy_id={proxy_id} type=task_progress trace_id={trace_id} task_id={task_id} event={event} force={force} summary={summary[:200]}")
+
+        ctx: TaskContext | None = None
+        text_to_send = ""
+        async with self._lock:
+            ctx = self._tasks_inflight.get(task_id)
+            if ctx is None:
+                return
+            now = time.time()
+            if ctx.progress_lines is None:
+                ctx.progress_lines = []
+            stage = str(msg.get("stage") or "")
+            label = self._normalize_progress_line(event=event, stage=stage, summary=summary, ctx=ctx, now=now)
+            if label is not None:
+                self._push_progress_line(ctx.progress_lines, label)
+            ctx.pending_progress_text = summary
+            ctx.last_progress_event = event
+            should_send = force or ctx.last_progress_at <= 0 or (now - ctx.last_progress_at) >= self.progress_update_interval_s
+            if not should_send:
+                return
+            text_to_send = self._render_progress_text(ctx)
+            ctx.last_progress_at = now
+            ctx.last_progress_text = ctx.pending_progress_text
+            ctx.pending_progress_text = ""
+
+        outbox = self._outbox
+        if outbox is None or ctx is None:
+            return
+        if not await outbox.enqueue(
+            TgAction(
+                type="edit",
+                chat_id=ctx.chat_id,
+                message_id=ctx.placeholder_msg_id,
+                text=text_to_send,
+                trace_id=trace_id or ctx.trace_id,
+                proxy_id=proxy_id,
+                task_id=task_id,
+                kind="progress",
+            )
+        ):
+            logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (progress)")
 
     async def _handle_approval_request(self, *, proxy_id: str, msg: JsonDict) -> None:
         approval_id = str(msg.get("approval_id") or "")
@@ -668,6 +799,70 @@ class ManagerCore:
         if ok:
             body = text.strip() or "(empty)"
             parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}] ")
+            if ctx.result_mode == "send":
+                done_text = self._render_progress_done_text(ctx, ok=True)
+                if not await outbox.enqueue(
+                    TgAction(
+                        type="edit",
+                        chat_id=ctx.chat_id,
+                        message_id=ctx.placeholder_msg_id,
+                        text=done_text,
+                        trace_id=trace_id or ctx.trace_id,
+                        proxy_id=proxy_id,
+                        task_id=task_id,
+                        kind="result_done",
+                    )
+                ):
+                    logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit done)")
+                for extra in parts:
+                    if not await outbox.enqueue(
+                        TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, proxy_id=proxy_id, task_id=task_id, kind="result")
+                    ):
+                        logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send result)")
+            else:
+                if not await outbox.enqueue(
+                    TgAction(
+                        type="edit",
+                        chat_id=ctx.chat_id,
+                        message_id=ctx.placeholder_msg_id,
+                        text=parts[0],
+                        trace_id=trace_id or ctx.trace_id,
+                        proxy_id=proxy_id,
+                        task_id=task_id,
+                        kind="result",
+                    )
+                ):
+                    logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit)")
+                for extra in parts[1:]:
+                    if not await outbox.enqueue(
+                        TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, proxy_id=proxy_id, task_id=task_id, kind="result")
+                    ):
+                        logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send extra)")
+            return
+
+        body = f"error: {err or 'unknown error'}"
+        parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}] ")
+        if ctx.result_mode == "send":
+            done_text = self._render_progress_done_text(ctx, ok=False)
+            if not await outbox.enqueue(
+                TgAction(
+                    type="edit",
+                    chat_id=ctx.chat_id,
+                    message_id=ctx.placeholder_msg_id,
+                    text=done_text,
+                    trace_id=trace_id or ctx.trace_id,
+                    proxy_id=proxy_id,
+                    task_id=task_id,
+                    kind="result_done",
+                )
+            ):
+                logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit err done)")
+            for extra in parts:
+                if not await outbox.enqueue(
+                    TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, proxy_id=proxy_id, task_id=task_id, kind="result")
+                ):
+                    logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send err)")
+        else:
             if not await outbox.enqueue(
                 TgAction(
                     type="edit",
@@ -680,34 +875,12 @@ class ManagerCore:
                     kind="result",
                 )
             ):
-                logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit)")
+                logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit err)")
             for extra in parts[1:]:
                 if not await outbox.enqueue(
                     TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, proxy_id=proxy_id, task_id=task_id, kind="result")
                 ):
-                    logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send extra)")
-            return
-
-        body = f"error: {err or 'unknown error'}"
-        parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}] ")
-        if not await outbox.enqueue(
-            TgAction(
-                type="edit",
-                chat_id=ctx.chat_id,
-                message_id=ctx.placeholder_msg_id,
-                text=parts[0],
-                trace_id=trace_id or ctx.trace_id,
-                proxy_id=proxy_id,
-                task_id=task_id,
-                kind="result",
-            )
-        ):
-            logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit err)")
-        for extra in parts[1:]:
-            if not await outbox.enqueue(
-                TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, proxy_id=proxy_id, task_id=task_id, kind="result")
-            ):
-                logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send extra err)")
+                    logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send extra err)")
 
     async def _fail_task(self, task_id: str, reason: str, *, proxy_id: str) -> None:
         ctx: TaskContext | None = None
@@ -821,7 +994,7 @@ async def run_ws_server(listen: str, registry: ProxyRegistry, core: ManagerCore)
                 if t == "heartbeat":
                     await registry.heartbeat(proxy_id, ws)
                     continue
-                if t in ("task_ack", "task_result", "appserver_response", "approval_request"):
+                if t in ("task_ack", "task_result", "task_progress", "appserver_response", "approval_request"):
                     await core.on_proxy_message(proxy_id, m)
                     continue
         except websockets.ConnectionClosed:
@@ -1038,17 +1211,33 @@ class ManagerApp:
     def _get_sess(self, sk: str) -> dict:
         sess = self.sessions.get(sk)
         if not isinstance(sess, dict):
-            sess = {"proxy": "", "by_proxy": {}, "defaults": {}}
+            sess = {"proxy": "", "by_proxy": {}, "defaults": {}, "result_mode": "send"}
             self.sessions[sk] = sess
         if not isinstance(sess.get("by_proxy"), dict):
             sess["by_proxy"] = {}
         if not isinstance(sess.get("defaults"), dict):
             sess["defaults"] = {}
+        if str(sess.get("result_mode") or "").strip() not in ("replace", "send"):
+            sess["result_mode"] = "send"
         return sess
 
     def _get_selected_proxy(self, sk: str) -> str:
         sess = self._get_sess(sk)
         return str(sess.get("proxy") or "").strip()
+
+    def _get_result_mode(self, sk: str) -> str:
+        sess = self._get_sess(sk)
+        mode = str(sess.get("result_mode") or "send").strip()
+        aliases = {"replace": "replace", "edit": "replace", "send": "send", "separate": "send"}
+        return aliases.get(mode, "send")
+
+    def _set_result_mode(self, sk: str, mode: str) -> None:
+        mode = (mode or "").strip()
+        aliases = {"replace": "replace", "edit": "replace", "send": "send", "separate": "send"}
+        mode = aliases.get(mode, "send")
+        sess = self._get_sess(sk)
+        sess["result_mode"] = mode
+        self.sessions[sk] = sess
 
     def _set_selected_proxy(self, sk: str, proxy_id: str) -> None:
         sess = self._get_sess(sk)
@@ -1062,6 +1251,28 @@ class ManagerApp:
         if not isinstance(entry, dict):
             return ""
         return str(entry.get("current_thread_id") or "").strip()
+
+    def _get_defaults(self, sk: str) -> dict[str, Any]:
+        sess = self._get_sess(sk)
+        defaults = sess.get("defaults")
+        return defaults if isinstance(defaults, dict) else {}
+
+    def _get_default_model(self, sk: str) -> str:
+        defaults = self._get_defaults(sk)
+        return str(defaults.get("model") or "").strip()
+
+    def _set_default_model(self, sk: str, model: str) -> None:
+        sess = self._get_sess(sk)
+        defaults = sess.get("defaults")
+        if not isinstance(defaults, dict):
+            defaults = {}
+        model = str(model or "").strip()
+        if model:
+            defaults["model"] = model
+        else:
+            defaults.pop("model", None)
+        sess["defaults"] = defaults
+        self.sessions[sk] = sess
 
     def _set_current_thread_id(self, sk: str, proxy_id: str, thread_id: str) -> None:
         sess = self._get_sess(sk)
@@ -1093,6 +1304,100 @@ class ManagerApp:
         if len(s) <= limit:
             return s
         return s[:limit] + f"\n...(truncated, total={len(s)})"
+
+    def _fmt_unix_ts(self, value: Any) -> str:
+        try:
+            ts = float(value)
+        except Exception:
+            return "(unknown)"
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _append_rate_limit_lines(self, lines: list[str], rate_result: dict[str, Any]) -> None:
+        rl_map = rate_result.get("rateLimitsByLimitId") if isinstance(rate_result.get("rateLimitsByLimitId"), dict) else {}
+        buckets: list[tuple[str, dict[str, Any]]] = []
+        for limit_id, payload in rl_map.items():
+            if isinstance(limit_id, str) and isinstance(payload, dict):
+                buckets.append((limit_id, payload))
+        if not buckets:
+            payload = rate_result.get("rateLimits") if isinstance(rate_result.get("rateLimits"), dict) else {}
+            if payload:
+                buckets.append(("default", payload))
+        if not buckets:
+            lines.append("rate_limits: (unavailable)")
+            return
+        for limit_id, payload in buckets:
+            primary = payload.get("primary") if isinstance(payload.get("primary"), dict) else {}
+            secondary = payload.get("secondary") if isinstance(payload.get("secondary"), dict) else {}
+            plan_type = str(payload.get("planType") or "").strip()
+            if plan_type:
+                lines.append(f"rate_limit[{limit_id}].plan: {plan_type}")
+            for name, bucket in (("primary", primary), ("secondary", secondary)):
+                if not bucket:
+                    continue
+                used_percent = bucket.get("usedPercent")
+                remaining_percent = "(unknown)"
+                if isinstance(used_percent, (int, float)):
+                    remaining_percent = f"{max(0.0, 100.0 - float(used_percent)):.0f}%"
+                window_mins = bucket.get("windowDurationMins")
+                resets_at = self._fmt_unix_ts(bucket.get("resetsAt"))
+                label = name
+                if window_mins == 300:
+                    label = "5h"
+                elif window_mins == 10080:
+                    label = "weekly"
+                lines.append(f"rate_limit[{limit_id}].{label}: remaining={remaining_percent}, window={window_mins or '(unknown)'}m, resets_at={resets_at}")
+
+    async def _fetch_model_state(self, *, proxy_id: str, core: ManagerCore, session_model: str) -> tuple[str, str, list[str]]:
+        cfg_rep = await core.appserver_call(proxy_id, "config/read", {}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(cfg_rep.get("ok")):
+            raise RuntimeError(str(cfg_rep.get("error") or "config/read failed"))
+        cfg_result = cfg_rep.get("result") if isinstance(cfg_rep.get("result"), dict) else {}
+        cfg_obj = cfg_result.get("config") if isinstance(cfg_result.get("config"), dict) else {}
+        proxy_default_model = str(cfg_obj.get("model") or "").strip()
+        effective_model = session_model or proxy_default_model
+
+        rep = await core.appserver_call(proxy_id, "model/list", {}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            raise RuntimeError(str(rep.get("error") or "model/list failed"))
+        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+        data = result.get("data") if isinstance(result.get("data"), list) else []
+        models: list[str] = []
+        for item in data[:30]:
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("id") or "").strip()
+            if mid:
+                models.append(mid)
+        return effective_model, proxy_default_model, models
+
+    def _render_model_text(self, *, proxy_id: str, effective_model: str, proxy_default_model: str, session_model: str, models: list[str]) -> str:
+        lines = [f"model: {effective_model or '(unknown)'}", f"proxy: {proxy_id}"]
+        if session_model:
+            lines.append("source: session override")
+        elif proxy_default_model:
+            lines.append("source: proxy default")
+        lines.append("available:")
+        for mid in models:
+            marker = " *" if mid == effective_model else ""
+            lines.append(f"- {mid}{marker}")
+        return "\n".join(lines)
+
+    def _build_model_keyboard(self, *, models: list[str], effective_model: str, session_model: str) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        row: list[InlineKeyboardButton] = []
+        for mid in models[:12]:
+            label = f"• {mid}" if mid == effective_model else mid
+            row.append(InlineKeyboardButton(label[:30], callback_data=f"model:set:{mid}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([
+            InlineKeyboardButton("Clear", callback_data="model:clear"),
+            InlineKeyboardButton("Refresh", callback_data="model:refresh"),
+        ])
+        return InlineKeyboardMarkup(rows)
 
     async def cmd_proxy_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /proxy_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
@@ -1145,6 +1450,224 @@ class ManagerApp:
         proxy_id = self._get_selected_proxy(sk)
         await _tg_call(update.message.reply_text(f"proxy: {proxy_id or '(none)'}"), timeout_s=15.0, what="/proxy_current reply")
 
+    async def cmd_result_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /result_mode chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/result_mode reply")
+            return
+        sk = _session_key(update)
+        if not context.args:
+            mode = self._get_result_mode(sk)
+            await _tg_call(update.message.reply_text(f"result_mode: {mode}"), timeout_s=15.0, what="/result_mode reply")
+            return
+        mode = (context.args[0] or "").strip().lower()
+        aliases = {"replace": "replace", "edit": "replace", "send": "send", "separate": "send"}
+        mode = aliases.get(mode, "")
+        if not mode:
+            await _tg_call(update.message.reply_text("usage: /result_mode <replace|send>"), timeout_s=15.0, what="/result_mode reply")
+            return
+        self._set_result_mode(sk, mode)
+        save_sessions(self.sessions)
+        await _tg_call(update.message.reply_text(f"ok result_mode={mode}"), timeout_s=15.0, what="/result_mode reply")
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /status chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/status reply")
+            return
+        sk = _session_key(update)
+        proxy_id = self._get_selected_proxy(sk)
+        if not proxy_id:
+            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use <id> 选择一台机器"), timeout_s=15.0, what="/status reply")
+            return
+        if not self.registry.is_online(proxy_id):
+            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /proxy_list)"), timeout_s=15.0, what="/status reply")
+            return
+        core = context.application.bot_data.get("core")
+        if core is None:
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/status reply")
+            return
+        session_model = self._get_default_model(sk)
+        current_thread_id = self._get_current_thread_id(sk, proxy_id)
+        result_mode = self._get_result_mode(sk)
+
+        cfg_rep = await core.appserver_call(proxy_id, "config/read", {}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(cfg_rep.get("ok")):
+            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {cfg_rep.get('error')}"), timeout_s=15.0, what="/status reply")
+            return
+        cfg_result = cfg_rep.get("result") if isinstance(cfg_rep.get("result"), dict) else {}
+        cfg_obj = cfg_result.get("config") if isinstance(cfg_result.get("config"), dict) else {}
+        account_rep = await core.appserver_call(proxy_id, "account/read", {}, timeout_s=min(60.0, self.task_timeout_s))
+        rate_limits_rep = await core.appserver_call(proxy_id, "account/rateLimits/read", {}, timeout_s=min(60.0, self.task_timeout_s))
+
+        loaded_rep = await core.appserver_call(proxy_id, "thread/loaded/list", {}, timeout_s=min(60.0, self.task_timeout_s))
+        loaded_data: list[str] = []
+        if bool(loaded_rep.get("ok")):
+            loaded_result = loaded_rep.get("result") if isinstance(loaded_rep.get("result"), dict) else {}
+            loaded_data = loaded_result.get("data") if isinstance(loaded_result.get("data"), list) else []
+
+        thread_list_rep = await core.appserver_call(proxy_id, "thread/list", {"limit": 5}, timeout_s=min(60.0, self.task_timeout_s))
+        thread_items: list[dict[str, Any]] = []
+        if bool(thread_list_rep.get("ok")):
+            tl_result = thread_list_rep.get("result") if isinstance(thread_list_rep.get("result"), dict) else {}
+            thread_items = tl_result.get("data") if isinstance(tl_result.get("data"), list) else []
+
+        collab_rep = await core.appserver_call(proxy_id, "collaborationMode/list", {}, timeout_s=min(60.0, self.task_timeout_s))
+        collab_modes: list[str] = []
+        if bool(collab_rep.get("ok")):
+            cm_result = collab_rep.get("result") if isinstance(collab_rep.get("result"), dict) else {}
+            cm_data = cm_result.get("data") if isinstance(cm_result.get("data"), list) else []
+            for item in cm_data:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or item.get("mode") or "").strip()
+                    if name:
+                        collab_modes.append(name)
+
+        effective_model = session_model or str(cfg_obj.get("model") or "").strip()
+        lines: list[str] = []
+        lines.append(f"proxy: {proxy_id}")
+        lines.append(f"model: {effective_model or '(unknown)'}")
+        lines.append(f"model_reasoning_effort: {str(cfg_obj.get('model_reasoning_effort') or '(unknown)')}")
+        lines.append(f"model_reasoning_summary: {str(cfg_obj.get('model_reasoning_summary') or '(unknown)')}")
+        lines.append(f"directory: {str((thread_items[0].get('cwd') if thread_items and isinstance(thread_items[0], dict) else '') or BASE_DIR)}")
+        lines.append(f"permissions: sandbox={str(cfg_obj.get('sandbox_mode') or '(unknown)')}, approval={str(cfg_obj.get('approval_policy') or '(unknown)')}")
+        lines.append(f"agents_md: {'AGENTS.md' if (BASE_DIR / 'AGENTS.md').exists() else '(none)'}")
+        lines.append(f"collaboration_modes: {', '.join(collab_modes) if collab_modes else '(unknown)'}")
+        lines.append(f"result_mode: {result_mode}")
+        lines.append(f"session_thread: {current_thread_id or '(none)'}")
+        if bool(account_rep.get("ok")):
+            account_result = account_rep.get("result") if isinstance(account_rep.get("result"), dict) else {}
+            account_obj = account_result.get("account") if isinstance(account_result.get("account"), dict) else {}
+            lines.append(f"account_type: {str(account_obj.get('type') or '(unknown)')}")
+            email = str(account_obj.get("email") or "").strip()
+            if email:
+                lines.append(f"account_email: {email}")
+            plan_type = str(account_obj.get("planType") or "").strip()
+            if plan_type:
+                lines.append(f"account_plan: {plan_type}")
+        else:
+            lines.append(f"account_error: {str(account_rep.get('error') or '(unknown)')}")
+        if bool(rate_limits_rep.get("ok")):
+            rate_result = rate_limits_rep.get("result") if isinstance(rate_limits_rep.get("result"), dict) else {}
+            self._append_rate_limit_lines(lines, rate_result)
+        else:
+            lines.append(f"rate_limits_error: {str(rate_limits_rep.get('error') or '(unknown)')}")
+        if current_thread_id:
+            lines.append(f"thread_loaded: {'yes' if current_thread_id in loaded_data else 'no'}")
+
+        if thread_items:
+            current_item = None
+            if current_thread_id:
+                for item in thread_items:
+                    if isinstance(item, dict) and str(item.get('id') or '') == current_thread_id:
+                        current_item = item
+                        break
+            if current_item is None and thread_items and isinstance(thread_items[0], dict):
+                current_item = thread_items[0]
+            if isinstance(current_item, dict):
+                lines.append(f"thread_status: {str((current_item.get('status') or {}).get('type') if isinstance(current_item.get('status'), dict) else '(unknown)')}")
+                lines.append(f"thread_updated_at: {str(current_item.get('updatedAt') or '(unknown)')}")
+                preview = str(current_item.get("preview") or "").strip()
+                if preview:
+                    lines.append(f"thread_preview: {preview[:160]}")
+                cli_ver = str(current_item.get("cliVersion") or "").strip()
+                if cli_ver:
+                    lines.append(f"cli_version: {cli_ver}")
+                git_info = current_item.get("gitInfo") if isinstance(current_item.get("gitInfo"), dict) else {}
+                branch = str(git_info.get("branch") or "").strip()
+                sha = str(git_info.get("sha") or "").strip()
+                if branch or sha:
+                    lines.append(f"git: branch={branch or '?'} sha={sha[:12] if sha else '?'}")
+
+        lines.append(f"loaded_threads: {len(loaded_data)}")
+        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/status reply")
+
+    async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /model chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/model reply")
+            return
+        sk = _session_key(update)
+        session_model = self._get_default_model(sk)
+        if not context.args:
+            proxy_id = await self._require_proxy_online(update)
+            if not proxy_id:
+                return
+            core: ManagerCore | None = context.application.bot_data.get("core")
+            if core is None:
+                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/model reply")
+                return
+            try:
+                effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
+            except Exception as e:
+                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {type(e).__name__}: {e}"), timeout_s=15.0, what="/model reply")
+                return
+            text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models)
+            kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model)
+            await _tg_call(update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/model reply")
+            return
+        arg = " ".join(context.args).strip()
+        if arg.lower() in ("clear", "default", "reset"):
+            self._set_default_model(sk, "")
+            save_sessions(self.sessions)
+            await _tg_call(update.message.reply_text("ok model=(default)"), timeout_s=15.0, what="/model reply")
+            return
+        self._set_default_model(sk, arg)
+        save_sessions(self.sessions)
+        await _tg_call(update.message.reply_text(f"ok model={arg}"), timeout_s=15.0, what="/model reply")
+
+    async def on_model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        if not self._is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        data = str(q.data or "")
+        if not data.startswith("model:"):
+            return
+        sk = _session_key(update)
+        proxy_id = self._get_selected_proxy(sk)
+        if not proxy_id or not self.registry.is_online(proxy_id):
+            await q.answer("proxy offline", show_alert=True)
+            return
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await q.answer("manager core missing", show_alert=True)
+            return
+        if data == "model:clear":
+            self._set_default_model(sk, "")
+            save_sessions(self.sessions)
+        elif data == "model:refresh":
+            pass
+        elif data.startswith("model:set:"):
+            model_id = data[len("model:set:") :].strip()
+            if not model_id:
+                await q.answer("bad model id", show_alert=True)
+                return
+            self._set_default_model(sk, model_id)
+            save_sessions(self.sessions)
+        else:
+            await q.answer()
+            return
+
+        session_model = self._get_default_model(sk)
+        try:
+            effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
+        except Exception as e:
+            await q.answer(f"{type(e).__name__}: {e}", show_alert=True)
+            return
+        text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models)
+        kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model)
+        await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="model callback edit")
+        await q.answer(f"model={session_model or proxy_default_model or '(default)'}")
+
     async def cmd_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(
             f"cmd /ping from chat={update.effective_chat.id if update.effective_chat else '?'} "
@@ -1170,10 +1693,15 @@ class ManagerApp:
         lines.append("- /proxy_list  查看在线机器（旧命令: /servers）")
         lines.append("- /proxy_use <id>  选择机器（旧命令: /use <id>）")
         lines.append("- /proxy_current  查看当前选择")
+        lines.append("- /status  查看当前会话状态汇总")
+        lines.append("- /model  查看当前会话模型（以及 proxy 默认模型），并列出可点按钮切换")
+        lines.append("- /model <model_id>  切换当前会话模型（会在每次 turn/start 里下发，按 app-server 语义写回 thread 默认）")
+        lines.append("- /result_mode [replace|send]  结果输出模式：覆盖占位 / 单独发结果")
         lines.append("")
         lines.append("2) 日常对话（turn）")
         lines.append("- 直接发送文本即可。")
         lines.append("- 若当前 proxy 没有 thread，会自动 thread/start。")
+        lines.append(f"- 运行中会用 placeholder 追加进度日志，默认约每 {int(self.core.progress_update_interval_s) if hasattr(self, 'core') else 5} 秒最多更新一次。")
         lines.append("")
         lines.append("3) Thread 会话（对齐 app-server method）")
         lines.append("- /thread_current  显示当前 threadId（按 proxy 隔离保存）")
@@ -1185,7 +1713,8 @@ class ManagerApp:
         lines.append("- /thread_unarchive <id>  (也支持: threadId=<id>)")
         lines.append("")
         lines.append("4) 其它 app-server 查询/配置")
-        lines.append("- /model_list [limit=10]")
+        lines.append("- /model")
+        lines.append("- /model <model_id>")
         lines.append("- /skills_list [cwds=/a,/b] [forceReload=true|false]")
         lines.append("- /config_read [includeLayers=true|false]")
         lines.append("- /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]")
@@ -1200,6 +1729,8 @@ class ManagerApp:
         lines.append("参数格式：key=value（多个参数用空格分隔）。JSON 参数用 value=<json>。")
         lines.append("示例：")
         lines.append("- /proxy_use proxy27")
+        lines.append("- /model gpt-5-codex")
+        lines.append("- /result_mode send")
         lines.append("- /thread_list limit=3 archived=false")
         lines.append("- /config_value_write keyPath=apps._default.enabled value=true mergeStrategy=replace")
         lines.append("")
@@ -1293,6 +1824,11 @@ class ManagerApp:
         for k in ("cwd", "sandbox", "approvalPolicy", "personality", "model", "baseInstructions"):
             if k in kv:
                 params[k] = kv[k]
+        sk = _session_key(update)
+        if "model" not in params:
+            default_model = self._get_default_model(sk)
+            if default_model:
+                params["model"] = default_model
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
             await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_start reply")
@@ -1307,7 +1843,6 @@ class ManagerApp:
         if not thread_id:
             await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="/thread_start reply")
             return
-        sk = _session_key(update)
         self._set_current_thread_id(sk, proxy_id, thread_id)
         save_sessions(self.sessions)
         await _tg_call(update.message.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_start reply")
@@ -1467,43 +2002,6 @@ class ManagerApp:
             return
         await _tg_call(update.message.reply_text(f"[{proxy_id}] ok unarchived threadId={thread_id}"), timeout_s=15.0, what="/thread_unarchive reply")
 
-    async def cmd_model_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /model_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not update.message:
-            return
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/model_list reply")
-            return
-        proxy_id = await self._require_proxy_online(update)
-        if not proxy_id:
-            return
-        kv = self._parse_kv(context.args or [])
-        params: JsonDict = {}
-        if "limit" in kv:
-            try:
-                params["limit"] = int(kv["limit"])
-            except Exception:
-                pass
-        if "includeHidden" in kv:
-            params["includeHidden"] = str(kv["includeHidden"]).lower() in ("1", "true", "yes", "y", "on")
-        core: ManagerCore | None = context.application.bot_data.get("core")
-        if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/model_list reply")
-            return
-        rep = await core.appserver_call(proxy_id, "model/list", params, timeout_s=min(60.0, self.task_timeout_s))
-        if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/model_list reply")
-            return
-        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
-        data = result.get("data") if isinstance(result.get("data"), list) else []
-        lines = [f"proxy: {proxy_id}", f"count: {len(data)}"]
-        for i, item in enumerate(data[:30], start=1):
-            if not isinstance(item, dict):
-                continue
-            mid = str(item.get("id") or "")
-            lines.append(f"{i}. {mid}")
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/model_list reply")
-
     async def cmd_skills_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /skills_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
@@ -1637,6 +2135,9 @@ class ManagerApp:
         if not thread_id:
             # Auto-create a thread on first message for this (chat, proxy).
             params: JsonDict = {"cwd": str(BASE_DIR), "personality": "pragmatic"}
+            default_model = self._get_default_model(sk)
+            if default_model:
+                params["model"] = default_model
             rep = await core.appserver_call(proxy_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
             if not bool(rep.get("ok")):
                 await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start failed: {rep.get('error')}"), timeout_s=15.0, what="msg reply")
@@ -1666,6 +2167,12 @@ class ManagerApp:
             "thread_id": thread_id,
             "prompt": prompt,
         }
+        # Per app-server spec: set per-turn overrides (e.g. model) on turn/start.
+        # This ensures the app-server thread defaults are updated and avoids drift
+        # between manager local session prefs and the actual Codex thread settings.
+        session_model = self._get_default_model(sk)
+        if session_model:
+            task_msg["model"] = session_model
 
         # Event-driven: send immediately, do not await result here.
         if chat_id is None:
@@ -1679,6 +2186,8 @@ class ManagerApp:
                 chat_id=int(chat_id),
                 placeholder_msg_id=int(placeholder.message_id),
                 created_at=time.time(),
+                session_key=sk,
+                result_mode=self._get_result_mode(sk),
             )
         )
         logger.info(
@@ -1817,6 +2326,10 @@ def main() -> int:
                     tg.add_handler(CommandHandler("proxy_list", app.cmd_proxy_list))
                     tg.add_handler(CommandHandler("proxy_use", app.cmd_proxy_use))
                     tg.add_handler(CommandHandler("proxy_current", app.cmd_proxy_current))
+                    tg.add_handler(CommandHandler("status", app.cmd_status))
+                    tg.add_handler(CommandHandler("model", app.cmd_model))
+                    tg.add_handler(CallbackQueryHandler(app.on_model_callback, pattern=r"^model:"))
+                    tg.add_handler(CommandHandler("result_mode", app.cmd_result_mode))
                     tg.add_handler(CommandHandler("thread_current", app.cmd_thread_current))
                     tg.add_handler(CommandHandler("thread_start", app.cmd_thread_start))
                     tg.add_handler(CommandHandler("thread_resume", app.cmd_thread_resume))
@@ -1824,7 +2337,6 @@ def main() -> int:
                     tg.add_handler(CommandHandler("thread_read", app.cmd_thread_read))
                     tg.add_handler(CommandHandler("thread_archive", app.cmd_thread_archive))
                     tg.add_handler(CommandHandler("thread_unarchive", app.cmd_thread_unarchive))
-                    tg.add_handler(CommandHandler("model_list", app.cmd_model_list))
                     tg.add_handler(CommandHandler("skills_list", app.cmd_skills_list))
                     tg.add_handler(CommandHandler("config_read", app.cmd_config_read))
                     tg.add_handler(CommandHandler("config_value_write", app.cmd_config_value_write))

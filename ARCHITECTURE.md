@@ -35,10 +35,14 @@
    - 若 “Codex 回答前未完成任务” 已达到上限（默认 10）：立刻回 `task_result(ok=false, error="proxy queue full")`
    - 否则立刻回 `task_ack`（表示已入 proxy 队列），并把任务入队
 5. Proxy 在本机按收到顺序（FIFO）把任务喂给 `codex app-server`，并回 `task_result`：
+   - 运行中会把关键 app-server 通知转成 `task_progress`（例如 `turn/plan/updated`、`item/started`、重试中的 `error`）
    - 需要时：`thread/start`
    - `turn/start`
    - 等待 `turn/completed`
-6. Manager 收到 `task_result` 后按 `task_id` 找到该条 placeholder，并回写 Telegram（编辑 placeholder；超长则追加多条消息）
+6. Manager 收到 `task_progress` 后会按 `task_id` 找到 placeholder，并在 Telegram 上节流更新“增量进度日志”（默认约 5 秒最多编辑一次）
+7. Manager 收到 `task_result` 后按会话配置回写 Telegram：
+   - `replace`：结果覆盖 placeholder
+   - `send`：placeholder 改为 done/failed，结果单独发送
 
 ## 状态与持久化
 
@@ -62,6 +66,8 @@
 - `task_result`：
   - 成功：`{"type":"task_result","task_id":"...","ok":true,"text":"..."}`
   - 失败：`{"type":"task_result","task_id":"...","ok":false,"error":"..."}`
+- `task_progress`：
+  - `{"type":"task_progress","task_id":"...","event":"item/started","stage":"command","summary":"执行命令: ip -4 addr show"}`
 - `appserver_response`（app-server JSON-RPC 透传结果）：
   - `{"type":"appserver_response","req_id":"...","ok":true,"result":{...}}`
   - `{"type":"appserver_response","req_id":"...","ok":false,"error":"..."}`
@@ -72,7 +78,10 @@
 
 - `register_ok` / `register_error`
 - `task_assign`：
-  - `{"type":"task_assign","task_id":"...","thread_key":"tg:<chat>:<user>","thread_id":"<threadId>","prompt":"..."}`
+  - `{"type":"task_assign","task_id":"...","thread_key":"tg:<chat>:<user>","thread_id":"<threadId>","prompt":"...","model":"gpt-5.3-codex","effort":"medium"}`
+  - 说明：
+    - `model/effort` 为可选字段，会在 proxy 侧转成 app-server 的 `turn/start` per-turn overrides。
+    - 按 app-server 语义，turn/start 指定的 overrides 会写回到 thread 默认值，用于后续 turns。
 - `appserver_request`（app-server JSON-RPC 透传）：
   - `{"type":"appserver_request","req_id":"...","method":"thread/list","params":{"limit":1}}`
 

@@ -129,6 +129,86 @@ def _map_threadstart_approval_policy(v: str) -> str:
     }.get(v, v)
 
 
+def _short_text(v: Any, limit: int = 160) -> str:
+    s = str(v or "").strip().replace("\n", " ")
+    if len(s) <= limit:
+        return s
+    return s[: limit - 3] + "..."
+
+
+def _progress_from_notification(msg: JsonDict) -> JsonDict | None:
+    method = str(msg.get("method") or "")
+    params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+    if not method or not isinstance(params, dict):
+        return None
+
+    if method == "turn/started":
+        return {"event": method, "stage": "turn_started", "summary": "已开始处理本轮请求"}
+
+    if method == "turn/completed":
+        return {"event": method, "stage": "turn_completed", "summary": "本轮处理完成", "force": True}
+
+    if method == "turn/plan/updated":
+        plan = params.get("plan")
+        if isinstance(plan, list):
+            in_progress = ""
+            pending = 0
+            completed = 0
+            for item in plan:
+                if not isinstance(item, dict):
+                    continue
+                status = str(item.get("status") or "")
+                step = _short_text(item.get("step") or "")
+                if status == "in_progress" and step:
+                    in_progress = step
+                elif status == "pending":
+                    pending += 1
+                elif status == "completed":
+                    completed += 1
+            if in_progress:
+                return {"event": method, "stage": "plan", "summary": f"计划执行中: {in_progress}"}
+            return {"event": method, "stage": "plan", "summary": f"计划已更新: completed={completed} pending={pending}"}
+        return {"event": method, "stage": "plan", "summary": "计划已更新"}
+
+    if method == "error":
+        if bool(params.get("willRetry")):
+            msg_text = _short_text(params.get("message") or params.get("additionalDetails") or "")
+            return {"event": method, "stage": "retrying", "summary": msg_text or "连接波动，Codex 正在重试"}
+        msg_text = _short_text(params.get("message") or params.get("additionalDetails") or "")
+        return {"event": method, "stage": "error", "summary": msg_text or "运行中出现错误", "force": True}
+
+    if method not in ("item/started", "item/completed", "item/updated"):
+        return None
+
+    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+    item_type = str(item.get("type") or "")
+    if not item_type:
+        return None
+    if item_type == "userMessage":
+        return None
+
+    if item_type == "commandExecution":
+        command = _short_text(item.get("command") or params.get("command") or "")
+        prefix = "执行命令" if method != "item/completed" else "命令完成"
+        return {"event": method, "stage": "command", "summary": f"{prefix}: {command or '(empty)'}"}
+
+    if item_type == "fileChange":
+        title = _short_text(item.get("title") or item.get("path") or item.get("description") or "")
+        prefix = "修改文件" if method != "item/completed" else "文件修改完成"
+        return {"event": method, "stage": "file_change", "summary": f"{prefix}: {title or '(unknown)'}"}
+
+    if item_type == "reasoning":
+        text = _short_text(item.get("text") or item.get("title") or "")
+        return {"event": method, "stage": "reasoning", "summary": text or "正在分析"}
+
+    if item_type == "agentMessage":
+        text = _short_text(item.get("text") or "")
+        return {"event": method, "stage": "message", "summary": text or "正在生成回复"}
+
+    title = _short_text(item.get("title") or item.get("text") or item_type)
+    return {"event": method, "stage": item_type, "summary": title or item_type}
+
+
 class CodexProxyAgent:
     def __init__(
         self,
@@ -188,10 +268,38 @@ class CodexProxyAgent:
             finally:
                 self._approval_waiters.pop(approval_id, None)
 
+        async def _on_notification(msg: JsonDict) -> None:
+            progress = _progress_from_notification(msg)
+            if progress is None:
+                return
+            ws = self._ws
+            send_lock = self._ws_send_lock
+            task_id = self._current_task_id
+            trace_id = self._current_trace_id
+            if ws is None or send_lock is None or not task_id:
+                return
+            out = {
+                "type": "task_progress",
+                "proxy_id": self.proxy_id,
+                "task_id": task_id,
+                "trace_id": trace_id,
+                "event": progress.get("event"),
+                "stage": progress.get("stage"),
+                "summary": progress.get("summary"),
+                "force": bool(progress.get("force")),
+            }
+            try:
+                logger.info(_kv(op="progress.forward", proxy_id=self.proxy_id, trace_id=trace_id or None, task_id=task_id, event=out.get("event"), stage=out.get("stage"), summary=_short_text(out.get("summary"), 120)))
+                async with send_lock:
+                    await ws.send(_json_dumps(out))
+            except Exception:
+                return
+
         self.app = CodexAppServerStdioProcess(
             CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd, env=env),
             on_log=lambda s: logger.info(_kv(op="appserver.log", proxy_id=self.proxy_id, msg=s[:500])),
             on_approval_request=_on_approval,
+            on_notification=_on_notification,
         )
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._resumed_threads: set[str] = set()
@@ -203,6 +311,12 @@ class CodexProxyAgent:
         task_id = str(msg.get("task_id") or "")
         thread_id = str(msg.get("thread_id") or "")
         prompt = str(msg.get("prompt") or "")
+        model = msg.get("model")
+        effort = msg.get("effort")
+        if not isinstance(model, str):
+            model = ""
+        if not isinstance(effort, str):
+            effort = ""
         if not task_id or not thread_id:
             return {
                 "type": "task_result",
@@ -224,6 +338,8 @@ class CodexProxyAgent:
                     task_id=task_id,
                     prompt_len=len(prompt),
                     thread_id=thread_id,
+                    model=(model or ""),
+                    effort=(effort or ""),
                 )
             )
             try:
@@ -242,7 +358,7 @@ class CodexProxyAgent:
                     lock = asyncio.Lock()
                     self._thread_locks[thread_id] = lock
                 async with lock:
-                    turn_id = await self.app.turn_start_text(thread_id=thread_id, text=prompt)
+                    turn_id = await self.app.turn_start_text(thread_id=thread_id, text=prompt, model=model or None, effort=effort or None)
                     text = await self.app.run_turn_and_collect_agent_message(thread_id=thread_id, turn_id=turn_id, timeout_s=120.0)
                 latency_ms = int((time.time() - t0) * 1000.0)
                 logger.info(
@@ -397,6 +513,8 @@ class CodexProxyAgent:
                                     else:
                                         try:
                                             allow = {
+                                                "account/read",
+                                                "account/rateLimits/read",
                                                 "thread/start",
                                                 "thread/resume",
                                                 "thread/list",

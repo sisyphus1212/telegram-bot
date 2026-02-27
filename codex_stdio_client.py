@@ -36,10 +36,12 @@ class CodexAppServerStdioProcess:
         on_log: Callable[[str], None] | None = None,
         *,
         on_approval_request: Callable[[JsonDict], Awaitable[str]] | None = None,
+        on_notification: Callable[[JsonDict], Awaitable[None] | None] | None = None,
     ) -> None:
         self._config = config
         self._on_log = on_log
         self._on_approval_request = on_approval_request
+        self._on_notification = on_notification
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stdout: asyncio.StreamReader | None = None
@@ -231,8 +233,15 @@ class CodexAppServerStdioProcess:
     async def collaborationmode_list(self) -> JsonDict:
         return await self.request("collaborationMode/list", {})
 
-    async def turn_start_text(self, thread_id: str, text: str) -> str:
-        result = await self.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": text}]})
+    async def turn_start_text(self, thread_id: str, text: str, *, model: str | None = None, effort: str | None = None) -> str:
+        params: JsonDict = {"threadId": thread_id, "input": [{"type": "text", "text": text}]}
+        # Per app-server spec: turn/start supports per-turn overrides (e.g. model/effort)
+        # and will update the thread defaults for subsequent turns.
+        if model:
+            params["model"] = model
+        if effort:
+            params["effort"] = effort
+        result = await self.request("turn/start", params)
         turn = result.get("turn") or {}
         turn_id = turn.get("id")
         if not isinstance(turn_id, str) or not turn_id:
@@ -295,6 +304,16 @@ class CodexAppServerStdioProcess:
             return
         await self._send_raw({"id": req_id, "error": {"code": -32601, "message": f"Unsupported request: {method}"}})
 
+    async def _dispatch_notification(self, msg: JsonDict) -> None:
+        if self._on_notification is None:
+            return
+        try:
+            ret = self._on_notification(msg)
+            if asyncio.iscoroutine(ret):
+                await ret
+        except Exception as e:
+            self._log(f"[app-server] notification handler failed: {type(e).__name__}: {e}")
+
     async def _reader_loop(self) -> None:
         assert self._stdout is not None
         try:
@@ -325,6 +344,7 @@ class CodexAppServerStdioProcess:
                     asyncio.create_task(self._handle_server_request(msg))
                     continue
                 if "method" in msg and "id" not in msg:
+                    asyncio.create_task(self._dispatch_notification(msg))
                     await self._notifications.put(msg)
                     continue
         except asyncio.CancelledError:
