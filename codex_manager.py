@@ -333,6 +333,8 @@ class TelegramOutbox:
         self._queues: dict[int, asyncio.Queue[TgAction]] = {}
         self._tasks: dict[int, asyncio.Task] = {}
         self._last_active: dict[int, float] = {}
+        # (chat_id, message_id) -> last edited text. Used to avoid noisy "Message is not modified" errors.
+        self._last_edit_text: dict[tuple[int, int], str] = {}
 
     async def enqueue(self, action: TgAction) -> bool:
         now = time.time()
@@ -375,11 +377,19 @@ class TelegramOutbox:
 
                 try:
                     if action.type == "edit":
+                        if action.message_id is None:
+                            raise ValueError("edit action missing message_id")
+                        key = (action.chat_id, action.message_id)
+                        last_text = self._last_edit_text.get(key)
+                        if last_text == action.text:
+                            # Avoid a no-op API call; this is common when progress updates are throttled.
+                            continue
                         await _tg_call(
                             lambda: self.bot.edit_message_text(chat_id=action.chat_id, message_id=action.message_id, text=action.text),
                             timeout_s=action.timeout_s,
                             what="tg edit",
                         )
+                        self._last_edit_text[key] = action.text
                         logger.info(
                             f"op=tg.edit ok=true chat_id={action.chat_id} msg_id={action.message_id} "
                             f"trace_id={action.trace_id} proxy_id={action.proxy_id} task_id={action.task_id} kind={action.kind}"
