@@ -117,7 +117,7 @@ Node 运行在被控机器上（每台机器一个进程），至少需要：
 - `CODEX_SANDBOX`：Codex sandbox（默认 `workspace-write`）。需要执行更高权限操作时可考虑 `danger-full-access`（风险极高）。
 - `CODEX_APPROVAL_POLICY`：审批策略（不同 codex 版本枚举可能不同；本项目会尽量兼容官方文档值与本地实际值）。
 
-> 说明：当前实现已经支持把 app-server 的审批请求转发到 Telegram。`approval_policy=onRequest` 时，只有当 Codex 主动发起 `requestApproval`，Telegram 才会收到 `/approve <approval_id>`、`/approve_session <approval_id>`、`/decline <approval_id>` 这类审批命令。
+> 说明：当前实现已经支持把 app-server 的审批请求转发到 Telegram。`approval_policy=onRequest` 时，只有当 Codex 主动发起 `requestApproval`，Telegram 才会收到 `/approve <approval_id>`、`/approve session <approval_id>`、`/decline <approval_id>` 这类审批命令。
 
 ### 4. 自检
 
@@ -202,7 +202,7 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 node）
 3. 点击按钮选择一台机器
 4. 可选：`/model <model_id>` 设置当前会话模型（每次 `turn/start` 都会带上该 model）
-5. 可选：`/result_mode replace` 或 `/result_mode send`
+5. 可选：`/result replace` 或 `/result send`
 6. 直接发一条消息，例如 `ping`
 7. 预期会先看到占位 `working...`
 8. 若任务执行较久，占位消息会被周期性编辑，并以“增量日志”的方式保留已发生的进展（默认约 5 秒最多更新一次；会自动去掉重复噪音，并在过长时折叠中间步骤）
@@ -212,13 +212,13 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 
 ### 7.1 Thread 管理命令（尽量对齐 app-server 官方 method）
 
-- `/thread_start` -> `thread/start`（并设置当前聊天在当前 node 上的 `current_thread_id`）
-- `/thread_resume threadId=<id>` -> `thread/resume`
-- `/thread_list limit=5` -> `thread/list`
-- `/thread_read threadId=<id>` -> `thread/read`
-- `/thread_archive [threadId=<id>]` -> `thread/archive`
-- `/thread_unarchive threadId=<id>` -> `thread/unarchive`
-- `/thread_current` 显示当前聊天在当前 node 上保存的 threadId（这是客户端路由元数据，不是 app-server method）
+- `/thread start` -> `thread/start`（并设置当前聊天在当前 node 上的 `current_thread_id`）
+- `/thread resume threadId=<id>` -> `thread/resume`
+- `/thread list limit=5` -> `thread/list`
+- `/thread read threadId=<id>` -> `thread/read`
+- `/thread archive [threadId=<id>]` -> `thread/archive`
+- `/thread unarchive threadId=<id>` -> `thread/unarchive`
+- `/thread current` 显示当前聊天在当前 node 上保存的 threadId（这是客户端路由元数据，不是 app-server method）
 
 ### 8. 作为 Linux 服务（systemd）
 

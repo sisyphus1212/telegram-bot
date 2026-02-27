@@ -799,7 +799,7 @@ class ManagerCore:
         text_lines.append("")
         text_lines.append("回复以下命令进行选择：")
         text_lines.append(f"/approve {approval_id}")
-        text_lines.append(f"/approve_session {approval_id}")
+        text_lines.append(f"/approve session {approval_id}")
         text_lines.append(f"/decline {approval_id}")
 
         await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text="\n".join(text_lines), trace_id=ac.trace_id, proxy_id=proxy_id, task_id=task_id, kind="approval"))
@@ -1543,28 +1543,6 @@ class ManagerApp:
         await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="node callback edit")
         await q.answer(f"current={selected or '(none)'}")
 
-    async def cmd_result_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /result_mode chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not update.message:
-            return
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/result_mode reply")
-            return
-        sk = _session_key(update)
-        if not context.args:
-            mode = self._get_result_mode(sk)
-            await _tg_call(update.message.reply_text(f"result_mode: {mode}"), timeout_s=15.0, what="/result_mode reply")
-            return
-        mode = (context.args[0] or "").strip().lower()
-        aliases = {"replace": "replace", "edit": "replace", "send": "send", "separate": "send"}
-        mode = aliases.get(mode, "")
-        if not mode:
-            await _tg_call(update.message.reply_text("usage: /result_mode <replace|send>"), timeout_s=15.0, what="/result_mode reply")
-            return
-        self._set_result_mode(sk, mode)
-        save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"ok result_mode={mode}"), timeout_s=15.0, what="/result_mode reply")
-
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /status chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not update.message:
@@ -1778,6 +1756,32 @@ class ManagerApp:
             return
         await _tg_call(update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
 
+    async def cmd_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /result [send|replace]
+        (Replaces legacy /result_mode)
+        """
+        logger.info(f"cmd /result chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/result reply")
+            return
+        sk = _session_key(update)
+        if not context.args:
+            mode = self._get_result_mode(sk)
+            await _tg_call(update.message.reply_text(f"result: {mode}"), timeout_s=15.0, what="/result reply")
+            return
+        mode = (context.args[0] or "").strip().lower()
+        aliases = {"replace": "replace", "edit": "replace", "send": "send", "separate": "send"}
+        mode = aliases.get(mode, "")
+        if not mode:
+            await _tg_call(update.message.reply_text("usage: /result <replace|send>"), timeout_s=15.0, what="/result reply")
+            return
+        self._set_result_mode(sk, mode)
+        save_sessions(self.sessions)
+        await _tg_call(update.message.reply_text(f"ok result={mode}"), timeout_s=15.0, what="/result reply")
+
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /help chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not update.message:
@@ -1794,7 +1798,7 @@ class ManagerApp:
         lines.append("- /status  查看当前会话状态汇总")
         lines.append("- /model  查看当前会话模型（以及 proxy 默认模型），并列出可点按钮切换")
         lines.append("- /model <model_id>  切换当前会话模型（会在每次 turn/start 里下发，按 app-server 语义写回 thread 默认）")
-        lines.append("- /result_mode [replace|send]  结果输出模式：覆盖占位 / 单独发结果")
+        lines.append("- /result [replace|send]  结果输出模式：覆盖占位 / 单独发结果")
         lines.append("")
         lines.append("2) 日常对话（turn）")
         lines.append("- 直接发送文本即可。")
@@ -1802,35 +1806,35 @@ class ManagerApp:
         lines.append(f"- 运行中会用 placeholder 追加进度日志，默认约每 {int(self.core.progress_update_interval_s) if hasattr(self, 'core') else 5} 秒最多更新一次。")
         lines.append("")
         lines.append("3) Thread 会话（对齐 app-server method）")
-        lines.append("- /thread_current  显示当前 threadId（按 proxy 隔离保存）")
-        lines.append("- /thread_start [cwd=...] [sandbox=workspaceWrite] [approvalPolicy=onRequest] [personality=pragmatic]")
-        lines.append("- /thread_resume <id>  (也支持: /thread_resume threadId=<id>)")
-        lines.append("- /thread_list [limit=5] [archived=true|false] [cursor=...] [sortKey=created_at|updated_at]")
-        lines.append("- /thread_read <id> [includeTurns=true|false]  (也支持: threadId=<id>)")
-        lines.append("- /thread_archive [threadId=<id>]   (不填则归档当前 thread)")
-        lines.append("- /thread_unarchive <id>  (也支持: threadId=<id>)")
+        lines.append("- /thread current")
+        lines.append("- /thread start [cwd=...] [sandbox=workspaceWrite] [approvalPolicy=onRequest] [personality=pragmatic]")
+        lines.append("- /thread resume <id>  (也支持: threadId=<id>)")
+        lines.append("- /thread list [limit=5] [archived=true|false] [cursor=...] [sortKey=created_at|updated_at]")
+        lines.append("- /thread read <id> [includeTurns=true|false]  (也支持: threadId=<id>)")
+        lines.append("- /thread archive [threadId=<id>]   (不填则归档当前 thread)")
+        lines.append("- /thread unarchive <id>  (也支持: threadId=<id>)")
         lines.append("")
         lines.append("4) 其它 app-server 查询/配置")
         lines.append("- /model")
         lines.append("- /model <model_id>")
-        lines.append("- /skills_list [cwds=/a,/b] [forceReload=true|false]")
-        lines.append("- /config_read [includeLayers=true|false]")
-        lines.append("- /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]")
-        lines.append("- /collaborationmode_list")
+        lines.append("- /skills list [cwds=/a,/b] [forceReload=true|false]")
+        lines.append("- /config read [includeLayers=true|false]")
+        lines.append("- /config write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]")
+        lines.append("- /collaborationmode list")
         lines.append("")
         lines.append("5) 审批（approval）")
         lines.append("- 当 approvalPolicy=onRequest 时，某些命令/文件变更会触发审批。")
         lines.append("- /approve <approval_id>  同意一次")
-        lines.append("- /approve_session <approval_id>  本会话同意（如果 codex 支持）")
+        lines.append("- /approve session <approval_id>  本会话同意（如果 codex 支持）")
         lines.append("- /decline <approval_id>  拒绝")
         lines.append("")
         lines.append("参数格式：key=value（多个参数用空格分隔）。JSON 参数用 value=<json>。")
         lines.append("示例：")
         lines.append("- /node")
         lines.append("- /model gpt-5-codex")
-        lines.append("- /result_mode send")
-        lines.append("- /thread_list limit=3 archived=false")
-        lines.append("- /config_value_write keyPath=apps._default.enabled value=true mergeStrategy=replace")
+        lines.append("- /result send")
+        lines.append("- /thread list limit=3 archived=false")
+        lines.append("- /config write keyPath=apps._default.enabled value=true mergeStrategy=replace")
         lines.append("")
         lines.append("提示：thread 内容由 Codex 保存在 proxy 机器的 ~/.codex/；manager 只保存 chat->(proxy, threadId) 路由。")
 
@@ -1843,26 +1847,21 @@ class ManagerApp:
         if not self._is_allowed(update):
             await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve reply")
             return
-        approval_id = (context.args[0] if context.args else "").strip()
-        if not approval_id:
-            await _tg_call(update.message.reply_text("usage: /approve <approval_id>"), timeout_s=15.0, what="/approve reply")
+        if not context.args:
+            await _tg_call(update.message.reply_text("usage: /approve <approval_id> | /approve session <approval_id>"), timeout_s=15.0, what="/approve reply")
             return
-        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="accept", chat_id=update.effective_chat.id)
+        decision = "accept"
+        approval_id = ""
+        if len(context.args) >= 2 and str(context.args[0]).strip().lower() == "session":
+            decision = "acceptForSession"
+            approval_id = str(context.args[1]).strip()
+        else:
+            approval_id = str(context.args[0]).strip()
+        if not approval_id:
+            await _tg_call(update.message.reply_text("usage: /approve <approval_id> | /approve session <approval_id>"), timeout_s=15.0, what="/approve reply")
+            return
+        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision=decision, chat_id=update.effective_chat.id)
         await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve reply")
-
-    async def cmd_approve_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.message:
-            return
-        logger.info(f"cmd /approve_session chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve_session reply")
-            return
-        approval_id = (context.args[0] if context.args else "").strip()
-        if not approval_id:
-            await _tg_call(update.message.reply_text("usage: /approve_session <approval_id>"), timeout_s=15.0, what="/approve_session reply")
-            return
-        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="acceptForSession", chat_id=update.effective_chat.id)
-        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve_session reply")
 
     async def cmd_decline(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message:
@@ -1877,6 +1876,117 @@ class ManagerApp:
             return
         ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="decline", chat_id=update.effective_chat.id)
         await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/decline reply")
+
+    async def cmd_thread(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /thread <subcmd> ...
+        subcmd: current|start|resume|list|read|archive|unarchive
+        (Replaces legacy /thread_* commands)
+        """
+        logger.info(f"cmd /thread chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not context.args:
+            await _tg_call(update.message.reply_text("usage: /thread <current|start|resume|list|read|archive|unarchive> ..."), timeout_s=15.0, what="/thread reply")
+            return
+        sub = str(context.args[0] or "").strip().lower()
+        rest = list(context.args[1:])
+        # Reuse existing implementations by temporarily rewriting context.args.
+        orig_args = context.args
+        context.args = rest
+        try:
+            if sub == "current":
+                await self.cmd_thread_current(update, context)
+            elif sub == "start":
+                await self.cmd_thread_start(update, context)
+            elif sub == "resume":
+                await self.cmd_thread_resume(update, context)
+            elif sub == "list":
+                await self.cmd_thread_list(update, context)
+            elif sub == "read":
+                await self.cmd_thread_read(update, context)
+            elif sub == "archive":
+                await self.cmd_thread_archive(update, context)
+            elif sub == "unarchive":
+                await self.cmd_thread_unarchive(update, context)
+            else:
+                await _tg_call(update.message.reply_text("usage: /thread <current|start|resume|list|read|archive|unarchive> ..."), timeout_s=15.0, what="/thread reply")
+        finally:
+            context.args = orig_args
+
+    async def cmd_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /config <subcmd> ...
+        subcmd: read|write
+        (Replaces legacy /config_read and /config_value_write)
+        """
+        logger.info(f"cmd /config chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not context.args:
+            await _tg_call(update.message.reply_text("usage: /config read ... | /config write keyPath=<...> value=<json> ..."), timeout_s=15.0, what="/config reply")
+            return
+        sub = str(context.args[0] or "").strip().lower()
+        rest = list(context.args[1:])
+        orig_args = context.args
+        context.args = rest
+        try:
+            if sub == "read":
+                await self.cmd_config_read(update, context)
+            elif sub == "write":
+                await self.cmd_config_value_write(update, context)
+            else:
+                await _tg_call(update.message.reply_text("usage: /config read ... | /config write keyPath=<...> value=<json> ..."), timeout_s=15.0, what="/config reply")
+        finally:
+            context.args = orig_args
+
+    async def cmd_skills(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /skills <subcmd> ...
+        subcmd: list
+        (Replaces legacy /skills_list)
+        """
+        logger.info(f"cmd /skills chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not context.args:
+            await _tg_call(update.message.reply_text("usage: /skills list [cwds=/a,/b] [forceReload=true|false]"), timeout_s=15.0, what="/skills reply")
+            return
+        sub = str(context.args[0] or "").strip().lower()
+        rest = list(context.args[1:])
+        orig_args = context.args
+        context.args = rest
+        try:
+            if sub == "list":
+                await self.cmd_skills_list(update, context)
+            else:
+                await _tg_call(update.message.reply_text("usage: /skills list [cwds=/a,/b] [forceReload=true|false]"), timeout_s=15.0, what="/skills reply")
+        finally:
+            context.args = orig_args
+
+    async def cmd_collaborationmode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /collaborationmode <subcmd> ...
+        subcmd: list
+        (Replaces legacy /collaborationmode_list)
+        """
+        logger.info(f"cmd /collaborationmode chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not context.args:
+            await _tg_call(update.message.reply_text("usage: /collaborationmode list"), timeout_s=15.0, what="/collaborationmode reply")
+            return
+        sub = str(context.args[0] or "").strip().lower()
+        rest = list(context.args[1:])
+        orig_args = context.args
+        context.args = rest
+        try:
+            if sub == "list":
+                await self.cmd_collaborationmode_list(update, context)
+            else:
+                await _tg_call(update.message.reply_text("usage: /collaborationmode list"), timeout_s=15.0, what="/collaborationmode reply")
+        finally:
+            context.args = orig_args
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Telegram common entrypoint.
@@ -2434,25 +2544,17 @@ def main() -> int:
                     tg.add_handler(CommandHandler("start", app.cmd_start))
                     tg.add_handler(CommandHandler("ping", app.cmd_ping))
                     tg.add_handler(CommandHandler("approve", app.cmd_approve))
-                    tg.add_handler(CommandHandler("approve_session", app.cmd_approve_session))
                     tg.add_handler(CommandHandler("decline", app.cmd_decline))
                     tg.add_handler(CommandHandler("node", app.cmd_node))
                     tg.add_handler(CallbackQueryHandler(app.on_node_callback, pattern=r"^node:"))
                     tg.add_handler(CommandHandler("status", app.cmd_status))
                     tg.add_handler(CommandHandler("model", app.cmd_model))
                     tg.add_handler(CallbackQueryHandler(app.on_model_callback, pattern=r"^model:"))
-                    tg.add_handler(CommandHandler("result_mode", app.cmd_result_mode))
-                    tg.add_handler(CommandHandler("thread_current", app.cmd_thread_current))
-                    tg.add_handler(CommandHandler("thread_start", app.cmd_thread_start))
-                    tg.add_handler(CommandHandler("thread_resume", app.cmd_thread_resume))
-                    tg.add_handler(CommandHandler("thread_list", app.cmd_thread_list))
-                    tg.add_handler(CommandHandler("thread_read", app.cmd_thread_read))
-                    tg.add_handler(CommandHandler("thread_archive", app.cmd_thread_archive))
-                    tg.add_handler(CommandHandler("thread_unarchive", app.cmd_thread_unarchive))
-                    tg.add_handler(CommandHandler("skills_list", app.cmd_skills_list))
-                    tg.add_handler(CommandHandler("config_read", app.cmd_config_read))
-                    tg.add_handler(CommandHandler("config_value_write", app.cmd_config_value_write))
-                    tg.add_handler(CommandHandler("collaborationmode_list", app.cmd_collaborationmode_list))
+                    tg.add_handler(CommandHandler("result", app.cmd_result))
+                    tg.add_handler(CommandHandler("thread", app.cmd_thread))
+                    tg.add_handler(CommandHandler("skills", app.cmd_skills))
+                    tg.add_handler(CommandHandler("config", app.cmd_config))
+                    tg.add_handler(CommandHandler("collaborationmode", app.cmd_collaborationmode))
                     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app.on_text))
                     tg.add_error_handler(lambda _u, c: logger.warning(f"telegram handler error: {c.error!r}"), block=False)
 
