@@ -16,7 +16,7 @@ from typing import Any
 import websockets
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
 import log_rotate
@@ -71,6 +71,16 @@ async def _tg_call(make_coro, *, timeout_s: float, what: str, retries: int = 3) 
         try:
             # Must create a new coroutine per attempt; coroutines can't be awaited twice.
             return await asyncio.wait_for(make_coro(), timeout=timeout_s)
+        except BadRequest as e:
+            # PTB treats BadRequest as a NetworkError subclass.
+            # For edits, Telegram returns "Message is not modified" when the content is identical.
+            # This shouldn't be retried or treated as a real failure.
+            msg = str(e)
+            if "Message is not modified" in msg:
+                logger.info(f"telegram call noop ({what}): {type(e).__name__}: {msg}")
+                return None
+            logger.warning(f"telegram call bad request ({what}): {type(e).__name__}: {msg}")
+            raise
         except RetryAfter as e:
             # Telegram 限流：按建议等待后重试。
             wait_s = max(0.5, float(getattr(e, "retry_after", 1.0)))
