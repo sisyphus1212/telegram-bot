@@ -1533,10 +1533,17 @@ class ManagerApp:
                     if name:
                         collab_modes.append(name)
 
-        effective_model = session_model or str(cfg_obj.get("model") or "").strip()
+        appserver_config_model = str(cfg_obj.get("model") or "").strip()
+        next_turn_model = session_model or appserver_config_model
         lines: list[str] = []
         lines.append(f"proxy: {proxy_id}")
-        lines.append(f"model: {effective_model or '(unknown)'}")
+        # IMPORTANT:
+        # - app-server `config/read` is the only reliable "raw" source we have for model right now.
+        #   `thread/read` (current codex versions) does not include a `model` field on the thread object.
+        # - Telegram /model is a manager-side preference that we pass as per-turn override on `turn/start`.
+        lines.append(f"appserver_config_model: {appserver_config_model or '(unknown)'}")
+        lines.append(f"session_model_pref: {session_model or '(none)'}")
+        lines.append(f"next_turn_model: {next_turn_model or '(unknown)'}")
         lines.append(f"model_reasoning_effort: {str(cfg_obj.get('model_reasoning_effort') or '(unknown)')}")
         lines.append(f"model_reasoning_summary: {str(cfg_obj.get('model_reasoning_summary') or '(unknown)')}")
         lines.append(f"directory: {str((thread_items[0].get('cwd') if thread_items and isinstance(thread_items[0], dict) else '') or BASE_DIR)}")
