@@ -2692,6 +2692,7 @@ def main() -> int:
                     # - 若未显式配置，则继承系统 HTTP(S)_PROXY（trust_env=true）
                     proxy = (os.environ.get("TELEGRAM_PROXY") or str(cfg.get("telegram_proxy") or cfg.get("telegram_http_proxy") or "")).strip() or None
                     trust_env = proxy is None
+                    logger.info(f"Telegram http: proxy={proxy!r} trust_env={trust_env}")
                     # PTB long-polling (getUpdates) can occupy connections for a long time.
                     # If we share the same httpx pool for both getUpdates and send/edit calls,
                     # we can hit:
@@ -2700,20 +2701,21 @@ def main() -> int:
                     # - API calls (send/edit/delete webhook)
                     # - getUpdates long-polling
                     req_api = HTTPXRequest(
-                        connection_pool_size=32,
-                        connect_timeout=20.0,
-                        read_timeout=60.0,
+                        connection_pool_size=64,
+                        connect_timeout=60.0,
+                        read_timeout=120.0,
                         write_timeout=60.0,
-                        pool_timeout=60.0,
+                        pool_timeout=180.0,
                         proxy=proxy,
                         httpx_kwargs={"trust_env": trust_env},
                     )
                     req_updates = HTTPXRequest(
-                        connection_pool_size=4,
-                        connect_timeout=20.0,
-                        read_timeout=90.0,
+                        connection_pool_size=32,
+                        connect_timeout=60.0,
+                        # getUpdates is long-polling. read_timeout must be > polling timeout.
+                        read_timeout=180.0,
                         write_timeout=60.0,
-                        pool_timeout=90.0,
+                        pool_timeout=180.0,
                         proxy=proxy,
                         httpx_kwargs={"trust_env": trust_env},
                     )
@@ -2758,7 +2760,7 @@ def main() -> int:
                     await tg.start()
                     core.set_outbox(TelegramOutbox(tg.bot))
                     assert tg.updater is not None
-                    await tg.updater.start_polling()
+                    await tg.updater.start_polling(drop_pending_updates=False, timeout=60, allowed_updates=Update.ALL_TYPES)
                     logger.info("Telegram polling started")
                     if startup_notify_chat_ids:
                         online = registry.online_proxy_ids()
