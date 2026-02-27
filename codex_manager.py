@@ -180,6 +180,21 @@ def _prefix_and_split_telegram_text(text: str, prefix: str, limit: int = 3900) -
     return [prefix + p for p in parts]
 
 
+def _short_one_line(s: str, limit: int = 80) -> str:
+    s = (s or "").replace("\n", " ").strip()
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 3)] + "..."
+
+
+def _result_fingerprint(text: str, *, parts: int) -> str:
+    body = text or ""
+    head = _short_one_line(body[:200], limit=60)
+    tail = _short_one_line(body[-200:], limit=60) if len(body) > 0 else ""
+    ln = len(body)
+    return f'result: len={ln} parts={parts} head=\"{head}\" tail=\"{tail}\"'
+
+
 def load_sessions() -> dict[str, dict]:
     """
     sessions.json v2 schema (持久化路由元数据，而不是 Codex thread 内容):
@@ -852,7 +867,8 @@ class ManagerCore:
             body = text.strip() or "(empty)"
             parts = _prefix_and_split_telegram_text(body, prefix=f"[{proxy_id}] ")
             if ctx.result_mode == "send":
-                done_text = self._render_progress_done_text(ctx, ok=True)
+                fp = _result_fingerprint(body, parts=len(parts))
+                done_text = self._render_progress_done_text(ctx, ok=True) + "\n" + fp
                 if not await outbox.enqueue(
                     TgAction(
                         type="edit",
