@@ -1,4 +1,4 @@
-# 阶段 3 验证：Telegram <-> Manager <-> Proxy <-> Codex <-> Telegram
+# 阶段 3 验证：Telegram <-> Manager <-> Node <-> Codex <-> Telegram
 
 本阶段只在 **阶段 1**（proxy 本机 codex ping/pong）和 **阶段 2**（manager<->proxy WS dispatch）都通过后再做。
 

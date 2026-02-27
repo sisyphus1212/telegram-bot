@@ -1,9 +1,9 @@
 # Telegram Bot - Codex 集成
 
-一个 Telegram 管理入口（manager）控制多台机器上的 Codex（proxy），支持一对多分发：
+一个 Telegram 管理入口（manager）控制多台机器上的 Codex（node；旧名 proxy），支持一对多分发：
 
-- **manager**：接收 Telegram 消息，选择一个在线 proxy 下发任务，收回结果后回写 Telegram
-- **proxy**：运行在每台被控机器上，保持本机 `codex app-server` 常驻，通过 WS 与 manager 双向通信
+- **manager**：接收 Telegram 消息，选择一个在线 node 下发任务，收回结果后回写 Telegram
+- **node**：运行在每台被控机器上，保持本机 `codex app-server` 常驻，通过 WS 与 manager 双向通信
 
 详细架构见 [ARCHITECTURE.md](/root/telegram-bot/ARCHITECTURE.md)。
 
@@ -13,24 +13,24 @@
 
 - [ARCHITECTURE.md](/root/telegram-bot/ARCHITECTURE.md) - 架构与协议说明
 - `codex_manager.py` - Manager（Telegram + WS registry + task dispatch）
-- `codex_proxy.py` - Proxy（WS client，内部使用本机 `codex app-server`）
-- `codex_stdio_client.py` - Proxy 使用的 stdio JSON-RPC 客户端
+- `codex_proxy.py` - Node（旧名 Proxy；WS client，内部使用本机 `codex app-server`）
+- `codex_stdio_client.py` - Node 使用的 stdio JSON-RPC 客户端
 - `codex_proxy_probe.py` - 自检脚本（验证本机 `codex app-server` 链路）
-- `scripts/verify_phase1_probe.sh` - 阶段 1：proxy 本机 codex ping/pong 一键验证
-- `scripts/verify_phase2_ws.sh` - 阶段 2：manager<->proxy WS 一键验证（需要开启 manager control server）
-- `scripts/verify_phase2_appserver_rpc.sh` - 阶段 2：manager<->proxy app-server RPC 透传验证（需要开启 control server）
+- `scripts/verify_phase1_probe.sh` - 阶段 1：node 本机 codex ping/pong 一键验证
+- `scripts/verify_phase2_ws.sh` - 阶段 2：manager<->node WS 一键验证（需要开启 manager control server）
+- `scripts/verify_phase2_appserver_rpc.sh` - 阶段 2：manager<->node app-server RPC 透传验证（需要开启 control server）
 - `docs/verify_phase3_tg.md` - 阶段 3：TG 端到端验证说明
 - `manager_config.example.json` - manager 配置示例（复制为 `manager_config.json` 后填写；不要提交真实 token）
 - `requirements.txt` - Python 依赖
 - `scripts/install.sh` - 创建 venv 并安装依赖
 - `scripts/run.sh` - 使用 venv 启动 manager
-- `scripts/run_proxy.sh` - 使用 venv 启动 proxy
+- `scripts/run_proxy.sh` - 使用 venv 启动 node（旧名 proxy）
 - `systemd/codex-manager.service` - systemd: manager 服务文件
 - `systemd/codex-manager.env.example` - systemd: manager 环境变量示例
-- `systemd/codex-proxy.service` - systemd: proxy 服务文件
+- `systemd/codex-proxy.service` - systemd: node 服务文件（旧名 proxy）
 - `log/manager.log` - 运行日志（运行后生成）
 - `sessions.json` - 会话存储文件（运行后生成）
-  - v2 会保存 chat -> proxy 以及 per-proxy 的 current threadId
+  - v2 会保存 chat -> node（旧名 proxy）以及 per-node 的 current threadId
   - thread 内容由 Codex 自己保存在 `~/.codex/`，我们只保存“指针/路由”
 
 ## 依赖
@@ -67,7 +67,7 @@ Manager 的 Telegram token 推荐放 `manager_config.json`（不要提交，已�
 
 - `TELEGRAM_BOT_TOKEN`: Telegram Bot token
 - `CODEX_MANAGER_WS_LISTEN`: manager WS 监听地址（例如 `0.0.0.0:8765`）
-- `CODEX_DEFAULT_PROXY`: 默认 proxy（可选）
+- `CODEX_DEFAULT_PROXY`: 默认 node（可选，历史命名保留）
 - `CODEX_TASK_TIMEOUT`: 单次任务超时秒数（可选）
 - `TELEGRAM_PROXY`: 如果你的环境需要代理访问 Telegram API（例如 `http://127.0.0.1:8080`）
 - `CODEX_MANAGER_CONTROL_LISTEN`: 可选，本地 control server 监听地址（用于阶段 2 验证，例如 `127.0.0.1:18766`）
@@ -86,7 +86,7 @@ Manager 的 Telegram token 推荐放 `manager_config.json`（不要提交，已�
 
 - `TELEGRAM_ALLOWED_USER_IDS`: 允许使用的 Telegram user id 列表(逗号分隔)，为空表示不限制
 
-Proxy allowlist（可选，后续要收紧安全建议开启）也写在 `manager_config.json`：
+Node allowlist（可选，后续要收紧安全建议开启）也写在 `manager_config.json`：
 
 ```json
 {
@@ -101,19 +101,19 @@ Proxy allowlist（可选，后续要收紧安全建议开启）也写在 `manage
 
 注意：当前代码处于“先打通链路”的 dev 模式，allowlist 目前只做告警不强制拦截（便于快速 bring-up）。
 
-### 3. 配置（Proxy）
+### 3. 配置（Node）
 
-Proxy 运行在被控机器上，至少需要：
+Node 运行在被控机器上（每台机器一个进程），至少需要：
 
 - `CODEX_MANAGER_WS`：manager 的 WS 地址，例如 `ws://MANAGER_IP:8765`
-- `PROXY_ID`：本机 proxy 的名字（用于 `/use <proxy_id>`）
+- `NODE_ID`：本机 node 的名字（推荐；兼容旧名 `PROXY_ID`）
 - `CODEX_CWD`：Codex 工作目录（默认当前目录）
 - `CODEX_BIN`：`codex` 可执行文件（默认 `codex`）
 
 可选：
 
-- `PROXY_TOKEN`：与 allowlist 配合使用的 token（dev 模式可空）
-- `PROXY_MAX_PENDING`：proxy 在 Codex 回答前允许挂起的最大任务数（默认 `10`）。超过会立刻回 `proxy queue full`。
+- `NODE_TOKEN`：与 allowlist 配合使用的 token（推荐；兼容旧名 `PROXY_TOKEN`，dev 模式可空）
+- `PROXY_MAX_PENDING`：node 在 Codex 回答前允许挂起的最大任务数（默认 `10`）。超过会立刻回 `queue full`。
 - `CODEX_SANDBOX`：Codex sandbox（默认 `workspace-write`）。需要执行更高权限操作时可考虑 `danger-full-access`（风险极高）。
 - `CODEX_APPROVAL_POLICY`：审批策略（不同 codex 版本枚举可能不同；本项目会尽量兼容官方文档值与本地实际值）。
 
@@ -135,7 +135,7 @@ Proxy 运行在被控机器上，至少需要：
 ./scripts/run.sh
 ```
 
-再启动 proxy（在每台需要执行 Codex 的机器上）：
+再启动 node（在每台需要执行 Codex 的机器上）：
 
 推荐用 `node_config.json` 来配置（兼容旧名 `proxy_config.json`），避免记环境变量。
 
@@ -151,7 +151,7 @@ python codex_proxy.py --config node_config.json
 - 如果当前目录存在 `node_config.json`，`codex_proxy.py` 即使不带 `--config` 也会自动读取它（兼容：若不存在则读取 `proxy_config.json`）。
 - 优先级：命令行参数 > 环境变量 > JSON 配置 > 默认值。
 
-`proxy_config.example.json` 是一个 JSONC 模板（支持注释），里面已经写好了 `sandbox` / `approval_policy` 的“注释开关”示例：
+`node_config.example.json` 是一个 JSONC 模板（支持注释），里面已经写好了 `sandbox` / `approval_policy` 的“注释开关”示例（兼容旧名 `proxy_config.example.json`）：
 
 - `sandbox`：
   - 常用：`workspaceWrite`（允许在工作区写）
@@ -162,13 +162,13 @@ python codex_proxy.py --config node_config.json
 
 ### 6. 阶段化验证（强烈建议按顺序）
 
-阶段 1：proxy 本机 codex（每台 proxy 机器都要做）
+阶段 1：node 本机 codex（每台 node 机器都要做）
 
 ```bash
 ./scripts/verify_phase1_probe.sh --prompt ping --repeat 10 --timeout 60 --jsonl log/probe_phase1.jsonl
 ```
 
-阶段 2：manager<->proxy WS（不经过 Telegram）
+阶段 2：manager<->node WS（不经过 Telegram）
 
 1. 在 manager 机器上启用 control server（建议只绑定 `127.0.0.1`）：
 
@@ -178,7 +178,7 @@ export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
 systemctl restart codex-manager.service
 ```
 
-2. 在 manager 机器上对某个 proxy 做 WS 连通性验证（要求 proxy 已在线注册）：
+2. 在 manager 机器上对某个 node 做 WS 连通性验证（要求 node 已在线注册）：
 
 ```bash
 export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
@@ -198,9 +198,9 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 
 在 Telegram 对话里：
 
-1. `/proxy_list` 查看在线 proxy（旧命令 `/servers` 仍可用）
-2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 proxy）
-3. `/proxy_use <proxy_id>` 选择一台机器（旧命令 `/use <proxy_id>` 仍可用）
+1. `/node_list` 查看在线 node（旧命令 `/servers`、`/proxy_list` 仍可用）
+2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 node）
+3. `/node_use <node_id>` 选择一台机器（旧命令 `/use <node_id>`、`/proxy_use <proxy_id>` 仍可用）
 4. 可选：`/model <model_id>` 设置当前会话模型（每次 `turn/start` 都会带上该 model）
 5. 可选：`/result_mode replace` 或 `/result_mode send`
 6. 直接发一条消息，例如 `ping`
@@ -212,13 +212,13 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 
 ### 7.1 Thread 管理命令（尽量对齐 app-server 官方 method）
 
-- `/thread_start` -> `thread/start`（并设置当前聊天在当前 proxy 上的 `current_thread_id`）
+- `/thread_start` -> `thread/start`（并设置当前聊天在当前 node 上的 `current_thread_id`）
 - `/thread_resume threadId=<id>` -> `thread/resume`
 - `/thread_list limit=5` -> `thread/list`
 - `/thread_read threadId=<id>` -> `thread/read`
 - `/thread_archive [threadId=<id>]` -> `thread/archive`
 - `/thread_unarchive threadId=<id>` -> `thread/unarchive`
-- `/thread_current` 显示当前聊天在当前 proxy 上保存的 threadId（这是客户端路由元数据，不是 app-server method）
+- `/thread_current` 显示当前聊天在当前 node 上保存的 threadId（这是客户端路由元数据，不是 app-server method）
 
 ### 8. 作为 Linux 服务（systemd）
 
@@ -256,21 +256,20 @@ sudo journalctl -u codex-proxy.service -f
    - 看 `journalctl -u codex-manager.service -f`
    - 很多环境需要设置 `TELEGRAM_PROXY`
    - 代理策略：优先使用 `TELEGRAM_PROXY` 或 `manager_config.json` 的 `telegram_proxy`；若未显式配置，则会继承系统 `HTTP_PROXY/HTTPS_PROXY`
-2. Manager 看不到在线 proxy：
+2. Manager 看不到在线 node：
    - 看 `journalctl -u codex-proxy.service -f`
    - 确认 `CODEX_MANAGER_WS` 可达、端口放通
 3. Codex 没回复或超时：
-   - 在 proxy 机器上跑 `codex --version`
+   - 在 node 机器上跑 `codex --version`
    - 先跑 `./scripts/verify_phase1_probe.sh --prompt ping --repeat 10` 确认本机链路
 4. 阶段 2 验证脚本报 control server 不可用：
    - 确认 manager 启动时设置了 `CODEX_MANAGER_CONTROL_LISTEN` 和 `CODEX_MANAGER_CONTROL_TOKEN`
    - 确认 `scripts/verify_phase2_ws.sh` 使用同一个 token
 5. 安全：
-   - 真实接管 PC 前必须加 `TELEGRAM_ALLOWED_USER_IDS`，并启用 proxy allowlist + token 强校验
+   - 真实接管 PC 前必须加 `TELEGRAM_ALLOWED_USER_IDS`，并启用 node allowlist + token 强校验
 
 ## 多机管理
 
-- `/servers` 列出在线 proxy
-- `/use <proxy_id>` 强制切换当前聊天使用的 proxy（会让下一次对话重置远端 thread）
-- `/reset` 下次对话重置远端 thread
-- `/pc on|off` 预留开关（当前最小协议未使用）
+- `/node_list` 列出在线 node（旧命令：`/servers`、`/proxy_list`）
+- `/node_use <node_id>` 切换当前聊天使用的 node（旧命令：`/use <id>`、`/proxy_use <id>`）
+- `/node_current` 查看当前聊天选择的 node（旧命令：`/proxy_current`）
