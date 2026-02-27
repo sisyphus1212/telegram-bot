@@ -112,6 +112,49 @@ def _parse_allowed_user_ids(value: str) -> set[int]:
     return out
 
 
+def _parse_int_list_env(value: str) -> list[int]:
+    out: list[int] = []
+    for part in (value or "").replace(",", " ").split():
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except Exception:
+            continue
+    return out
+
+
+def _read_git_short_sha(repo_dir: Path) -> str:
+    try:
+        git = repo_dir / ".git"
+        head_path = git / "HEAD"
+        if not head_path.exists():
+            return ""
+        head = head_path.read_text(encoding="utf-8", errors="replace").strip()
+        if head.startswith("ref:"):
+            ref = head.split(":", 1)[1].strip()
+            ref_path = git / ref
+            if ref_path.exists():
+                sha = ref_path.read_text(encoding="utf-8", errors="replace").strip()
+                return sha[:12]
+            packed = git / "packed-refs"
+            if packed.exists():
+                for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or line.startswith("^") or " " not in line:
+                        continue
+                    sha, name = line.split(" ", 1)
+                    if name.strip() == ref:
+                        return sha.strip()[:12]
+                return ""
+        if len(head) >= 12:
+            return head[:12]
+    except Exception:
+        return ""
+    return ""
+
+
 def _split_telegram_text(text: str, limit: int = 3900) -> list[str]:
     text = text or ""
     if len(text) <= limit:
@@ -2237,6 +2280,24 @@ def main() -> int:
 
     default_proxy = os.environ.get("CODEX_DEFAULT_PROXY") or str(cfg.get("default_proxy") or "")
 
+    startup_notify_env = os.environ.get("TELEGRAM_STARTUP_NOTIFY_CHAT_IDS", "").strip()
+    startup_notify_cfg = cfg.get("startup_notify_chat_ids") if isinstance(cfg.get("startup_notify_chat_ids"), list) else []
+    startup_notify_chat_ids: list[int] = []
+    if startup_notify_env:
+        startup_notify_chat_ids = _parse_int_list_env(startup_notify_env)
+    else:
+        for x in startup_notify_cfg:
+            try:
+                startup_notify_chat_ids.append(int(x))
+            except Exception:
+                continue
+        # Reasonable default: if caller already configured allowed user ids (private chat),
+        # use them as startup notification chat ids.
+        if not startup_notify_chat_ids and allowed_users:
+            startup_notify_chat_ids = sorted(allowed_users)
+
+    git_sha = _read_git_short_sha(BASE_DIR)
+
     proxies_cfg = cfg.get("proxies") if isinstance(cfg.get("proxies"), dict) else {}
     allowed_proxies: dict[str, str] = {}
     for pid, entry in proxies_cfg.items():
@@ -2370,6 +2431,26 @@ def main() -> int:
                     assert tg.updater is not None
                     await tg.updater.start_polling()
                     logger.info("Telegram polling started")
+                    if startup_notify_chat_ids:
+                        online = registry.online_proxy_ids()
+                        text_lines = []
+                        text_lines.append("codex_manager 已启动")
+                        text_lines.append(f"time: {datetime.now().isoformat(timespec='seconds')}")
+                        text_lines.append(f"host: {os.uname().nodename}")
+                        if git_sha:
+                            text_lines.append(f"git: {git_sha}")
+                        text_lines.append(f"ws_listen: {args.ws_listen}")
+                        if args.control_listen:
+                            text_lines.append(f"control_listen: {args.control_listen}")
+                        text_lines.append(f"proxies_online: {', '.join(online) if online else '(none)'}")
+                        text_lines.append("tips: /help, /proxy_list, /proxy_use <id>, /status, /model")
+                        msg_text = "\n".join(text_lines)
+                        for chat_id in startup_notify_chat_ids:
+                            try:
+                                await _tg_call(tg.bot.send_message(chat_id=chat_id, text=msg_text), timeout_s=15.0, what="startup_notify")
+                                logger.info(f"op=startup_notify ok=true chat_id={chat_id}")
+                            except Exception as e:
+                                logger.warning(f"op=startup_notify ok=false chat_id={chat_id} error={type(e).__name__}: {e}")
                     backoff_s = 2.0
                     await stop_event.wait()
                 except asyncio.CancelledError:

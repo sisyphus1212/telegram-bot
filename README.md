@@ -72,6 +72,7 @@ Manager 的 Telegram token 推荐放 `manager_config.json`（不要提交，已�
 - `TELEGRAM_PROXY`: 如果你的环境需要代理访问 Telegram API（例如 `http://127.0.0.1:8080`）
 - `CODEX_MANAGER_CONTROL_LISTEN`: 可选，本地 control server 监听地址（用于阶段 2 验证，例如 `127.0.0.1:18766`）
 - `CODEX_MANAGER_CONTROL_TOKEN`: 可选，control server 必需 token（用于阶段 2 验证）
+- `TELEGRAM_STARTUP_NOTIFY_CHAT_IDS`: 可选，manager 启动后向这些 chat_id 发送一条启动汇报（逗号/空格分隔）
 
 也可以在 `manager_config.json` 里显式配置 Telegram 代理（优先级低于 `TELEGRAM_PROXY`）：
 
