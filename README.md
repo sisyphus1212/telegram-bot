@@ -202,8 +202,9 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 node）
 3. 点击按钮选择一台机器
 4. 可选：`/model <model_id>` 设置当前会话模型（每次 `turn/start` 都会带上该 model）
-5. 可选：`/result replace` 或 `/result send`
-6. 直接发一条消息，例如 `ping`
+5. 可选：`/model effort <low|medium|high>` 设置 reasoning effort（默认 `medium`，每次 `turn/start` 都会带上该 effort）
+6. 可选：`/result replace` 或 `/result send`
+7. 直接发一条消息，例如 `ping`
 7. 预期会先看到占位 `working...`
 8. 若任务执行较久，占位消息会被周期性编辑，并以“增量日志”的方式保留已发生的进展（默认约 5 秒最多更新一次；会自动去掉重复噪音，并在过长时折叠中间步骤）
 9. 最终结果输出：

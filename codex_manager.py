@@ -1344,6 +1344,26 @@ class ManagerApp:
         sess["defaults"] = defaults
         self.sessions[sk] = sess
 
+    def _get_default_effort(self, sk: str) -> str:
+        defaults = self._get_defaults(sk)
+        effort = str(defaults.get("effort") or "").strip().lower()
+        if effort in ("low", "medium", "high"):
+            return effort
+        # Default to medium unless explicitly set otherwise.
+        return "medium"
+
+    def _set_default_effort(self, sk: str, effort: str) -> None:
+        effort = str(effort or "").strip().lower()
+        if effort not in ("low", "medium", "high"):
+            effort = "medium"
+        sess = self._get_sess(sk)
+        defaults = sess.get("defaults")
+        if not isinstance(defaults, dict):
+            defaults = {}
+        defaults["effort"] = effort
+        sess["defaults"] = defaults
+        self.sessions[sk] = sess
+
     def _set_current_thread_id(self, sk: str, proxy_id: str, thread_id: str) -> None:
         sess = self._get_sess(sk)
         byp = sess["by_proxy"]
@@ -1440,12 +1460,31 @@ class ManagerApp:
                 models.append(mid)
         return effective_model, proxy_default_model, models
 
-    def _render_model_text(self, *, proxy_id: str, effective_model: str, proxy_default_model: str, session_model: str, models: list[str]) -> str:
+    async def _fetch_model_detail(self, *, proxy_id: str, core: ManagerCore, model_id: str) -> JsonDict:
+        rep = await core.appserver_call(proxy_id, "model/list", {}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            raise RuntimeError(str(rep.get("error") or "model/list failed"))
+        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+        data = result.get("data") if isinstance(result.get("data"), list) else []
+        for item in data:
+            if isinstance(item, dict) and str(item.get("id") or "").strip() == model_id:
+                return item
+        return {}
+
+    def _render_model_text(self, *, proxy_id: str, effective_model: str, proxy_default_model: str, session_model: str, models: list[str], effort: str, model_detail: JsonDict | None) -> str:
         lines = [f"model: {effective_model or '(unknown)'}", f"proxy: {proxy_id}"]
+        lines.append(f"effort: {effort}")
         if session_model:
             lines.append("source: session override")
         elif proxy_default_model:
             lines.append("source: proxy default")
+        if isinstance(model_detail, dict) and model_detail:
+            de = str(model_detail.get("defaultReasoningEffort") or "").strip()
+            if de:
+                lines.append(f"defaultReasoningEffort: {de}")
+            sup = model_detail.get("supportedReasoningEfforts")
+            if isinstance(sup, list) and sup:
+                lines.append(f"supportedReasoningEfforts: {', '.join([str(x) for x in sup if x])}")
         # Keep the text compact: available models are selectable via buttons.
         if models:
             shown = min(len(models), 12)
@@ -1454,7 +1493,7 @@ class ManagerApp:
             lines.append("available: (none)")
         return "\n".join(lines)
 
-    def _build_model_keyboard(self, *, models: list[str], effective_model: str, session_model: str) -> InlineKeyboardMarkup:
+    def _build_model_keyboard(self, *, models: list[str], effective_model: str, session_model: str, effort: str) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = []
         row: list[InlineKeyboardButton] = []
         for mid in models[:12]:
@@ -1465,6 +1504,12 @@ class ManagerApp:
                 row = []
         if row:
             rows.append(row)
+        # Effort controls (low/medium/high). Default is medium.
+        eff_row: list[InlineKeyboardButton] = []
+        for e in ("low", "medium", "high"):
+            lab = f"• {e}" if e == effort else e
+            eff_row.append(InlineKeyboardButton(lab, callback_data=f"effort:set:{e}"))
+        rows.append(eff_row)
         rows.append([
             InlineKeyboardButton("Clear", callback_data="model:clear"),
             InlineKeyboardButton("Refresh", callback_data="model:refresh"),
@@ -1673,6 +1718,7 @@ class ManagerApp:
             return
         sk = _session_key(update)
         session_model = self._get_default_model(sk)
+        session_effort = self._get_default_effort(sk)
         if not context.args:
             proxy_id = await self._require_proxy_online(update)
             if not proxy_id:
@@ -1683,14 +1729,27 @@ class ManagerApp:
                 return
             try:
                 effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
+                detail = await self._fetch_model_detail(proxy_id=proxy_id, core=core, model_id=effective_model)
             except Exception as e:
                 await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {type(e).__name__}: {e}"), timeout_s=15.0, what="/model reply")
                 return
-            text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models)
-            kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model)
+            text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
+            kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
             await _tg_call(update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/model reply")
             return
         arg = " ".join(context.args).strip()
+        if context.args and str(context.args[0]).strip().lower() == "effort":
+            if len(context.args) < 2:
+                await _tg_call(update.message.reply_text("usage: /model effort <low|medium|high>"), timeout_s=15.0, what="/model reply")
+                return
+            eff = str(context.args[1]).strip().lower()
+            if eff not in ("low", "medium", "high"):
+                await _tg_call(update.message.reply_text("usage: /model effort <low|medium|high>"), timeout_s=15.0, what="/model reply")
+                return
+            self._set_default_effort(sk, eff)
+            save_sessions(self.sessions)
+            await _tg_call(update.message.reply_text(f"ok effort={eff}"), timeout_s=15.0, what="/model reply")
+            return
         if arg.lower() in ("clear", "default", "reset"):
             self._set_default_model(sk, "")
             save_sessions(self.sessions)
@@ -1736,15 +1795,59 @@ class ManagerApp:
             return
 
         session_model = self._get_default_model(sk)
+        session_effort = self._get_default_effort(sk)
         try:
             effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
+            detail = await self._fetch_model_detail(proxy_id=proxy_id, core=core, model_id=effective_model)
         except Exception as e:
             await q.answer(f"{type(e).__name__}: {e}", show_alert=True)
             return
-        text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models)
-        kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model)
+        text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
+        kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
         await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="model callback edit")
         await q.answer(f"model={session_model or proxy_default_model or '(default)'}")
+
+    async def on_effort_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        if not self._is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        data = str(q.data or "")
+        if not data.startswith("effort:"):
+            return
+        sk = _session_key(update)
+        proxy_id = self._get_selected_proxy(sk)
+        if not proxy_id or not self.registry.is_online(proxy_id):
+            await q.answer("node offline", show_alert=True)
+            return
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await q.answer("manager core missing", show_alert=True)
+            return
+        if data.startswith("effort:set:"):
+            eff = data[len("effort:set:") :].strip().lower()
+            if eff not in ("low", "medium", "high"):
+                await q.answer("bad effort", show_alert=True)
+                return
+            self._set_default_effort(sk, eff)
+            save_sessions(self.sessions)
+        else:
+            await q.answer()
+            return
+        session_model = self._get_default_model(sk)
+        session_effort = self._get_default_effort(sk)
+        try:
+            effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
+            detail = await self._fetch_model_detail(proxy_id=proxy_id, core=core, model_id=effective_model)
+        except Exception as e:
+            await q.answer(f"{type(e).__name__}: {e}", show_alert=True)
+            return
+        text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
+        kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
+        await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="effort callback edit")
+        await q.answer(f"effort={session_effort}")
 
     async def cmd_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(
@@ -2381,6 +2484,8 @@ class ManagerApp:
         session_model = self._get_default_model(sk)
         if session_model:
             task_msg["model"] = session_model
+        # Default to medium.
+        task_msg["effort"] = self._get_default_effort(sk)
 
         # Event-driven: send immediately, do not await result here.
         if chat_id is None:
@@ -2550,6 +2655,7 @@ def main() -> int:
                     tg.add_handler(CommandHandler("status", app.cmd_status))
                     tg.add_handler(CommandHandler("model", app.cmd_model))
                     tg.add_handler(CallbackQueryHandler(app.on_model_callback, pattern=r"^model:"))
+                    tg.add_handler(CallbackQueryHandler(app.on_effort_callback, pattern=r"^effort:"))
                     tg.add_handler(CommandHandler("result", app.cmd_result))
                     tg.add_handler(CommandHandler("thread", app.cmd_thread))
                     tg.add_handler(CommandHandler("skills", app.cmd_skills))
