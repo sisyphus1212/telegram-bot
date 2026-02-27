@@ -65,6 +65,9 @@ async def _tg_call(make_coro, *, timeout_s: float, what: str, retries: int = 3) 
     Telegram 网络在部分环境下不稳定（尤其是走本地代理时），这里做轻量重试避免“没反应”。
 
     注意：send_message 不是严格幂等，重试可能导致重复消息；但比起完全无响应更可接受。
+
+    约定：如果调用方本身已经实现了“队列级重试”（例如 TelegramOutbox），则应把 retries 设为 1，
+    避免“单次发送内部重试 + 队列外部重试”叠加导致整体延迟过大。
     """
     attempt = 0
     while True:
@@ -324,7 +327,7 @@ class TgAction:
     kind: str = ""  # "placeholder" | "result" | "late" | "timeout" | ...
     # Retry on transient Telegram network failures. None means "use default policy by kind".
     retries_left: int | None = None
-    backoff_s: float = 2.0
+    backoff_s: float = 1.0
 
 
 class TelegramOutbox:
@@ -402,6 +405,7 @@ class TelegramOutbox:
                             lambda: self.bot.edit_message_text(chat_id=action.chat_id, message_id=action.message_id, text=action.text),
                             timeout_s=action.timeout_s,
                             what="tg edit",
+                            retries=1,
                         )
                         self._last_edit_text[key] = action.text
                         logger.info(
@@ -409,7 +413,12 @@ class TelegramOutbox:
                             f"trace_id={action.trace_id} proxy_id={action.proxy_id} task_id={action.task_id} kind={action.kind}"
                         )
                     elif action.type == "send":
-                        await _tg_call(lambda: self.bot.send_message(chat_id=action.chat_id, text=action.text), timeout_s=action.timeout_s, what="tg send")
+                        await _tg_call(
+                            lambda: self.bot.send_message(chat_id=action.chat_id, text=action.text),
+                            timeout_s=action.timeout_s,
+                            what="tg send",
+                            retries=1,
+                        )
                         logger.info(
                             f"op=tg.send ok=true chat_id={action.chat_id} trace_id={action.trace_id} "
                             f"proxy_id={action.proxy_id} task_id={action.task_id} kind={action.kind}"
@@ -531,7 +540,7 @@ class ManagerCore:
         if self._timeout_task is None:
             self._timeout_task = asyncio.create_task(self._timeout_loop(), name="task_timeout_loop")
 
-    async def tg_send(self, *, chat_id: int, text: str, kind: str, timeout_s: float = 15.0, retries_left: int | None = None) -> bool:
+    async def tg_send(self, *, chat_id: int, text: str, kind: str, timeout_s: float = 8.0, retries_left: int | None = None) -> bool:
         outbox = self._outbox
         if outbox is None:
             return False
@@ -1924,7 +1933,7 @@ class ManagerApp:
             await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/ping reply")
             return
         core2: ManagerCore | None = context.application.bot_data.get("core")
-        if core2 is not None and await core2.tg_send(chat_id=update.effective_chat.id, text="pong", kind="ping", retries_left=12):
+        if core2 is not None and await core2.tg_send(chat_id=update.effective_chat.id, text="pong", kind="ping", timeout_s=5.0, retries_left=12):
             return
         await _tg_call(lambda: update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
 
