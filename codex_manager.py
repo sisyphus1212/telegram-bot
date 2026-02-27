@@ -2688,11 +2688,11 @@ def main() -> int:
                 tg = None
                 try:
                     # Telegram 代理策略：
-                    # - 优先使用显式配置：TELEGRAM_PROXY 或 manager_config.json 的 telegram_proxy
-                    # - 若未显式配置，则继承系统 HTTP(S)_PROXY（trust_env=true）
-                    proxy = (os.environ.get("TELEGRAM_PROXY") or str(cfg.get("telegram_proxy") or cfg.get("telegram_http_proxy") or "")).strip() or None
-                    trust_env = proxy is None
-                    logger.info(f"Telegram http: proxy={proxy!r} trust_env={trust_env}")
+                    # - 只使用系统环境变量 HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+                    # - 不再读取 TELEGRAM_PROXY / manager_config.json 里的 telegram_proxy（避免多处配置互相打架）
+                    proxy = None
+                    trust_env = True
+                    logger.info("Telegram http: proxy=<env> trust_env=true")
                     # PTB long-polling (getUpdates) can occupy connections for a long time.
                     # If we share the same httpx pool for both getUpdates and send/edit calls,
                     # we can hit:

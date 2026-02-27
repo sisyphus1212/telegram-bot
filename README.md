@@ -69,18 +69,12 @@ Manager 的 Telegram token 推荐放 `manager_config.json`（不要提交，已�
 - `CODEX_MANAGER_WS_LISTEN`: manager WS 监听地址（例如 `0.0.0.0:8765`）
 - `CODEX_DEFAULT_PROXY`: 默认 node（可选，历史命名保留）
 - `CODEX_TASK_TIMEOUT`: 单次任务超时秒数（可选）
-- `TELEGRAM_PROXY`: 如果你的环境需要代理访问 Telegram API（例如 `http://127.0.0.1:8080`）
+- 系统代理：如果你的环境需要代理访问 Telegram API，请使用系统环境变量 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY`
 - `CODEX_MANAGER_CONTROL_LISTEN`: 可选，本地 control server 监听地址（用于阶段 2 验证，例如 `127.0.0.1:18766`）
 - `CODEX_MANAGER_CONTROL_TOKEN`: 可选，control server 必需 token（用于阶段 2 验证）
 - `TELEGRAM_STARTUP_NOTIFY_CHAT_IDS`: 可选，manager 启动后向这些 chat_id 发送一条启动汇报（逗号/空格分隔）
 
-也可以在 `manager_config.json` 里显式配置 Telegram 代理（优先级低于 `TELEGRAM_PROXY`）：
-
-```json
-{
-  "telegram_proxy": "http://127.0.0.1:8080"
-}
-```
+不再支持在 `manager_config.json` 或 `TELEGRAM_PROXY` 单独配置 Telegram 代理，避免出现“多处配置互相打架”导致的不可用问题。
 
 安全相关（当前阶段可以先不设，但强烈建议后续补上）：
 
@@ -255,8 +249,8 @@ sudo journalctl -u agent-node.service -f
 
 1. Telegram 收不到消息：
    - 看 `journalctl -u agent-manager.service -f`
-   - 很多环境需要设置 `TELEGRAM_PROXY`
-   - 代理策略：优先使用 `TELEGRAM_PROXY` 或 `manager_config.json` 的 `telegram_proxy`；若未显式配置，则会继承系统 `HTTP_PROXY/HTTPS_PROXY`
+   - 很多环境需要设置系统 `HTTP_PROXY/HTTPS_PROXY`
+   - 代理策略：只继承系统 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY`
 2. Manager 看不到在线 node：
    - 看 `journalctl -u agent-node.service -f`
    - 确认 `CODEX_MANAGER_WS` 可达、端口放通
