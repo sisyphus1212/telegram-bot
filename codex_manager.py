@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import signal
 import time
 import uuid
@@ -2744,6 +2745,42 @@ def main() -> int:
                             text_lines.append(f"control_listen: {args.control_listen}")
                         text_lines.append(f"nodes_online: {', '.join(online) if online else '(none)'}")
                         text_lines.append("tips: /help, /node, /status, /model")
+
+                        # Startup helper: show a ready-to-copy node_config.json template.
+                        # This is best-effort because ws_listen may be 0.0.0.0 and the real reachable
+                        # address might be a public IP / VPN IP.
+                        public_ws = (os.environ.get("CODEX_MANAGER_PUBLIC_WS") or str(cfg.get("public_manager_ws") or "")).strip()
+                        if not public_ws:
+                            guessed_ip = ""
+                            try:
+                                guessed_ip = socket.gethostbyname(socket.gethostname())
+                            except Exception:
+                                guessed_ip = ""
+                            port = str(args.ws_listen).rsplit(":", 1)[-1]
+                            public_ws = f"ws://{guessed_ip or '<MANAGER_IP>'}:{port}"
+
+                        shared_token = (os.environ.get("AGENT_NODE_TOKEN") or str(cfg.get("agent_node_token") or "")).strip()
+                        if not shared_token:
+                            shared_token = "<NODE_TOKEN>"
+
+                        node_tpl = {
+                            "manager_ws": public_ws,
+                            "node_id": "<node_id>",
+                            "node_token": shared_token,
+                            "max_pending": 10,
+                            "sandbox": "dangerFullAccess",
+                            "approval_policy": "onRequest",
+                            "codex_cwd": "/root/telegram-bot",
+                            "codex_bin": "codex",
+                            "http_proxy": "http://127.0.0.1:8080",
+                            "https_proxy": "http://127.0.0.1:8080",
+                            "no_proxy": "localhost,127.0.0.1,::1",
+                        }
+                        text_lines.append("")
+                        text_lines.append("node_config.json 模板（复制到 node 机器的 /root/telegram-bot/node_config.json）：")
+                        text_lines.append("```json")
+                        text_lines.append(json.dumps(node_tpl, ensure_ascii=False, indent=2))
+                        text_lines.append("```")
                         msg_text = "\n".join(text_lines)
                         for chat_id in startup_notify_chat_ids:
                             try:
