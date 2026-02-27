@@ -1382,10 +1382,12 @@ class ManagerApp:
             lines.append("source: session override")
         elif proxy_default_model:
             lines.append("source: proxy default")
-        lines.append("available:")
-        for mid in models:
-            marker = " *" if mid == effective_model else ""
-            lines.append(f"- {mid}{marker}")
+        # Keep the text compact: available models are selectable via buttons.
+        if models:
+            shown = min(len(models), 12)
+            lines.append(f"available: {shown} shown in buttons (total={len(models)})")
+        else:
+            lines.append("available: (none)")
         return "\n".join(lines)
 
     def _build_model_keyboard(self, *, models: list[str], effective_model: str, session_model: str) -> InlineKeyboardMarkup:

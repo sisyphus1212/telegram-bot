@@ -202,8 +202,15 @@ def _progress_from_notification(msg: JsonDict) -> JsonDict | None:
         return {"event": method, "stage": "reasoning", "summary": text or "正在分析"}
 
     if item_type == "agentMessage":
-        text = _short_text(item.get("text") or "")
-        return {"event": method, "stage": "message", "summary": text or "正在生成回复"}
+        # Avoid echoing the full assistant message in progress, since the final
+        # result will be delivered via task_result (and may be sent separately
+        # to Telegram). Keep progress high-signal and non-duplicative.
+        text = str(item.get("text") or "")
+        if method == "item/started":
+            return {"event": method, "stage": "message", "summary": "正在生成回复"}
+        if method == "item/completed":
+            return {"event": method, "stage": "message", "summary": f"回复已生成(len={len(text)})" if text else "回复已生成"}
+        return {"event": method, "stage": "message", "summary": "回复生成中"}
 
     title = _short_text(item.get("title") or item.get("text") or item_type)
     return {"event": method, "stage": item_type, "summary": title or item_type}
