@@ -198,9 +198,9 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 
 在 Telegram 对话里：
 
-1. `/node_list` 查看在线 node（旧命令 `/servers`、`/proxy_list` 仍可用）
+1. `/node_list` 查看在线 node
 2. `/ping` 验证 Telegram -> manager -> Telegram（不经过 node）
-3. `/node_use <node_id>` 选择一台机器（旧命令 `/use <node_id>`、`/proxy_use <proxy_id>` 仍可用）
+3. `/node_use <node_id>` 选择一台机器
 4. 可选：`/model <model_id>` 设置当前会话模型（每次 `turn/start` 都会带上该 model）
 5. 可选：`/result_mode replace` 或 `/result_mode send`
 6. 直接发一条消息，例如 `ping`
@@ -270,6 +270,6 @@ sudo journalctl -u codex-proxy.service -f
 
 ## 多机管理
 
-- `/node_list` 列出在线 node（旧命令：`/servers`、`/proxy_list`）
-- `/node_use <node_id>` 切换当前聊天使用的 node（旧命令：`/use <id>`、`/proxy_use <id>`）
-- `/node_current` 查看当前聊天选择的 node（旧命令：`/proxy_current`）
+- `/node_list` 列出在线 node
+- `/node_use <node_id>` 切换当前聊天使用的 node
+- `/node_current` 查看当前聊天选择的 node

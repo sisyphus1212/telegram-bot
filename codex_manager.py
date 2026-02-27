@@ -1471,16 +1471,10 @@ class ManagerApp:
         ])
         return InlineKeyboardMarkup(rows)
 
-    async def cmd_proxy_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        # Back-compat alias. Prefer /node_list.
-        logger.info(f"cmd /proxy_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
-        await self.cmd_node_list(update, context)
-        return
-
     async def cmd_node_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /node_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/proxy_list reply")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/node_list reply")
             return
         sk = _session_key(update)
         selected = self._get_selected_proxy(sk)
@@ -1500,12 +1494,6 @@ class ManagerApp:
             lines.append("use: /node_use <id>")
         await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/node_list reply")
 
-    async def cmd_proxy_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        # Back-compat alias. Prefer /node_use.
-        logger.info(f"cmd /proxy_use chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        await self.cmd_node_use(update, context)
-        return
-
     async def cmd_node_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /node_use chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not self._is_allowed(update):
@@ -1523,12 +1511,6 @@ class ManagerApp:
         self._set_selected_proxy(sk, node_id)
         save_sessions(self.sessions)
         await _tg_call(update.message.reply_text(f"ok node={node_id}"), timeout_s=15.0, what="/node_use reply")
-
-    async def cmd_proxy_current(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        # Back-compat alias. Prefer /node_current.
-        logger.info(f"cmd /proxy_current chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
-        await self.cmd_node_current(update, context)
-        return
 
     async def cmd_node_current(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /node_current chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
@@ -1786,9 +1768,9 @@ class ManagerApp:
         lines.append("Codex Manager (TG -> Manager -> Proxy -> Codex app-server)")
         lines.append("")
         lines.append("1) 选择机器（node）")
-        lines.append("- /node_list  查看在线机器（旧命令: /servers, /proxy_list）")
-        lines.append("- /node_use <id>  选择机器（旧命令: /use <id>, /proxy_use）")
-        lines.append("- /node_current  查看当前选择（旧命令: /proxy_current）")
+        lines.append("- /node_list  查看在线机器")
+        lines.append("- /node_use <id>  选择机器")
+        lines.append("- /node_current  查看当前选择")
         lines.append("- /status  查看当前会话状态汇总")
         lines.append("- /model  查看当前会话模型（以及 proxy 默认模型），并列出可点按钮切换")
         lines.append("- /model <model_id>  切换当前会话模型（会在每次 turn/start 里下发，按 app-server 语义写回 thread 默认）")
@@ -2434,15 +2416,9 @@ def main() -> int:
                     tg.add_handler(CommandHandler("approve", app.cmd_approve))
                     tg.add_handler(CommandHandler("approve_session", app.cmd_approve_session))
                     tg.add_handler(CommandHandler("decline", app.cmd_decline))
-                    # Back-compat aliases.
-                    tg.add_handler(CommandHandler("servers", app.cmd_proxy_list))
-                    tg.add_handler(CommandHandler("use", app.cmd_proxy_use))
                     tg.add_handler(CommandHandler("node_list", app.cmd_node_list))
                     tg.add_handler(CommandHandler("node_use", app.cmd_node_use))
                     tg.add_handler(CommandHandler("node_current", app.cmd_node_current))
-                    tg.add_handler(CommandHandler("proxy_list", app.cmd_proxy_list))
-                    tg.add_handler(CommandHandler("proxy_use", app.cmd_proxy_use))
-                    tg.add_handler(CommandHandler("proxy_current", app.cmd_proxy_current))
                     tg.add_handler(CommandHandler("status", app.cmd_status))
                     tg.add_handler(CommandHandler("model", app.cmd_model))
                     tg.add_handler(CallbackQueryHandler(app.on_model_callback, pattern=r"^model:"))
