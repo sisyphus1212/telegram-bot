@@ -643,8 +643,11 @@ def main() -> int:
         help="path to node_config.json (back-compat: proxy_config.json)",
     )
     ap.add_argument("--manager-ws", default="", help="override manager WS (ws://host:port)")
-    ap.add_argument("--proxy-id", default="", help="override proxy id")
-    ap.add_argument("--token", default="", help="override proxy token")
+    # Prefer "node" naming, but keep proxy-* flags for back-compat.
+    ap.add_argument("--node-id", default="", help="override node id (same as --proxy-id)")
+    ap.add_argument("--node-token", default="", help="override node token (same as --token)")
+    ap.add_argument("--proxy-id", default="", help="override proxy id (deprecated; use --node-id)")
+    ap.add_argument("--token", default="", help="override proxy token (deprecated; use --node-token)")
     ap.add_argument("--codex-bin", default="", help="override codex bin")
     ap.add_argument("--cwd", default="", help="override codex cwd")
     ap.add_argument("--sandbox", default="", help="override codex sandbox (e.g. workspace-write / danger-full-access)")
@@ -680,8 +683,22 @@ def main() -> int:
         env["no_proxy"] = np
 
     manager_ws = args.manager_ws or os.environ.get("CODEX_MANAGER_WS") or _cfg_get_str(cfg, "manager_ws") or "ws://127.0.0.1:8765"
-    proxy_id = args.proxy_id or os.environ.get("PROXY_ID") or os.environ.get("NODE_ID") or _cfg_get_str(cfg, "node_id") or _cfg_get_str(cfg, "proxy_id")
-    token = args.token or os.environ.get("PROXY_TOKEN") or os.environ.get("NODE_TOKEN") or _cfg_get_str(cfg, "node_token") or _cfg_get_str(cfg, "proxy_token")
+    proxy_id = (
+        args.node_id
+        or args.proxy_id
+        or os.environ.get("NODE_ID")
+        or os.environ.get("PROXY_ID")
+        or _cfg_get_str(cfg, "node_id")
+        or _cfg_get_str(cfg, "proxy_id")
+    )
+    token = (
+        args.node_token
+        or args.token
+        or os.environ.get("NODE_TOKEN")
+        or os.environ.get("PROXY_TOKEN")
+        or _cfg_get_str(cfg, "node_token")
+        or _cfg_get_str(cfg, "proxy_token")
+    )
     codex_bin = args.codex_bin or os.environ.get("CODEX_BIN") or _cfg_get_str(cfg, "codex_bin") or "codex"
     cwd = args.cwd or os.environ.get("CODEX_CWD") or _cfg_get_str(cfg, "codex_cwd") or str(BASE_DIR)
     max_pending = int(os.environ.get("PROXY_MAX_PENDING") or str(cfg.get("max_pending") or 10))
@@ -689,7 +706,7 @@ def main() -> int:
     approval_policy = args.approval_policy or os.environ.get("CODEX_APPROVAL_POLICY") or _cfg_get_str(cfg, "approval_policy") or "unlessTrusted"
 
     if not proxy_id:
-        raise SystemExit("missing NODE_ID/PROXY_ID / --proxy-id")
+        raise SystemExit("missing NODE_ID/PROXY_ID / --node-id/--proxy-id")
     # Dev mode: allow empty PROXY_TOKEN if manager doesn't enforce an allowlist.
 
     if env:

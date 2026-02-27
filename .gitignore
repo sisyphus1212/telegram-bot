@@ -27,3 +27,5 @@ opencode_config.json
 
 # Local proxy config (contains machine-specific endpoints/tokens)
 proxy_config.json
+# New name (prefer)
+node_config.json
