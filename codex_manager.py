@@ -2850,15 +2850,15 @@ def main() -> int:
                     if tg is not None:
                         try:
                             if tg.updater is not None:
-                                await tg.updater.stop()
+                                await asyncio.wait_for(tg.updater.stop(), timeout=5.0)
                         except Exception:
                             pass
                         try:
-                            await tg.stop()
+                            await asyncio.wait_for(tg.stop(), timeout=5.0)
                         except Exception:
                             pass
                         try:
-                            await tg.shutdown()
+                            await asyncio.wait_for(tg.shutdown(), timeout=5.0)
                         except Exception:
                             pass
 
