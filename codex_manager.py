@@ -2722,7 +2722,8 @@ def main() -> int:
                     # - getUpdates long-polling
                     req_api = HTTPXRequest(
                         connection_pool_size=64,
-                        connect_timeout=60.0,
+                        # connect timeout should be short; retries handle transient proxy issues.
+                        connect_timeout=10.0,
                         read_timeout=120.0,
                         write_timeout=60.0,
                         pool_timeout=180.0,
@@ -2731,7 +2732,7 @@ def main() -> int:
                     )
                     req_updates = HTTPXRequest(
                         connection_pool_size=32,
-                        connect_timeout=60.0,
+                        connect_timeout=10.0,
                         # getUpdates is long-polling. read_timeout must be > polling timeout.
                         read_timeout=180.0,
                         write_timeout=60.0,
