@@ -1,0 +1,20 @@
+[Unit]
+Description=Agent Node Instance (%i) (WS client -> local codex app-server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/telegram-bot
+# Each instance reads its own config file:
+#   /root/telegram-bot/node_config.<instance>.json
+ExecStart=/root/telegram-bot/.venv/bin/python /root/telegram-bot/codex_proxy.py --config /root/telegram-bot/node_config.%i.json
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+
