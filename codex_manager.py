@@ -59,7 +59,7 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-async def _tg_call(coro, *, timeout_s: float, what: str, retries: int = 3) -> Any:
+async def _tg_call(make_coro, *, timeout_s: float, what: str, retries: int = 3) -> Any:
     """
     Telegram 网络在部分环境下不稳定（尤其是走本地代理时），这里做轻量重试避免“没反应”。
 
@@ -69,7 +69,8 @@ async def _tg_call(coro, *, timeout_s: float, what: str, retries: int = 3) -> An
     while True:
         attempt += 1
         try:
-            return await asyncio.wait_for(coro, timeout=timeout_s)
+            # Must create a new coroutine per attempt; coroutines can't be awaited twice.
+            return await asyncio.wait_for(make_coro(), timeout=timeout_s)
         except RetryAfter as e:
             # Telegram 限流：按建议等待后重试。
             wait_s = max(0.5, float(getattr(e, "retry_after", 1.0)))
@@ -365,7 +366,7 @@ class TelegramOutbox:
                 try:
                     if action.type == "edit":
                         await _tg_call(
-                            self.bot.edit_message_text(chat_id=action.chat_id, message_id=action.message_id, text=action.text),
+                            lambda: self.bot.edit_message_text(chat_id=action.chat_id, message_id=action.message_id, text=action.text),
                             timeout_s=action.timeout_s,
                             what="tg edit",
                         )
@@ -374,7 +375,7 @@ class TelegramOutbox:
                             f"trace_id={action.trace_id} proxy_id={action.proxy_id} task_id={action.task_id} kind={action.kind}"
                         )
                     elif action.type == "send":
-                        await _tg_call(self.bot.send_message(chat_id=action.chat_id, text=action.text), timeout_s=action.timeout_s, what="tg send")
+                        await _tg_call(lambda: self.bot.send_message(chat_id=action.chat_id, text=action.text), timeout_s=action.timeout_s, what="tg send")
                         logger.info(
                             f"op=tg.send ok=true chat_id={action.chat_id} trace_id={action.trace_id} "
                             f"proxy_id={action.proxy_id} task_id={action.task_id} kind={action.kind}"
@@ -1544,7 +1545,7 @@ class ManagerApp:
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/node reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/node reply")
             return
         sk = _session_key(update)
         selected = self._get_selected_proxy(sk)
@@ -1552,7 +1553,7 @@ class ManagerApp:
         allowed = self.registry.allowed_proxy_ids()
         text = self._render_node_text(selected=selected, online=online, allowed=allowed)
         kb = self._build_node_keyboard(online=online, selected=selected)
-        await _tg_call(update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/node reply")
+        await _tg_call(lambda: update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/node reply")
 
     async def on_node_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -1586,7 +1587,7 @@ class ManagerApp:
         allowed = self.registry.allowed_proxy_ids()
         text = self._render_node_text(selected=selected, online=online, allowed=allowed)
         kb = self._build_node_keyboard(online=online, selected=selected)
-        await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="node callback edit")
+        await _tg_call(lambda: q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="node callback edit")
         await q.answer(f"current={selected or '(none)'}")
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1594,19 +1595,19 @@ class ManagerApp:
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/status reply")
             return
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="/status reply")
             return
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="/status reply")
             return
         core = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/status reply")
             return
         session_model = self._get_default_model(sk)
         current_thread_id = self._get_current_thread_id(sk, proxy_id)
@@ -1614,7 +1615,7 @@ class ManagerApp:
 
         cfg_rep = await core.appserver_call(proxy_id, "config/read", {}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(cfg_rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {cfg_rep.get('error')}"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {cfg_rep.get('error')}"), timeout_s=15.0, what="/status reply")
             return
         cfg_result = cfg_rep.get("result") if isinstance(cfg_rep.get("result"), dict) else {}
         cfg_obj = cfg_result.get("config") if isinstance(cfg_result.get("config"), dict) else {}
@@ -1708,14 +1709,14 @@ class ManagerApp:
                     lines.append(f"git: branch={branch or '?'} sha={sha[:12] if sha else '?'}")
 
         lines.append(f"loaded_threads: {len(loaded_data)}")
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/status reply")
+        await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/status reply")
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /model chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/model reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/model reply")
             return
         sk = _session_key(update)
         session_model = self._get_default_model(sk)
@@ -1726,39 +1727,39 @@ class ManagerApp:
                 return
             core: ManagerCore | None = context.application.bot_data.get("core")
             if core is None:
-                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/model reply")
+                await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/model reply")
                 return
             try:
                 effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
                 detail = await self._fetch_model_detail(proxy_id=proxy_id, core=core, model_id=effective_model)
             except Exception as e:
-                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {type(e).__name__}: {e}"), timeout_s=15.0, what="/model reply")
+                await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {type(e).__name__}: {e}"), timeout_s=15.0, what="/model reply")
                 return
             text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
             kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
-            await _tg_call(update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/model reply")
+            await _tg_call(lambda: update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/model reply")
             return
         arg = " ".join(context.args).strip()
         if context.args and str(context.args[0]).strip().lower() == "effort":
             if len(context.args) < 2:
-                await _tg_call(update.message.reply_text("usage: /model effort <low|medium|high>"), timeout_s=15.0, what="/model reply")
+                await _tg_call(lambda: update.message.reply_text("usage: /model effort <low|medium|high>"), timeout_s=15.0, what="/model reply")
                 return
             eff = str(context.args[1]).strip().lower()
             if eff not in ("low", "medium", "high"):
-                await _tg_call(update.message.reply_text("usage: /model effort <low|medium|high>"), timeout_s=15.0, what="/model reply")
+                await _tg_call(lambda: update.message.reply_text("usage: /model effort <low|medium|high>"), timeout_s=15.0, what="/model reply")
                 return
             self._set_default_effort(sk, eff)
             save_sessions(self.sessions)
-            await _tg_call(update.message.reply_text(f"ok effort={eff}"), timeout_s=15.0, what="/model reply")
+            await _tg_call(lambda: update.message.reply_text(f"ok effort={eff}"), timeout_s=15.0, what="/model reply")
             return
         if arg.lower() in ("clear", "default", "reset"):
             self._set_default_model(sk, "")
             save_sessions(self.sessions)
-            await _tg_call(update.message.reply_text("ok model=(default)"), timeout_s=15.0, what="/model reply")
+            await _tg_call(lambda: update.message.reply_text("ok model=(default)"), timeout_s=15.0, what="/model reply")
             return
         self._set_default_model(sk, arg)
         save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"ok model={arg}"), timeout_s=15.0, what="/model reply")
+        await _tg_call(lambda: update.message.reply_text(f"ok model={arg}"), timeout_s=15.0, what="/model reply")
 
     async def on_model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -1805,7 +1806,7 @@ class ManagerApp:
             return
         text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
         kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
-        await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="model callback edit")
+        await _tg_call(lambda: q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="model callback edit")
         await q.answer(f"model={session_model or proxy_default_model or '(default)'}")
 
     async def on_effort_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1847,7 +1848,7 @@ class ManagerApp:
             return
         text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
         kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
-        await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="effort callback edit")
+        await _tg_call(lambda: q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="effort callback edit")
         await q.answer(f"effort={session_effort}")
 
     async def cmd_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1856,9 +1857,9 @@ class ManagerApp:
             f"user={update.effective_user.id if update.effective_user else '?'}"
         )
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/ping reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/ping reply")
             return
-        await _tg_call(update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
+        await _tg_call(lambda: update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
 
     async def cmd_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -1869,29 +1870,29 @@ class ManagerApp:
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/result reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/result reply")
             return
         sk = _session_key(update)
         if not context.args:
             mode = self._get_result_mode(sk)
-            await _tg_call(update.message.reply_text(f"result: {mode}"), timeout_s=15.0, what="/result reply")
+            await _tg_call(lambda: update.message.reply_text(f"result: {mode}"), timeout_s=15.0, what="/result reply")
             return
         mode = (context.args[0] or "").strip().lower()
         aliases = {"replace": "replace", "edit": "replace", "send": "send", "separate": "send"}
         mode = aliases.get(mode, "")
         if not mode:
-            await _tg_call(update.message.reply_text("usage: /result <replace|send>"), timeout_s=15.0, what="/result reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /result <replace|send>"), timeout_s=15.0, what="/result reply")
             return
         self._set_result_mode(sk, mode)
         save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"ok result={mode}"), timeout_s=15.0, what="/result reply")
+        await _tg_call(lambda: update.message.reply_text(f"ok result={mode}"), timeout_s=15.0, what="/result reply")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /help chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/help reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/help reply")
             return
 
         lines: list[str] = []
@@ -1942,17 +1943,17 @@ class ManagerApp:
         lines.append("")
         lines.append("提示：thread 内容由 Codex 保存在 proxy 机器的 ~/.codex/；manager 只保存 chat->(proxy, threadId) 路由。")
 
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/help reply")
+        await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/help reply")
 
     async def cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message:
             return
         logger.info(f"cmd /approve chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve reply")
             return
         if not context.args:
-            await _tg_call(update.message.reply_text("usage: /approve <approval_id> | /approve session <approval_id>"), timeout_s=15.0, what="/approve reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /approve <approval_id> | /approve session <approval_id>"), timeout_s=15.0, what="/approve reply")
             return
         decision = "accept"
         approval_id = ""
@@ -1962,24 +1963,24 @@ class ManagerApp:
         else:
             approval_id = str(context.args[0]).strip()
         if not approval_id:
-            await _tg_call(update.message.reply_text("usage: /approve <approval_id> | /approve session <approval_id>"), timeout_s=15.0, what="/approve reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /approve <approval_id> | /approve session <approval_id>"), timeout_s=15.0, what="/approve reply")
             return
         ok, msg = await self.core.approval_decide(approval_id=approval_id, decision=decision, chat_id=update.effective_chat.id)
-        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve reply")
+        await _tg_call(lambda: update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve reply")
 
     async def cmd_decline(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message:
             return
         logger.info(f"cmd /decline chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/decline reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/decline reply")
             return
         approval_id = (context.args[0] if context.args else "").strip()
         if not approval_id:
-            await _tg_call(update.message.reply_text("usage: /decline <approval_id>"), timeout_s=15.0, what="/decline reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /decline <approval_id>"), timeout_s=15.0, what="/decline reply")
             return
         ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="decline", chat_id=update.effective_chat.id)
-        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/decline reply")
+        await _tg_call(lambda: update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/decline reply")
 
     async def cmd_thread(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -1998,7 +1999,7 @@ class ManagerApp:
                 InlineKeyboardButton("/thread current", callback_data="thread:shortcut:current"),
             ]])
             await _tg_call(
-                msg.reply_text(
+                lambda: msg.reply_text(
                     "usage: /thread <current|start|resume|list|read|archive|unarchive> ...\n\n"
                     "快捷按钮：",
                     reply_markup=kb,
@@ -2028,7 +2029,7 @@ class ManagerApp:
             elif sub == "unarchive":
                 await self.cmd_thread_unarchive(update, context)
             else:
-                await _tg_call(update.message.reply_text("usage: /thread <current|start|resume|list|read|archive|unarchive> ..."), timeout_s=15.0, what="/thread reply")
+                await _tg_call(lambda: update.message.reply_text("usage: /thread <current|start|resume|list|read|archive|unarchive> ..."), timeout_s=15.0, what="/thread reply")
         finally:
             context.args = orig_args
 
@@ -2077,7 +2078,7 @@ class ManagerApp:
         if not update.message:
             return
         if not context.args:
-            await _tg_call(update.message.reply_text("usage: /config read ... | /config write keyPath=<...> value=<json> ..."), timeout_s=15.0, what="/config reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /config read ... | /config write keyPath=<...> value=<json> ..."), timeout_s=15.0, what="/config reply")
             return
         sub = str(context.args[0] or "").strip().lower()
         rest = list(context.args[1:])
@@ -2089,7 +2090,7 @@ class ManagerApp:
             elif sub == "write":
                 await self.cmd_config_value_write(update, context)
             else:
-                await _tg_call(update.message.reply_text("usage: /config read ... | /config write keyPath=<...> value=<json> ..."), timeout_s=15.0, what="/config reply")
+                await _tg_call(lambda: update.message.reply_text("usage: /config read ... | /config write keyPath=<...> value=<json> ..."), timeout_s=15.0, what="/config reply")
         finally:
             context.args = orig_args
 
@@ -2103,7 +2104,7 @@ class ManagerApp:
         if not update.message:
             return
         if not context.args:
-            await _tg_call(update.message.reply_text("usage: /skills list [cwds=/a,/b] [forceReload=true|false]"), timeout_s=15.0, what="/skills reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /skills list [cwds=/a,/b] [forceReload=true|false]"), timeout_s=15.0, what="/skills reply")
             return
         sub = str(context.args[0] or "").strip().lower()
         rest = list(context.args[1:])
@@ -2113,7 +2114,7 @@ class ManagerApp:
             if sub == "list":
                 await self.cmd_skills_list(update, context)
             else:
-                await _tg_call(update.message.reply_text("usage: /skills list [cwds=/a,/b] [forceReload=true|false]"), timeout_s=15.0, what="/skills reply")
+                await _tg_call(lambda: update.message.reply_text("usage: /skills list [cwds=/a,/b] [forceReload=true|false]"), timeout_s=15.0, what="/skills reply")
         finally:
             context.args = orig_args
 
@@ -2127,7 +2128,7 @@ class ManagerApp:
         if not update.message:
             return
         if not context.args:
-            await _tg_call(update.message.reply_text("usage: /collaborationmode list"), timeout_s=15.0, what="/collaborationmode reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /collaborationmode list"), timeout_s=15.0, what="/collaborationmode reply")
             return
         sub = str(context.args[0] or "").strip().lower()
         rest = list(context.args[1:])
@@ -2137,7 +2138,7 @@ class ManagerApp:
             if sub == "list":
                 await self.cmd_collaborationmode_list(update, context)
             else:
-                await _tg_call(update.message.reply_text("usage: /collaborationmode list"), timeout_s=15.0, what="/collaborationmode reply")
+                await _tg_call(lambda: update.message.reply_text("usage: /collaborationmode list"), timeout_s=15.0, what="/collaborationmode reply")
         finally:
             context.args = orig_args
 
@@ -2152,10 +2153,10 @@ class ManagerApp:
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(msg.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="require proxy")
+            await _tg_call(lambda: msg.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="require proxy")
             return None
         if not self.registry.is_online(proxy_id):
-            await _tg_call(msg.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="require proxy")
+            await _tg_call(lambda: msg.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="require proxy")
             return None
         return proxy_id
 
@@ -2165,14 +2166,14 @@ class ManagerApp:
         if msg is None:
             return
         if not self._is_allowed(update):
-            await _tg_call(msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_current reply")
+            await _tg_call(lambda: msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_current reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
             return
         sk = _session_key(update)
         tid = self._get_current_thread_id(sk, proxy_id)
-        await _tg_call(msg.reply_text(f"threadId: {tid or '(none)'}"), timeout_s=15.0, what="/thread_current reply")
+        await _tg_call(lambda: msg.reply_text(f"threadId: {tid or '(none)'}"), timeout_s=15.0, what="/thread_current reply")
 
     async def cmd_thread_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_start chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
@@ -2180,7 +2181,7 @@ class ManagerApp:
         if msg is None:
             return
         if not self._is_allowed(update):
-            await _tg_call(msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_start reply")
+            await _tg_call(lambda: msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_start reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2197,28 +2198,28 @@ class ManagerApp:
                 params["model"] = default_model
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(msg.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_start reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_start reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(msg.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_start reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_start reply")
             return
         result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
         thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
         thread_id = str(thread.get("id") or "")
         if not thread_id:
-            await _tg_call(msg.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="/thread_start reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="/thread_start reply")
             return
         self._set_current_thread_id(sk, proxy_id, thread_id)
         save_sessions(self.sessions)
-        await _tg_call(msg.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_start reply")
+        await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_start reply")
 
     async def cmd_thread_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_resume chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_resume reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2226,20 +2227,20 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_resume <id>"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /thread_resume <id>"), timeout_s=15.0, what="/thread_resume reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_resume reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/resume", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_resume reply")
             return
         sk = _session_key(update)
         self._set_current_thread_id(sk, proxy_id, thread_id)
         save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_resume reply")
+        await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_resume reply")
 
     async def cmd_thread_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
@@ -2247,7 +2248,7 @@ class ManagerApp:
         if msg is None:
             return
         if not self._is_allowed(update):
-            await _tg_call(msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_list reply")
+            await _tg_call(lambda: msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_list reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2269,11 +2270,11 @@ class ManagerApp:
                 params[k] = v
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(msg.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_list reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_list reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/list", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(msg.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_list reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_list reply")
             return
         result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
         data = result.get("data") if isinstance(result.get("data"), list) else []
@@ -2288,14 +2289,14 @@ class ManagerApp:
             lines.append(f"{i}. {tid} [{stype}] {preview[:80]}")
         if result.get("nextCursor"):
             lines.append(f"nextCursor: {result.get('nextCursor')}")
-        await _tg_call(msg.reply_text("\n".join(lines)), timeout_s=15.0, what="/thread_list reply")
+        await _tg_call(lambda: msg.reply_text("\n".join(lines)), timeout_s=15.0, what="/thread_list reply")
 
     async def cmd_thread_read(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_read chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_read reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2303,25 +2304,25 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_read <id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /thread_read <id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
             return
         include_turns = str(kv.get("includeTurns") or "false").lower() in ("1", "true", "yes", "y", "on")
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_read reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/read", {"threadId": thread_id, "includeTurns": include_turns}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_read reply")
             return
-        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/thread_read reply")
+        await _tg_call(lambda: update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/thread_read reply")
 
     async def cmd_thread_archive(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_archive chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_archive reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_archive reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2332,24 +2333,24 @@ class ManagerApp:
             sk = _session_key(update)
             thread_id = self._get_current_thread_id(sk, proxy_id)
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_archive threadId=<id> (or set current thread first)"), timeout_s=15.0, what="/thread_archive reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /thread_archive threadId=<id> (or set current thread first)"), timeout_s=15.0, what="/thread_archive reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_archive reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_archive reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/archive", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_archive reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_archive reply")
             return
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok archived threadId={thread_id}"), timeout_s=15.0, what="/thread_archive reply")
+        await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] ok archived threadId={thread_id}"), timeout_s=15.0, what="/thread_archive reply")
 
     async def cmd_thread_unarchive(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_unarchive chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_unarchive reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2357,24 +2358,24 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_unarchive <id>"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /thread_unarchive <id>"), timeout_s=15.0, what="/thread_unarchive reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_unarchive reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/unarchive", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_unarchive reply")
             return
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok unarchived threadId={thread_id}"), timeout_s=15.0, what="/thread_unarchive reply")
+        await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] ok unarchived threadId={thread_id}"), timeout_s=15.0, what="/thread_unarchive reply")
 
     async def cmd_skills_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /skills_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/skills_list reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/skills_list reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2387,20 +2388,20 @@ class ManagerApp:
             params["forceReload"] = str(kv["forceReload"]).lower() in ("1", "true", "yes", "y", "on")
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/skills_list reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/skills_list reply")
             return
         rep = await core.appserver_call(proxy_id, "skills/list", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/skills_list reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/skills_list reply")
             return
-        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/skills_list reply")
+        await _tg_call(lambda: update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/skills_list reply")
 
     async def cmd_config_read(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /config_read chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_read reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_read reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2411,20 +2412,20 @@ class ManagerApp:
             params["includeLayers"] = str(kv["includeLayers"]).lower() in ("1", "true", "yes", "y", "on")
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_read reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_read reply")
             return
         rep = await core.appserver_call(proxy_id, "config/read", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_read reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_read reply")
             return
-        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/config_read reply")
+        await _tg_call(lambda: update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/config_read reply")
 
     async def cmd_config_value_write(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /config_value_write chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_value_write reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2432,45 +2433,45 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         key_path = (kv.get("keyPath") or "").strip()
         if not key_path or "value" not in kv:
-            await _tg_call(update.message.reply_text("usage: /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]"), timeout_s=15.0, what="/config_value_write reply")
             return
         try:
             value_obj = json.loads(kv["value"])
         except Exception as e:
-            await _tg_call(update.message.reply_text(f"bad value json: {type(e).__name__}: {e}"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text(f"bad value json: {type(e).__name__}: {e}"), timeout_s=15.0, what="/config_value_write reply")
             return
         params: JsonDict = {"keyPath": key_path, "value": value_obj}
         if "mergeStrategy" in kv:
             params["mergeStrategy"] = kv["mergeStrategy"]
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_value_write reply")
             return
         rep = await core.appserver_call(proxy_id, "config/value/write", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_value_write reply")
             return
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok"), timeout_s=15.0, what="/config_value_write reply")
+        await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] ok"), timeout_s=15.0, what="/config_value_write reply")
 
     async def cmd_collaborationmode_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /collaborationmode_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/collaborationmode_list reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/collaborationmode_list reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/collaborationmode_list reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/collaborationmode_list reply")
             return
         rep = await core.appserver_call(proxy_id, "collaborationMode/list", {}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/collaborationmode_list reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/collaborationmode_list reply")
             return
-        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/collaborationmode_list reply")
+        await _tg_call(lambda: update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/collaborationmode_list reply")
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         trace_id = uuid.uuid4().hex
@@ -2479,7 +2480,7 @@ class ManagerApp:
         text_len = len(update.message.text) if update.message and update.message.text else 0
         logger.info(f"op=tg.update trace_id={trace_id} chat_id={chat_id} user_id={user_id} text_len={text_len}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="msg reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="msg reply")
             return
         if not update.message or not isinstance(update.message.text, str):
             return
@@ -2487,17 +2488,17 @@ class ManagerApp:
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="msg reply")
+            await _tg_call(lambda: update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="msg reply")
             return
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="msg reply")
+            await _tg_call(lambda: update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="msg reply")
             return
 
         task_id = uuid.uuid4().hex
         thread_id = self._get_current_thread_id(sk, proxy_id)
         core = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="msg reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="msg reply")
             return
         if not thread_id:
             # Auto-create a thread on first message for this (chat, proxy).
@@ -2507,20 +2508,20 @@ class ManagerApp:
                 params["model"] = default_model
             rep = await core.appserver_call(proxy_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
             if not bool(rep.get("ok")):
-                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start failed: {rep.get('error')}"), timeout_s=15.0, what="msg reply")
+                await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: thread/start failed: {rep.get('error')}"), timeout_s=15.0, what="msg reply")
                 return
             result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
             thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
             thread_id = str(thread.get("id") or "")
             if not thread_id:
-                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="msg reply")
+                await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="msg reply")
                 return
             self._set_current_thread_id(sk, proxy_id, thread_id)
             save_sessions(self.sessions)
 
         prompt = update.message.text
         placeholder = await _tg_call(
-            update.message.reply_text(f"working (node={proxy_id}, threadId={thread_id[-8:]}) ..."),
+            lambda: update.message.reply_text(f"working (node={proxy_id}, threadId={thread_id[-8:]}) ..."),
             timeout_s=15.0,
             what="placeholder",
         )
@@ -2719,7 +2720,11 @@ def main() -> int:
                     tg.add_handler(CommandHandler("config", app.cmd_config))
                     tg.add_handler(CommandHandler("collaborationmode", app.cmd_collaborationmode))
                     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app.on_text))
-                    tg.add_error_handler(lambda _u, c: logger.warning(f"telegram handler error: {c.error!r}"), block=False)
+                    async def _on_tg_error(_update: object, context: object) -> None:
+                        err = getattr(context, "error", None)
+                        logger.warning(f"telegram handler error: {err!r}")
+
+                    tg.add_error_handler(_on_tg_error, block=False)
 
                     await tg.initialize()
                     # Ensure we're in polling mode. If a webhook is set, getUpdates won't deliver anything.
@@ -2784,7 +2789,7 @@ def main() -> int:
                         msg_text = "\n".join(text_lines)
                         for chat_id in startup_notify_chat_ids:
                             try:
-                                await _tg_call(tg.bot.send_message(chat_id=chat_id, text=msg_text), timeout_s=15.0, what="startup_notify")
+                                await _tg_call(lambda: tg.bot.send_message(chat_id=chat_id, text=msg_text), timeout_s=15.0, what="startup_notify")
                                 logger.info(f"op=startup_notify ok=true chat_id={chat_id}")
                             except Exception as e:
                                 logger.warning(f"op=startup_notify ok=false chat_id={chat_id} error={type(e).__name__}: {e}")
