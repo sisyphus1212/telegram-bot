@@ -656,7 +656,7 @@ class ManagerCore:
         return summary
 
     def _render_progress_text(self, ctx: TaskContext) -> str:
-        head = f"working (proxy={ctx.proxy_id}, threadId={ctx.thread_id[-8:]}) ..."
+        head = f"working (node={ctx.proxy_id}, threadId={ctx.thread_id[-8:]}) ..."
         lines: list[str] = [head]
         if ctx.progress_lines:
             lines.append("")
@@ -669,7 +669,7 @@ class ManagerCore:
     def _render_progress_done_text(self, ctx: TaskContext, *, ok: bool) -> str:
         lines = [self._render_progress_text(ctx), ""]
         status = "working done" if ok else "working failed"
-        lines.append(f"{status} (proxy={ctx.proxy_id}, threadId={ctx.thread_id[-8:]})")
+        lines.append(f"{status} (node={ctx.proxy_id}, threadId={ctx.thread_id[-8:]})")
         return "\n".join(lines)
 
     async def _handle_task_progress(self, *, proxy_id: str, msg: JsonDict) -> None:
@@ -2249,7 +2249,7 @@ class ManagerApp:
 
         prompt = update.message.text
         placeholder = await _tg_call(
-            update.message.reply_text(f"working (proxy={proxy_id}, threadId={thread_id[-8:]}) ..."),
+            update.message.reply_text(f"working (node={proxy_id}, threadId={thread_id[-8:]}) ..."),
             timeout_s=15.0,
             what="placeholder",
         )
@@ -2483,7 +2483,7 @@ def main() -> int:
                         text_lines.append(f"ws_listen: {args.ws_listen}")
                         if args.control_listen:
                             text_lines.append(f"control_listen: {args.control_listen}")
-                        text_lines.append(f"proxies_online: {', '.join(online) if online else '(none)'}")
+                        text_lines.append(f"nodes_online: {', '.join(online) if online else '(none)'}")
                         text_lines.append("tips: /help, /node_list, /node_use <id>, /status, /model")
                         msg_text = "\n".join(text_lines)
                         for chat_id in startup_notify_chat_ids:

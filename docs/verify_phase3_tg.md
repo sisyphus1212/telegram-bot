@@ -32,7 +32,7 @@ journalctl -u codex-manager.service -n 200 --no-pager | rg 'Telegram polling sta
 5. 发送文本：`请先说明计划，再执行 uname -a 和 ip -4 addr show，并返回摘要`
 
 验收：
-- 先出现占位消息：`working (proxy=..., threadId=...) ...`
+- 先出现占位消息：`working (node=..., threadId=...) ...`
 - 如果任务持续时间较长，占位消息中间会被编辑成增量进度日志，新的步骤会追加到同一条 placeholder 中；重复噪音会被过滤，超长时会折叠中间步骤
 - `replace` 模式下：随后占位消息被编辑为 `[{proxy_id}] ...`
 - `send` 模式下：占位消息变成 `working done/failed ...`，结果作为新消息单独发送
