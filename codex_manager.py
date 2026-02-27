@@ -2692,9 +2692,15 @@ def main() -> int:
                     # - 若未显式配置，则继承系统 HTTP(S)_PROXY（trust_env=true）
                     proxy = (os.environ.get("TELEGRAM_PROXY") or str(cfg.get("telegram_proxy") or cfg.get("telegram_http_proxy") or "")).strip() or None
                     trust_env = proxy is None
-                    req = HTTPXRequest(
-                        # Ensure the long-polling request doesn't block other API calls (send/edit/delete webhook).
-                        connection_pool_size=16,
+                    # PTB long-polling (getUpdates) can occupy connections for a long time.
+                    # If we share the same httpx pool for both getUpdates and send/edit calls,
+                    # we can hit:
+                    #   "Pool timeout: All connections in the connection pool are occupied."
+                    # Fix: use dedicated request clients for:
+                    # - API calls (send/edit/delete webhook)
+                    # - getUpdates long-polling
+                    req_api = HTTPXRequest(
+                        connection_pool_size=32,
                         connect_timeout=20.0,
                         read_timeout=60.0,
                         write_timeout=60.0,
@@ -2702,7 +2708,22 @@ def main() -> int:
                         proxy=proxy,
                         httpx_kwargs={"trust_env": trust_env},
                     )
-                    tg = Application.builder().token(bot_token).request(req).build()
+                    req_updates = HTTPXRequest(
+                        connection_pool_size=4,
+                        connect_timeout=20.0,
+                        read_timeout=90.0,
+                        write_timeout=60.0,
+                        pool_timeout=90.0,
+                        proxy=proxy,
+                        httpx_kwargs={"trust_env": trust_env},
+                    )
+                    tg = (
+                        Application.builder()
+                        .token(bot_token)
+                        .request(req_api)
+                        .get_updates_request(req_updates)
+                        .build()
+                    )
                     tg.bot_data["core"] = core
                     tg.add_handler(CommandHandler("help", app.cmd_help))
                     tg.add_handler(CommandHandler("start", app.cmd_start))
