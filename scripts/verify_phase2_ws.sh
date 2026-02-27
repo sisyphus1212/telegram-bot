@@ -7,6 +7,8 @@ CONTROL_HOSTPORT="${CODEX_MANAGER_CONTROL:-127.0.0.1:18766}"
 CONTROL_TOKEN="${CODEX_MANAGER_CONTROL_TOKEN:-}"
 PROXY_ID="${1:-}"
 PROMPT="${PROMPT:-ping}"
+MODEL="${MODEL:-${CODEX_TEST_MODEL:-}}"
+EFFORT="${EFFORT:-${CODEX_TEST_EFFORT:-}}"
 REPEAT="${REPEAT:-10}"
 TIMEOUT="${TIMEOUT:-60}"
 
@@ -18,6 +20,8 @@ Usage:
 Optional env:
   CODEX_MANAGER_CONTROL=127.0.0.1:18766
   PROMPT=ping
+  MODEL=gpt-5.3-codex
+  EFFORT=medium
   REPEAT=10
   TIMEOUT=60
 EOF
@@ -42,6 +46,8 @@ export CONTROL_HOSTPORT
 export CONTROL_TOKEN
 export PROXY_ID
 export PROMPT
+export MODEL
+export EFFORT
 export REPEAT
 export TIMEOUT
 
@@ -64,6 +70,8 @@ hostport=os.environ.get("CONTROL_HOSTPORT")
 token=os.environ.get("CONTROL_TOKEN")
 proxy_id=os.environ.get("PROXY_ID")
 prompt=os.environ.get("PROMPT","ping")
+model=os.environ.get("MODEL","").strip()
+effort=os.environ.get("EFFORT","").strip()
 repeat=int(os.environ.get("REPEAT","10"))
 timeout=float(os.environ.get("TIMEOUT","60"))
 
@@ -106,7 +114,12 @@ ok=0
 lat=[]
 for i in range(1, repeat+1):
   t0=time.time()
-  r = rpc({"type":"dispatch","token":token,"proxy_id":proxy_id,"prompt":prompt,"timeout":timeout})
+  payload={"type":"dispatch","token":token,"proxy_id":proxy_id,"prompt":prompt,"timeout":timeout}
+  if model:
+    payload["model"]=model
+  if effort:
+    payload["effort"]=effort
+  r = rpc(payload)
   dt=(time.time()-t0)*1000.0
   lat.append(dt)
   if r.get("ok") and isinstance(r.get("result"), dict) and r["result"].get("ok"):

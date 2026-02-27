@@ -425,7 +425,7 @@ class ManagerCore:
             self._tasks_inflight[ctx.task_id] = ctx
             self._gc_recent_locked()
 
-    async def dispatch_once(self, proxy_id: str, prompt: str, *, timeout_s: float) -> JsonDict:
+    async def dispatch_once(self, proxy_id: str, prompt: str, *, timeout_s: float, model: str = "", effort: str = "") -> JsonDict:
         rep = await self.appserver_call(
             proxy_id,
             "thread/start",
@@ -440,9 +440,9 @@ class ManagerCore:
         thread_id = str(thread.get("id") or "")
         if not thread_id:
             raise RuntimeError(f"thread/start missing id: {result!r}")
-        return await self.dispatch_task(proxy_id, thread_id, prompt, thread_key="probe:local", timeout_s=timeout_s)
+        return await self.dispatch_task(proxy_id, thread_id, prompt, thread_key="probe:local", timeout_s=timeout_s, model=model, effort=effort)
 
-    async def dispatch_task(self, proxy_id: str, thread_id: str, prompt: str, *, thread_key: str, timeout_s: float) -> JsonDict:
+    async def dispatch_task(self, proxy_id: str, thread_id: str, prompt: str, *, thread_key: str, timeout_s: float, model: str = "", effort: str = "") -> JsonDict:
         task_id = uuid.uuid4().hex
         trace_id = uuid.uuid4().hex
         fut: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
@@ -456,6 +456,10 @@ class ManagerCore:
             "thread_id": thread_id,
             "prompt": prompt,
         }
+        if model:
+            msg["model"] = model
+        if effort:
+            msg["effort"] = effort
         t0 = time.time()
         logger.info(f"op=dispatch.enqueue proxy_id={proxy_id} trace_id={trace_id} task_id={task_id} thread_id={thread_id[-8:]} prompt_len={len(prompt)}")
         await self.registry.send_json(proxy_id, msg)
@@ -1071,12 +1075,14 @@ async def run_control_server(listen: str, token: str, registry: ProxyRegistry, c
                     proxy_id = str(req.get("proxy_id") or "").strip()
                     prompt = str(req.get("prompt") or "ping")
                     timeout_s = float(req.get("timeout") or 60.0)
+                    model = str(req.get("model") or "").strip()
+                    effort = str(req.get("effort") or "").strip()
                     if not proxy_id:
                         writer.write((json.dumps({"ok": False, "type": "dispatch", "error": "missing proxy_id"}) + "\n").encode("utf-8"))
                         await writer.drain()
                         continue
                     try:
-                        res = await core.dispatch_once(proxy_id, prompt, timeout_s=timeout_s)
+                        res = await core.dispatch_once(proxy_id, prompt, timeout_s=timeout_s, model=model, effort=effort)
                         resp = {"ok": True, "type": "dispatch", "result": res}
                         writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()
