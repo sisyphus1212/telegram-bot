@@ -32,8 +32,13 @@
 
     node_id: "cloud_huang"
 
-    # v2ray HTTP proxy (for Codex + Telegram). This playbook will try to ensure an inbound exists.
-    v2ray_http_port: 8080
+    # v2ray HTTP proxy (for Codex + Telegram).
+    #
+    # 注意：在一些机器上（比如已有 docker-proxy 占用 8080），无法再让 v2ray 绑定 0.0.0.0:8080。
+    # 因此这里采用“首选端口 + 冲突自动回退端口”的策略。
+    v2ray_http_port_preferred: 8080
+    v2ray_http_port_fallback: 18080
+    v2ray_http_port: 8080  # 运行时会被 set_fact 覆盖为最终端口
     http_proxy_url: "http://127.0.0.1:{{ v2ray_http_port }}"
     no_proxy: "localhost,127.0.0.1,::1"
 
@@ -69,6 +74,24 @@
         exit 1
       register: v2ray_cfg
       changed_when: false
+
+    - name: Choose v2ray HTTP inbound port (avoid bind conflict on 0.0.0.0)
+      ansible.builtin.shell: |
+        set -e
+        P="{{ v2ray_http_port_preferred }}"
+        # If ANY listener already uses this port, binding 0.0.0.0:<P> will fail.
+        if ss -H -ltn "sport = :$P" | grep -q .; then
+          echo "{{ v2ray_http_port_fallback }}"
+        else
+          echo "$P"
+        fi
+      register: v2ray_port_pick
+      changed_when: false
+
+    - name: Set v2ray_http_port fact
+      ansible.builtin.set_fact:
+        v2ray_http_port: "{{ (v2ray_port_pick.stdout | trim) | int }}"
+        http_proxy_url: "http://127.0.0.1:{{ (v2ray_port_pick.stdout | trim) }}"
 
     - name: Backup v2ray config
       ansible.builtin.copy:
@@ -114,8 +137,8 @@
 
     - name: Smoke test proxy can reach chatgpt.com
       ansible.builtin.shell: |
-        set -e
-        curl -I -m 12 -x "{{ http_proxy_url }}" https://chatgpt.com/ | head -n 3
+        set -euo pipefail
+        curl -sS -I -m 12 -x "{{ http_proxy_url }}" https://chatgpt.com/ | head -n 1 | grep -E '^HTTP/'
       register: proxy_smoke
       changed_when: false
 
