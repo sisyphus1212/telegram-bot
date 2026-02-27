@@ -1,16 +1,18 @@
 {
   // ===========================
-  // Codex Node 配置模板（JSONC）
+  // Agent Node 配置模板（JSONC）
   // 说明：
-  // - 本文件支持 // 与 /* */ 注释（codex_proxy.py 会自动剥离注释后再解析 JSON）。
-  // - “通过注释开关”：把你不想用的那行注释掉即可。
+  // - 本文件支持 // 与 /* */ 注释（agent node 会自动剥离注释后再解析 JSON）。
+  // - 兼容：旧文件名 proxy_config.json 仍可用；旧字段 proxy_id/proxy_token 仍可用。
   // ===========================
   //
   "manager_ws": "ws://MANAGER_IP:8765",
-  // 注意：虽然字段名仍为 proxy_id/proxy_token（兼容旧协议），
-  // 但在对外概念上我们更推荐称其为 node_id/node_token。
-  "proxy_id": "home_hw",
-  "proxy_token": "",
+  // 新推荐字段（对外概念）
+  "node_id": "home_hw",
+  "node_token": "",
+  // 兼容字段（保留即可，不必同时设置）
+  // "proxy_id": "home_hw",
+  // "proxy_token": "",
   "max_pending": 10,
   // sandbox：控制文件系统/命令能力
   // 常用：workspaceWrite（允许在工作区写）
@@ -19,11 +21,12 @@
   // "sandbox": "dangerFullAccess",
   //
   // approval_policy：控制是否触发“审批”
-  // onRequest：需要审批（但我们当前客户端默认会自动 decline，所以很多命令会失败）
+  // onRequest：需要审批（会把审批转发到 Telegram）
   // "approval_policy": "onRequest",
   //
-  // never：不走审批（高危，但能避免“权限确认导致失败”）
+  // unlessTrusted：默认（仅在不受信时要求审批）
   "approval_policy": "unlessTrusted",
+  // never：不走审批（高危）
   // "approval_policy": "never",
   "codex_cwd": "/root/telegram-bot",
   "codex_bin": "codex",
@@ -31,3 +34,4 @@
   "https_proxy": "http://127.0.0.1:8080",
   "no_proxy": "localhost,127.0.0.1,::1"
 }
+

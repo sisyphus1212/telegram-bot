@@ -637,7 +637,11 @@ class CodexProxyAgent:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.environ.get("CODEX_PROXY_CONFIG") or "", help="path to proxy_config.json")
+    ap.add_argument(
+        "--config",
+        default=os.environ.get("CODEX_NODE_CONFIG") or os.environ.get("CODEX_PROXY_CONFIG") or "",
+        help="path to node_config.json (back-compat: proxy_config.json)",
+    )
     ap.add_argument("--manager-ws", default="", help="override manager WS (ws://host:port)")
     ap.add_argument("--proxy-id", default="", help="override proxy id")
     ap.add_argument("--token", default="", help="override proxy token")
@@ -647,7 +651,15 @@ def main() -> int:
     ap.add_argument("--approval-policy", default="", help="override approval policy (e.g. on-request / never)")
     args = ap.parse_args()
 
-    cfg_path = Path(args.config) if args.config else (BASE_DIR / "proxy_config.json" if (BASE_DIR / "proxy_config.json").exists() else None)
+    cfg_path = None
+    if args.config:
+        cfg_path = Path(args.config)
+    else:
+        # Prefer the new name, but keep the old one working.
+        if (BASE_DIR / "node_config.json").exists():
+            cfg_path = BASE_DIR / "node_config.json"
+        elif (BASE_DIR / "proxy_config.json").exists():
+            cfg_path = BASE_DIR / "proxy_config.json"
     cfg = _load_json(cfg_path) if cfg_path else {}
 
     # Optional network proxy config for codex connectivity on some hosts.
@@ -668,8 +680,8 @@ def main() -> int:
         env["no_proxy"] = np
 
     manager_ws = args.manager_ws or os.environ.get("CODEX_MANAGER_WS") or _cfg_get_str(cfg, "manager_ws") or "ws://127.0.0.1:8765"
-    proxy_id = args.proxy_id or os.environ.get("PROXY_ID") or _cfg_get_str(cfg, "proxy_id")
-    token = args.token or os.environ.get("PROXY_TOKEN") or _cfg_get_str(cfg, "proxy_token")
+    proxy_id = args.proxy_id or os.environ.get("PROXY_ID") or os.environ.get("NODE_ID") or _cfg_get_str(cfg, "node_id") or _cfg_get_str(cfg, "proxy_id")
+    token = args.token or os.environ.get("PROXY_TOKEN") or os.environ.get("NODE_TOKEN") or _cfg_get_str(cfg, "node_token") or _cfg_get_str(cfg, "proxy_token")
     codex_bin = args.codex_bin or os.environ.get("CODEX_BIN") or _cfg_get_str(cfg, "codex_bin") or "codex"
     cwd = args.cwd or os.environ.get("CODEX_CWD") or _cfg_get_str(cfg, "codex_cwd") or str(BASE_DIR)
     max_pending = int(os.environ.get("PROXY_MAX_PENDING") or str(cfg.get("max_pending") or 10))
@@ -677,7 +689,7 @@ def main() -> int:
     approval_policy = args.approval_policy or os.environ.get("CODEX_APPROVAL_POLICY") or _cfg_get_str(cfg, "approval_policy") or "unlessTrusted"
 
     if not proxy_id:
-        raise SystemExit("missing PROXY_ID / --proxy-id")
+        raise SystemExit("missing NODE_ID/PROXY_ID / --proxy-id")
     # Dev mode: allow empty PROXY_TOKEN if manager doesn't enforce an allowlist.
 
     if env:

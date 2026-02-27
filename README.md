@@ -137,18 +137,18 @@ Proxy 运行在被控机器上，至少需要：
 
 再启动 proxy（在每台需要执行 Codex 的机器上）：
 
-推荐用 `proxy_config.json` 来配置，避免记环境变量。
+推荐用 `node_config.json` 来配置（兼容旧名 `proxy_config.json`），避免记环境变量。
 
 ```bash
 . .venv/bin/activate
-cp proxy_config.example.json proxy_config.json
-editor proxy_config.json
-python codex_proxy.py --config proxy_config.json
+cp node_config.example.json node_config.json
+editor node_config.json
+python codex_proxy.py --config node_config.json
 ```
 
 说明：
 
-- 如果当前目录存在 `proxy_config.json`，`codex_proxy.py` 即使不带 `--config` 也会自动读取它。
+- 如果当前目录存在 `node_config.json`，`codex_proxy.py` 即使不带 `--config` 也会自动读取它（兼容：若不存在则读取 `proxy_config.json`）。
 - 优先级：命令行参数 > 环境变量 > JSON 配置 > 默认值。
 
 `proxy_config.example.json` 是一个 JSONC 模板（支持注释），里面已经写好了 `sandbox` / `approval_policy` 的“注释开关”示例：
@@ -240,7 +240,7 @@ Proxy:
 
 ```bash
 sudo cp systemd/codex-proxy.service /etc/systemd/system/codex-proxy.service
-# Proxy 统一从 WorkingDirectory（默认 /root/telegram-bot）下的 proxy_config.json 读取配置。
+# Node 统一从 WorkingDirectory（默认 /root/telegram-bot）下的 node_config.json 读取配置（兼容 proxy_config.json）。
 # 不再使用 /etc/codex-proxy.env。
 
 sudo systemctl daemon-reload
