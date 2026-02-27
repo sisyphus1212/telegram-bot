@@ -622,7 +622,12 @@ class ManagerCore:
                     return None
                 ctx.progress_last_message_at = now
                 return "正在生成回复"
-            return f"message: {summary}"
+            # Do not include assistant message content in progress to avoid duplicating
+            # the final task_result text (especially in result_mode=send). Newer proxies
+            # already summarize agentMessage progress as "回复已生成(len=...)".
+            if summary.startswith("回复已生成"):
+                return summary
+            return None
         if stage == "plan":
             return f"plan: {summary}"
         if stage == "retrying":
