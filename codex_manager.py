@@ -1474,9 +1474,7 @@ class ManagerApp:
     def _render_node_text(self, *, selected: str, online: list[str], allowed: list[str]) -> str:
         lines: list[str] = []
         lines.append(f"current: {selected or '(none)'}")
-        lines.append(f"online: {', '.join(online) if online else '(none)'}")
-        if allowed:
-            lines.append(f"allowed: {', '.join(allowed)}")
+        lines.append(f"online_count: {len(online)}")
         lines.append("")
         lines.append("点击按钮选择 node：")
         return "\n".join(lines)
