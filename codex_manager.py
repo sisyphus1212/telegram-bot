@@ -1471,55 +1471,79 @@ class ManagerApp:
         ])
         return InlineKeyboardMarkup(rows)
 
-    async def cmd_node_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /node_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+    def _render_node_text(self, *, selected: str, online: list[str], allowed: list[str]) -> str:
+        lines: list[str] = []
+        lines.append(f"current: {selected or '(none)'}")
+        lines.append(f"online: {', '.join(online) if online else '(none)'}")
+        if allowed:
+            lines.append(f"allowed: {', '.join(allowed)}")
+        lines.append("")
+        lines.append("点击按钮选择 node：")
+        return "\n".join(lines)
+
+    def _build_node_keyboard(self, *, online: list[str], selected: str) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        row: list[InlineKeyboardButton] = []
+        for nid in online[:20]:
+            label = f"• {nid}" if nid == selected else nid
+            row.append(InlineKeyboardButton(label[:32], callback_data=f"node:set:{nid}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("Refresh", callback_data="node:refresh")])
+        return InlineKeyboardMarkup(rows)
+
+    async def cmd_node(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /node chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        if not update.message:
+            return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/node_list reply")
+            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/node reply")
             return
         sk = _session_key(update)
         selected = self._get_selected_proxy(sk)
         online = self.registry.online_proxy_ids()
         allowed = self.registry.allowed_proxy_ids()
-        lines = []
-        lines.append(f"online: {', '.join(online) if online else '(none)'}")
-        lines.append(f"selected: {selected or '(none)'}")
-        if allowed:
-            lines.append(f"allowed: {', '.join(allowed)}")
-        if online:
-            lines.append("")
-            lines.append("可直接复制切换：")
-            for pid in online:
-                lines.append(f"/node_use {pid}")
+        text = self._render_node_text(selected=selected, online=online, allowed=allowed)
+        kb = self._build_node_keyboard(online=online, selected=selected)
+        await _tg_call(update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/node reply")
+
+    async def on_node_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        if not self._is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        data = str(q.data or "")
+        if not data.startswith("node:"):
+            return
+        sk = _session_key(update)
+        if data == "node:refresh":
+            pass
+        elif data.startswith("node:set:"):
+            node_id = data[len("node:set:") :].strip()
+            if not node_id:
+                await q.answer("bad node id", show_alert=True)
+                return
+            if not self.registry.is_online(node_id):
+                await q.answer(f"node offline: {node_id}", show_alert=True)
+                return
+            self._set_selected_proxy(sk, node_id)
+            save_sessions(self.sessions)
         else:
-            lines.append("use: /node_use <id>")
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/node_list reply")
+            await q.answer()
+            return
 
-    async def cmd_node_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /node_use chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/node_use reply")
-            return
-        sk = _session_key(update)
-        # Keep /node_use strict: only accept a single positional node id.
-        node_id = (context.args[0] if context.args else "").strip()
-        if not node_id:
-            await _tg_call(update.message.reply_text("usage: /node_use <id>"), timeout_s=15.0, what="/node_use reply")
-            return
-        if not self.registry.is_online(node_id):
-            await _tg_call(update.message.reply_text(f"node offline: {node_id}"), timeout_s=15.0, what="/node_use reply")
-            return
-        self._set_selected_proxy(sk, node_id)
-        save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"ok node={node_id}"), timeout_s=15.0, what="/node_use reply")
-
-    async def cmd_node_current(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /node_current chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/node_current reply")
-            return
-        sk = _session_key(update)
-        node_id = self._get_selected_proxy(sk)
-        await _tg_call(update.message.reply_text(f"node: {node_id or '(none)'}"), timeout_s=15.0, what="/node_current reply")
+        selected = self._get_selected_proxy(sk)
+        online = self.registry.online_proxy_ids()
+        allowed = self.registry.allowed_proxy_ids()
+        text = self._render_node_text(selected=selected, online=online, allowed=allowed)
+        kb = self._build_node_keyboard(online=online, selected=selected)
+        await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="node callback edit")
+        await q.answer(f"current={selected or '(none)'}")
 
     async def cmd_result_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /result_mode chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
@@ -1553,10 +1577,10 @@ class ManagerApp:
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /node_list 查看在线机器，然后 /node_use <id> 选择一台机器"), timeout_s=15.0, what="/status reply")
+            await _tg_call(update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="/status reply")
             return
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"node offline: {proxy_id} (use /node_list)"), timeout_s=15.0, what="/status reply")
+            await _tg_call(update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="/status reply")
             return
         core = context.application.bot_data.get("core")
         if core is None:
@@ -1768,9 +1792,7 @@ class ManagerApp:
         lines.append("Codex Manager (TG -> Manager -> Proxy -> Codex app-server)")
         lines.append("")
         lines.append("1) 选择机器（node）")
-        lines.append("- /node_list  查看在线机器")
-        lines.append("- /node_use <id>  选择机器")
-        lines.append("- /node_current  查看当前选择")
+        lines.append("- /node  弹出在线机器按钮，并显示 current")
         lines.append("- /status  查看当前会话状态汇总")
         lines.append("- /model  查看当前会话模型（以及 proxy 默认模型），并列出可点按钮切换")
         lines.append("- /model <model_id>  切换当前会话模型（会在每次 turn/start 里下发，按 app-server 语义写回 thread 默认）")
@@ -1806,7 +1828,7 @@ class ManagerApp:
         lines.append("")
         lines.append("参数格式：key=value（多个参数用空格分隔）。JSON 参数用 value=<json>。")
         lines.append("示例：")
-        lines.append("- /node_use proxy27")
+        lines.append("- /node")
         lines.append("- /model gpt-5-codex")
         lines.append("- /result_mode send")
         lines.append("- /thread_list limit=3 archived=false")
@@ -1868,10 +1890,10 @@ class ManagerApp:
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /node_list 查看在线机器，然后 /node_use <id> 选择一台机器"), timeout_s=15.0, what="require proxy")
+            await _tg_call(update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="require proxy")
             return None
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"node offline: {proxy_id} (use /node_list)"), timeout_s=15.0, what="require proxy")
+            await _tg_call(update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="require proxy")
             return None
         return proxy_id
 
@@ -2198,10 +2220,10 @@ class ManagerApp:
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /node_list 查看在线机器，然后 /node_use <id> 选择一台机器"), timeout_s=15.0, what="msg reply")
+            await _tg_call(update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="msg reply")
             return
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"node offline: {proxy_id} (use /node_list)"), timeout_s=15.0, what="msg reply")
+            await _tg_call(update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="msg reply")
             return
 
         task_id = uuid.uuid4().hex
@@ -2416,9 +2438,8 @@ def main() -> int:
                     tg.add_handler(CommandHandler("approve", app.cmd_approve))
                     tg.add_handler(CommandHandler("approve_session", app.cmd_approve_session))
                     tg.add_handler(CommandHandler("decline", app.cmd_decline))
-                    tg.add_handler(CommandHandler("node_list", app.cmd_node_list))
-                    tg.add_handler(CommandHandler("node_use", app.cmd_node_use))
-                    tg.add_handler(CommandHandler("node_current", app.cmd_node_current))
+                    tg.add_handler(CommandHandler("node", app.cmd_node))
+                    tg.add_handler(CallbackQueryHandler(app.on_node_callback, pattern=r"^node:"))
                     tg.add_handler(CommandHandler("status", app.cmd_status))
                     tg.add_handler(CommandHandler("model", app.cmd_model))
                     tg.add_handler(CallbackQueryHandler(app.on_model_callback, pattern=r"^model:"))
@@ -2460,7 +2481,7 @@ def main() -> int:
                         if args.control_listen:
                             text_lines.append(f"control_listen: {args.control_listen}")
                         text_lines.append(f"nodes_online: {', '.join(online) if online else '(none)'}")
-                        text_lines.append("tips: /help, /node_list, /node_use <id>, /status, /model")
+                        text_lines.append("tips: /help, /node, /status, /model")
                         msg_text = "\n".join(text_lines)
                         for chat_id in startup_notify_chat_ids:
                             try:

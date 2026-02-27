@@ -25,8 +25,8 @@ journalctl -u codex-manager.service -n 200 --no-pager | rg 'Telegram polling sta
 ## 3. TG 端到端验证（依赖 proxy）
 
 在 Telegram 对话里：
-1. `/node_list` 确认目标 node 在线
-2. `/node_use proxy27`
+1. `/node` 打开 node 选择面板
+2. 点击按钮选择目标 node
 3. `/result_mode replace` 或 `/result_mode send`
 4. `/thread_start`（可选：显式新建 thread；不做也行，首次发文本会自动创建）
 5. 发送文本：`请先说明计划，再执行 uname -a 和 ip -4 addr show，并返回摘要`

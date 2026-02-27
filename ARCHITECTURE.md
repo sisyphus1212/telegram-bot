@@ -29,7 +29,7 @@
 ### 一次对话（一个 turn）
 
 1. 用户在 Telegram 发消息
-2. **当前设计：必须 `/node_use <node_id>` 选择机器**
+2. **当前设计：必须先 `/node` 选择机器**
 3. Manager **立即**向该 Node 下发 `task_assign`（不等待执行结果）
 4. Node 收到后：
    - 若 “Codex 回答前未完成任务” 已达到上限（默认 10）：立刻回 `task_result(ok=false, error="proxy queue full")`
