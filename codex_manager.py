@@ -322,6 +322,9 @@ class TgAction:
     proxy_id: str = ""
     task_id: str = ""
     kind: str = ""  # "placeholder" | "result" | "late" | "timeout" | ...
+    # Retry on transient Telegram network failures. None means "use default policy by kind".
+    retries_left: int | None = None
+    backoff_s: float = 2.0
 
 
 class TelegramOutbox:
@@ -339,6 +342,16 @@ class TelegramOutbox:
 
     async def enqueue(self, action: TgAction) -> bool:
         now = time.time()
+        if action.retries_left is None:
+            # Default retry policy:
+            # - progress edits are lossy (don't block the chat queue)
+            # - result/placeholder are important (retry longer under flaky proxy)
+            if action.kind in ("progress",):
+                action.retries_left = 0
+            elif action.kind in ("result", "result_done", "manager_error", "timeout", "approval"):
+                action.retries_left = 12
+            else:
+                action.retries_left = 6
         async with self._lock:
             q = self._queues.get(action.chat_id)
             if q is None:
@@ -401,6 +414,25 @@ class TelegramOutbox:
                             f"op=tg.send ok=true chat_id={action.chat_id} trace_id={action.trace_id} "
                             f"proxy_id={action.proxy_id} task_id={action.task_id} kind={action.kind}"
                         )
+                except (TimedOut, NetworkError, asyncio.TimeoutError) as e:
+                    # Transient: retry with backoff to survive flaky local proxy.
+                    left = int(action.retries_left or 0)
+                    if left > 0:
+                        action.retries_left = left - 1
+                        delay = max(0.5, float(action.backoff_s or 1.0))
+                        action.backoff_s = min(30.0, delay * 1.7)
+                        logger.warning(
+                            f"tg outbox transient failed chat={chat_id}: {type(e).__name__}: {e} "
+                            f"(will retry in {delay:.1f}s, left={action.retries_left})"
+                        )
+                        await asyncio.sleep(delay)
+                        # Retry the same action to preserve per-chat ordering.
+                        try:
+                            q.put_nowait(action)
+                        except asyncio.QueueFull:
+                            logger.warning(f"tg outbox retry dropped chat={chat_id}: queue full")
+                        continue
+                    logger.warning(f"tg outbox send failed chat={chat_id}: {type(e).__name__}: {e}")
                 except Exception as e:
                     logger.warning(f"tg outbox send failed chat={chat_id}: {type(e).__name__}: {e}")
                 finally:
@@ -498,6 +530,12 @@ class ManagerCore:
         self._outbox = outbox
         if self._timeout_task is None:
             self._timeout_task = asyncio.create_task(self._timeout_loop(), name="task_timeout_loop")
+
+    async def tg_send(self, *, chat_id: int, text: str, kind: str, timeout_s: float = 15.0, retries_left: int | None = None) -> bool:
+        outbox = self._outbox
+        if outbox is None:
+            return False
+        return await outbox.enqueue(TgAction(type="send", chat_id=chat_id, text=text, kind=kind, timeout_s=timeout_s, retries_left=retries_left))
 
     async def register_task(self, ctx: TaskContext) -> None:
         async with self._lock:
@@ -1877,8 +1915,16 @@ class ManagerApp:
             f"cmd /ping from chat={update.effective_chat.id if update.effective_chat else '?'} "
             f"user={update.effective_user.id if update.effective_user else '?'}"
         )
+        if not update.effective_chat:
+            return
         if not self._is_allowed(update):
+            core: ManagerCore | None = context.application.bot_data.get("core")
+            if core is not None and await core.tg_send(chat_id=update.effective_chat.id, text="unauthorized", kind="ping", retries_left=12):
+                return
             await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/ping reply")
+            return
+        core2: ManagerCore | None = context.application.bot_data.get("core")
+        if core2 is not None and await core2.tg_send(chat_id=update.effective_chat.id, text="pong", kind="ping", retries_left=12):
             return
         await _tg_call(lambda: update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
 
