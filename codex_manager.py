@@ -2772,16 +2772,26 @@ def main() -> int:
 
                     tg.add_error_handler(_on_tg_error, block=False)
 
-                    await tg.initialize()
+                    logger.info("Telegram init: begin")
+                    await asyncio.wait_for(tg.initialize(), timeout=30.0)
+                    logger.info("Telegram init: ok")
                     # Ensure we're in polling mode. If a webhook is set, getUpdates won't deliver anything.
                     try:
-                        await tg.bot.delete_webhook(drop_pending_updates=False)
+                        logger.info("Telegram delete_webhook: begin")
+                        await asyncio.wait_for(tg.bot.delete_webhook(drop_pending_updates=False), timeout=20.0)
+                        logger.info("Telegram delete_webhook: ok")
                     except Exception as e:
                         logger.warning(f"delete_webhook failed: {type(e).__name__}: {e}")
-                    await tg.start()
+                    logger.info("Telegram start: begin")
+                    await asyncio.wait_for(tg.start(), timeout=30.0)
+                    logger.info("Telegram start: ok")
                     core.set_outbox(TelegramOutbox(tg.bot))
                     assert tg.updater is not None
-                    await tg.updater.start_polling(drop_pending_updates=False, timeout=60, allowed_updates=Update.ALL_TYPES)
+                    logger.info("Telegram polling: begin")
+                    await asyncio.wait_for(
+                        tg.updater.start_polling(drop_pending_updates=False, timeout=60, allowed_updates=Update.ALL_TYPES),
+                        timeout=30.0,
+                    )
                     logger.info("Telegram polling started")
                     if startup_notify_chat_ids:
                         online = registry.online_proxy_ids()
