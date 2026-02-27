@@ -7,7 +7,7 @@
 在 manager 机器上：
 
 ```bash
-journalctl -u codex-manager.service -n 200 --no-pager | rg 'Telegram polling started|Telegram start failed'
+journalctl -u agent-manager.service -n 200 --no-pager | rg 'Telegram polling started|Telegram start failed'
 ```
 
 验收：
@@ -42,7 +42,7 @@ journalctl -u codex-manager.service -n 200 --no-pager | rg 'Telegram polling sta
 在 manager 机器上抓关键日志：
 
 ```bash
-journalctl -u codex-manager.service -n 400 --no-pager | rg 'op=tg.update|op=tg.send|op=tg.edit|op=dispatch.enqueue|op=ws.recv|op=ws.send'
+journalctl -u agent-manager.service -n 400 --no-pager | rg 'op=tg.update|op=tg.send|op=tg.edit|op=dispatch.enqueue|op=ws.recv|op=ws.send'
 ```
 
 你应该能看到同一个 `trace_id` 一路贯穿：

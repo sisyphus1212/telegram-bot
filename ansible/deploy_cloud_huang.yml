@@ -1,0 +1,200 @@
+---
+# 部署目标：一台机器同时跑 manager + node（agent-manager.service + agent-node.service）
+# 约定：
+# - 代码目录固定为 /root/telegram-bot
+# - 使用 systemd 管理服务
+# - v2ray 必须提供本机可用的 HTTP 代理（默认 http://127.0.0.1:8080），并按需监听到 0.0.0.0:8080
+#
+# 用法示例：
+# ansible-playbook -i /root/opencode/.opencode/config/inventory -l 54.168.243.68 ansible/deploy_cloud_huang.yml \
+#   -e telegram_bot_token='...'
+#
+# 可选变量：
+# - repo_ref: 默认 refactor/node-naming
+# - manager_ws_listen: 默认 0.0.0.0:8765
+# - node_id: 默认 cloud_huang
+# - v2ray_http_port: 默认 8080
+
+- name: Deploy Codex manager+node to cloud_huang
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    repo_url: "https://github.com/sisyphus1212/telegram-bot.git"
+    repo_ref: "refactor/node-naming"
+    deploy_dir: "/root/telegram-bot"
+    manager_ws_listen: "0.0.0.0:8765"
+    manager_control_listen: "127.0.0.1:18766"
+    manager_control_token: "devtoken"
+    telegram_allowed_user_ids: "5974809970"
+    telegram_startup_notify_chat_ids: "5974809970"
+
+    node_id: "cloud_huang"
+
+    # v2ray HTTP proxy (for Codex + Telegram). This playbook will try to ensure an inbound exists.
+    v2ray_http_port: 8080
+    http_proxy_url: "http://127.0.0.1:{{ v2ray_http_port }}"
+    no_proxy: "localhost,127.0.0.1,::1"
+
+  tasks:
+    - name: Ensure base packages
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - git
+          - python3
+          - python3-venv
+          - python3-pip
+          - curl
+        state: present
+
+    - name: Check codex binary exists
+      ansible.builtin.shell: |
+        set -e
+        command -v codex
+        codex --version || true
+      register: codex_check
+      changed_when: false
+
+    - name: Locate v2ray config file (common paths)
+      ansible.builtin.shell: |
+        set -e
+        for p in /etc/v2ray/config.json /usr/local/etc/v2ray/config.json /etc/v2ray/config.jsonc /usr/local/etc/v2ray/config.jsonc; do
+          if [ -f "$p" ]; then
+            echo "$p"
+            exit 0
+          fi
+        done
+        exit 1
+      register: v2ray_cfg
+      changed_when: false
+
+    - name: Backup v2ray config
+      ansible.builtin.copy:
+        src: "{{ v2ray_cfg.stdout | trim }}"
+        dest: "{{ v2ray_cfg.stdout | trim }}.bak.{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
+        remote_src: true
+
+    - name: Ensure v2ray has HTTP inbound on 0.0.0.0:{{ v2ray_http_port }}
+      ansible.builtin.copy:
+        src: "files/ensure_v2ray_http_inbound.py"
+        dest: /tmp/ensure_v2ray_http_inbound.py
+        mode: "0755"
+
+    - name: Patch v2ray config (ensure HTTP inbound)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /tmp/ensure_v2ray_http_inbound.py
+          - "{{ v2ray_cfg.stdout | trim }}"
+          - "{{ v2ray_http_port }}"
+      register: v2ray_patch
+      changed_when: "'changed' in v2ray_patch.stdout"
+
+    - name: Restart v2ray
+      ansible.builtin.systemd:
+        name: v2ray
+        state: restarted
+        enabled: true
+
+    - name: Wait v2ray port listening
+      ansible.builtin.shell: |
+        set -e
+        for i in $(seq 1 50); do
+          if ss -ltn | grep -q ":{{ v2ray_http_port }}\\b"; then
+            echo ok
+            exit 0
+          fi
+          sleep 0.2
+        done
+        ss -ltn
+        exit 1
+      changed_when: false
+
+    - name: Smoke test proxy can reach chatgpt.com
+      ansible.builtin.shell: |
+        set -e
+        curl -I -m 12 -x "{{ http_proxy_url }}" https://chatgpt.com/ | head -n 3
+      register: proxy_smoke
+      changed_when: false
+
+    - name: Git checkout repo
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ deploy_dir }}"
+        version: "{{ repo_ref }}"
+        force: true
+
+    - name: Install Python deps (venv)
+      ansible.builtin.shell: |
+        set -e
+        cd "{{ deploy_dir }}"
+        ./scripts/install.sh
+      args:
+        executable: /bin/bash
+
+    - name: Write /etc/agent-manager.env
+      ansible.builtin.copy:
+        dest: /etc/agent-manager.env
+        mode: "0600"
+        content: |
+          TELEGRAM_BOT_TOKEN={{ telegram_bot_token }}
+          TELEGRAM_ALLOWED_USER_IDS={{ telegram_allowed_user_ids }}
+          TELEGRAM_STARTUP_NOTIFY_CHAT_IDS={{ telegram_startup_notify_chat_ids }}
+          CODEX_MANAGER_WS_LISTEN={{ manager_ws_listen }}
+          CODEX_DEFAULT_PROXY={{ node_id }}
+          CODEX_TASK_TIMEOUT=120
+          HTTP_PROXY={{ http_proxy_url }}
+          HTTPS_PROXY={{ http_proxy_url }}
+          NO_PROXY={{ no_proxy }}
+          CODEX_MANAGER_CONTROL_LISTEN={{ manager_control_listen }}
+          CODEX_MANAGER_CONTROL_TOKEN={{ manager_control_token }}
+
+    - name: Write node_config.json (node service reads it from WorkingDirectory)
+      ansible.builtin.copy:
+        dest: "{{ deploy_dir }}/node_config.json"
+        mode: "0600"
+        content: |
+          {
+            "manager_ws": "ws://127.0.0.1:8765",
+            "node_id": "{{ node_id }}",
+            "node_token": "",
+            "max_pending": 10,
+            "sandbox": "dangerFullAccess",
+            "approval_policy": "onRequest",
+            "codex_cwd": "{{ deploy_dir }}",
+            "codex_bin": "codex",
+            "http_proxy": "{{ http_proxy_url }}",
+            "https_proxy": "{{ http_proxy_url }}",
+            "no_proxy": "{{ no_proxy }}"
+          }
+
+    - name: Install systemd units
+      ansible.builtin.copy:
+        src: "{{ deploy_dir }}/systemd/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        remote_src: true
+        mode: "0644"
+      loop:
+        - agent-manager.service
+        - agent-node.service
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and restart services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: true
+      loop:
+        - agent-manager.service
+        - agent-node.service
+
+    - name: Show status
+      ansible.builtin.shell: |
+        set -e
+        systemctl --no-pager --full status agent-manager.service agent-node.service | sed -n '1,120p'
+      changed_when: false

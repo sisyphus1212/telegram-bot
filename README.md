@@ -25,9 +25,9 @@
 - `scripts/install.sh` - 创建 venv 并安装依赖
 - `scripts/run.sh` - 使用 venv 启动 manager
 - `scripts/run_proxy.sh` - 使用 venv 启动 node（旧名 proxy）
-- `systemd/codex-manager.service` - systemd: manager 服务文件
-- `systemd/codex-manager.env.example` - systemd: manager 环境变量示例
-- `systemd/codex-proxy.service` - systemd: node 服务文件（旧名 proxy）
+- `systemd/agent-manager.service` - systemd: manager 服务文件
+- `systemd/agent-manager.env.example` - systemd: manager 环境变量示例
+- `systemd/agent-node.service` - systemd: node 服务文件（旧名 proxy）
 - `log/manager.log` - 运行日志（运行后生成）
 - `sessions.json` - 会话存储文件（运行后生成）
   - v2 会保存 chat -> node（旧名 proxy）以及 per-node 的 current threadId
@@ -175,7 +175,7 @@ python codex_proxy.py --config node_config.json
 ```bash
 export CODEX_MANAGER_CONTROL_LISTEN=127.0.0.1:18766
 export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
-systemctl restart codex-manager.service
+systemctl restart agent-manager.service
 ```
 
 2. 在 manager 机器上对某个 node 做 WS 连通性验证（要求 node 已在线注册）：
@@ -226,39 +226,39 @@ scripts/verify_phase2_appserver_rpc.sh proxy27
 Manager:
 
 ```bash
-sudo cp systemd/codex-manager.service /etc/systemd/system/codex-manager.service
-sudo cp systemd/codex-manager.env.example /etc/codex-manager.env
-sudo editor /etc/codex-manager.env
+sudo cp systemd/agent-manager.service /etc/systemd/system/agent-manager.service
+sudo cp systemd/agent-manager.env.example /etc/agent-manager.env
+sudo editor /etc/agent-manager.env
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now codex-manager.service
+sudo systemctl enable --now agent-manager.service
 
-sudo systemctl status codex-manager.service
-sudo journalctl -u codex-manager.service -f
+sudo systemctl status agent-manager.service
+sudo journalctl -u agent-manager.service -f
 ```
 
 Proxy:
 
 ```bash
-sudo cp systemd/codex-proxy.service /etc/systemd/system/codex-proxy.service
+sudo cp systemd/agent-node.service /etc/systemd/system/agent-node.service
 # Node 统一从 WorkingDirectory（默认 /root/telegram-bot）下的 node_config.json 读取配置（兼容 proxy_config.json）。
 # 不再使用 /etc/codex-proxy.env。
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now codex-proxy.service
+sudo systemctl enable --now agent-node.service
 
-sudo systemctl status codex-proxy.service
-sudo journalctl -u codex-proxy.service -f
+sudo systemctl status agent-node.service
+sudo journalctl -u agent-node.service -f
 ```
 
 ## 故障排除
 
 1. Telegram 收不到消息：
-   - 看 `journalctl -u codex-manager.service -f`
+   - 看 `journalctl -u agent-manager.service -f`
    - 很多环境需要设置 `TELEGRAM_PROXY`
    - 代理策略：优先使用 `TELEGRAM_PROXY` 或 `manager_config.json` 的 `telegram_proxy`；若未显式配置，则会继承系统 `HTTP_PROXY/HTTPS_PROXY`
 2. Manager 看不到在线 node：
-   - 看 `journalctl -u codex-proxy.service -f`
+   - 看 `journalctl -u agent-node.service -f`
    - 确认 `CODEX_MANAGER_WS` 可达、端口放通
 3. Codex 没回复或超时：
    - 在 node 机器上跑 `codex --version`

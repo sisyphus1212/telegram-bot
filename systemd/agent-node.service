@@ -1,5 +1,5 @@
 [Unit]
-Description=Codex Proxy (WS client -> local codex app-server)
+Description=Agent Node (WS client -> local codex app-server)
 After=network-online.target
 Wants=network-online.target
 
@@ -15,3 +15,4 @@ PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
+

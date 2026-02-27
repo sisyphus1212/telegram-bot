@@ -42,7 +42,7 @@
 
 systemd 推荐：
 
-- `/etc/codex-manager.env`
+- `/etc/agent-manager.env`
 
 ### 4.2 Proxy（WS client + 本机 Codex）
 
@@ -108,11 +108,11 @@ python codex_manager.py --ws-only --ws-listen 127.0.0.1:8765 --dispatch-proxy pr
 ### 5.4 systemd 运行与查看日志
 
 ```bash
-systemctl status codex-manager.service
-journalctl -u codex-manager.service -f
+systemctl status agent-manager.service
+journalctl -u agent-manager.service -f
 
-systemctl status codex-proxy.service
-journalctl -u codex-proxy.service -f
+systemctl status agent-node.service
+journalctl -u agent-node.service -f
 ```
 
 ## 6. 当前实现范围（v0）
