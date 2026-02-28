@@ -1,0 +1,18 @@
+[Unit]
+Description=Agent Node (WS client -> local codex app-server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/telegram-bot
+ExecStart=/root/telegram-bot/scripts/run_proxy.sh
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

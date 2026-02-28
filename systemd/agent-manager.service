@@ -1,0 +1,19 @@
+[Unit]
+Description=Agent Manager (Telegram + Node Registry)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/telegram-bot
+EnvironmentFile=/etc/agent-manager.env
+ExecStart=/root/telegram-bot/scripts/run.sh
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

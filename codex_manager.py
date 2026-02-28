@@ -1,8 +1,10 @@
 import argparse
 import asyncio
+import faulthandler
 import json
 import logging
 import os
+import socket
 import signal
 import time
 import uuid
@@ -15,7 +17,7 @@ from typing import Any
 import websockets
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
 import log_rotate
@@ -58,28 +60,44 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-async def _tg_call(coro, *, timeout_s: float, what: str, retries: int = 3) -> Any:
+async def _tg_call(make_coro, *, timeout_s: float, what: str, retries: int = 3) -> Any:
     """
     Telegram 网络在部分环境下不稳定（尤其是走本地代理时），这里做轻量重试避免“没反应”。
 
     注意：send_message 不是严格幂等，重试可能导致重复消息；但比起完全无响应更可接受。
+
+    约定：如果调用方本身已经实现了“队列级重试”（例如 TelegramOutbox），则应把 retries 设为 1，
+    避免“单次发送内部重试 + 队列外部重试”叠加导致整体延迟过大。
     """
     attempt = 0
     while True:
         attempt += 1
         try:
-            return await asyncio.wait_for(coro, timeout=timeout_s)
+            # Must create a new coroutine per attempt; coroutines can't be awaited twice.
+            return await asyncio.wait_for(make_coro(), timeout=timeout_s)
+        except BadRequest as e:
+            # PTB treats BadRequest as a NetworkError subclass.
+            # For edits, Telegram returns "Message is not modified" when the content is identical.
+            # This shouldn't be retried or treated as a real failure.
+            msg = str(e)
+            if "Message is not modified" in msg:
+                logger.info(f"telegram call noop ({what}): {type(e).__name__}: {msg}")
+                return None
+            logger.warning(f"telegram call bad request ({what}): {type(e).__name__}: {msg}")
+            raise
         except RetryAfter as e:
             # Telegram 限流：按建议等待后重试。
             wait_s = max(0.5, float(getattr(e, "retry_after", 1.0)))
-            logger.warning(f"telegram call rate-limited ({what}): RetryAfter {wait_s:.1f}s (attempt {attempt}/{retries})")
             if attempt >= retries:
+                logger.warning(f"telegram call rate-limited ({what}): RetryAfter {wait_s:.1f}s (attempt {attempt}/{retries})")
                 raise
+            logger.info(f"telegram call rate-limited ({what}): RetryAfter {wait_s:.1f}s (attempt {attempt}/{retries})")
             await asyncio.sleep(wait_s)
         except (TimedOut, NetworkError, asyncio.TimeoutError) as e:
-            logger.warning(f"telegram call transient failed ({what}): {type(e).__name__}: {e} (attempt {attempt}/{retries})")
             if attempt >= retries:
+                logger.warning(f"telegram call transient failed ({what}): {type(e).__name__}: {e} (attempt {attempt}/{retries})")
                 raise
+            logger.info(f"telegram call transient failed ({what}): {type(e).__name__}: {e} (attempt {attempt}/{retries})")
             await asyncio.sleep(min(5.0, 0.7 * (1.6 ** (attempt - 1))))
         except Exception as e:
             logger.warning(f"telegram call failed ({what}): {type(e).__name__}: {e}")
@@ -109,6 +127,15 @@ def _parse_allowed_user_ids(value: str) -> set[int]:
             out.add(int(part))
         except ValueError:
             logger.warning(f"Invalid TELEGRAM_ALLOWED_USER_IDS entry: {part!r}")
+    return out
+
+
+def _parse_csv_set(value: str) -> set[str]:
+    out: set[str] = set()
+    for part in (value or "").replace(" ", ",").split(","):
+        p = part.strip()
+        if p:
+            out.add(p)
     return out
 
 
@@ -267,6 +294,21 @@ class ProxyConn:
 
 
 @dataclass
+class ProxyPresenceRecord:
+    proxy_id: str
+    first_seen_at: float
+    last_seen_at: float
+    online: bool = False
+    last_online_at: float = 0.0
+    last_offline_at: float = 0.0
+    last_peer: str = ""
+    online_count: int = 0
+    offline_count: int = 0
+    last_notify_at: float = 0.0
+    pending_online_notify: bool = False
+
+
+@dataclass
 class TaskContext:
     task_id: str
     trace_id: str
@@ -278,6 +320,8 @@ class TaskContext:
     session_key: str = ""
     result_mode: str = "send"
     last_progress_at: float = 0.0
+    # For timeout/liveness tracking: update on *every* progress event, regardless of TG edit rate limits.
+    last_progress_seen_at: float = 0.0
     last_progress_text: str = ""
     pending_progress_text: str = ""
     last_progress_event: str = ""
@@ -304,11 +348,15 @@ class TgAction:
     chat_id: int
     text: str
     message_id: int | None = None
+    reply_markup: Any | None = None
     timeout_s: float = 15.0
     trace_id: str = ""
     proxy_id: str = ""
     task_id: str = ""
     kind: str = ""  # "placeholder" | "result" | "late" | "timeout" | ...
+    # Retry on transient Telegram network failures. None means "use default policy by kind".
+    retries_left: int | None = None
+    backoff_s: float = 1.0
 
 
 class TelegramOutbox:
@@ -321,9 +369,21 @@ class TelegramOutbox:
         self._queues: dict[int, asyncio.Queue[TgAction]] = {}
         self._tasks: dict[int, asyncio.Task] = {}
         self._last_active: dict[int, float] = {}
+        # (chat_id, message_id) -> last edited text. Used to avoid noisy "Message is not modified" errors.
+        self._last_edit_text: dict[tuple[int, int], str] = {}
 
     async def enqueue(self, action: TgAction) -> bool:
         now = time.time()
+        if action.retries_left is None:
+            # Default retry policy:
+            # - progress edits are lossy (don't block the chat queue)
+            # - result/placeholder are important (retry longer under flaky proxy)
+            if action.kind in ("progress",):
+                action.retries_left = 0
+            elif action.kind in ("result", "result_done", "manager_error", "timeout", "approval"):
+                action.retries_left = 12
+            else:
+                action.retries_left = 6
         async with self._lock:
             q = self._queues.get(action.chat_id)
             if q is None:
@@ -363,21 +423,59 @@ class TelegramOutbox:
 
                 try:
                     if action.type == "edit":
+                        if action.message_id is None:
+                            raise ValueError("edit action missing message_id")
+                        key = (action.chat_id, action.message_id)
+                        last_text = self._last_edit_text.get(key)
+                        if last_text == action.text:
+                            # Avoid a no-op API call; this is common when progress updates are throttled.
+                            continue
                         await _tg_call(
-                            self.bot.edit_message_text(chat_id=action.chat_id, message_id=action.message_id, text=action.text),
+                            lambda: self.bot.edit_message_text(
+                                chat_id=action.chat_id,
+                                message_id=action.message_id,
+                                text=action.text,
+                                reply_markup=action.reply_markup,
+                            ),
                             timeout_s=action.timeout_s,
                             what="tg edit",
+                            retries=1,
                         )
+                        self._last_edit_text[key] = action.text
                         logger.info(
                             f"op=tg.edit ok=true chat_id={action.chat_id} msg_id={action.message_id} "
                             f"trace_id={action.trace_id} proxy_id={action.proxy_id} task_id={action.task_id} kind={action.kind}"
                         )
                     elif action.type == "send":
-                        await _tg_call(self.bot.send_message(chat_id=action.chat_id, text=action.text), timeout_s=action.timeout_s, what="tg send")
+                        await _tg_call(
+                            lambda: self.bot.send_message(chat_id=action.chat_id, text=action.text, reply_markup=action.reply_markup),
+                            timeout_s=action.timeout_s,
+                            what="tg send",
+                            retries=1,
+                        )
                         logger.info(
                             f"op=tg.send ok=true chat_id={action.chat_id} trace_id={action.trace_id} "
                             f"proxy_id={action.proxy_id} task_id={action.task_id} kind={action.kind}"
                         )
+                except (TimedOut, NetworkError, asyncio.TimeoutError) as e:
+                    # Transient: retry with backoff to survive flaky local proxy.
+                    left = int(action.retries_left or 0)
+                    if left > 0:
+                        action.retries_left = left - 1
+                        delay = max(0.5, float(action.backoff_s or 1.0))
+                        action.backoff_s = min(30.0, delay * 1.7)
+                        logger.info(
+                            f"tg outbox transient failed chat={chat_id}: {type(e).__name__}: {e} "
+                            f"(will retry in {delay:.1f}s, left={action.retries_left})"
+                        )
+                        await asyncio.sleep(delay)
+                        # Retry the same action to preserve per-chat ordering.
+                        try:
+                            q.put_nowait(action)
+                        except asyncio.QueueFull:
+                            logger.warning(f"tg outbox retry dropped chat={chat_id}: queue full")
+                        continue
+                    logger.warning(f"tg outbox send failed chat={chat_id}: {type(e).__name__}: {e}")
                 except Exception as e:
                     logger.warning(f"tg outbox send failed chat={chat_id}: {type(e).__name__}: {e}")
                 finally:
@@ -388,8 +486,9 @@ class TelegramOutbox:
 
 
 class ProxyRegistry:
-    def __init__(self, allowed: dict[str, str]) -> None:
+    def __init__(self, allowed: dict[str, str], *, enforce_allowlist: bool = False) -> None:
         self._allowed = allowed  # proxy_id -> token
+        self._enforce_allowlist = bool(enforce_allowlist)
         self._lock = asyncio.Lock()
         self._conns: dict[str, ProxyConn] = {}
 
@@ -403,13 +502,17 @@ class ProxyRegistry:
         return proxy_id in self._conns
 
     async def register(self, proxy_id: str, token: str, ws: Any) -> bool:
-        # Dev mode (current phase): accept any proxy registration.
-        # If an allowlist is configured, we only use it for warnings (not enforcement).
         if self._allowed:
-            expect = self._allowed.get(proxy_id, "")
-            if not expect:
+            expect = self._allowed.get(proxy_id)
+            if expect is None:
+                if self._enforce_allowlist:
+                    logger.warning(f"proxy_id {proxy_id!r} not in allowlist; rejecting.")
+                    return False
                 logger.warning(f"proxy_id {proxy_id!r} not in allowlist; accepting (dev mode).")
-            elif token != expect:
+            elif expect and token != expect:
+                if self._enforce_allowlist:
+                    logger.warning(f"proxy_id {proxy_id!r} token mismatch; rejecting.")
+                    return False
                 logger.warning(f"proxy_id {proxy_id!r} token mismatch; accepting (dev mode).")
         async with self._lock:
             # Replace existing connection if any.
@@ -453,11 +556,15 @@ class ManagerCore:
         registry: ProxyRegistry,
         *,
         task_timeout_s: float,
+        node_notify_chat_ids: list[int] | None = None,
+        node_notify_min_interval_s: float = 60.0,
         recent_ttl_s: float = 1800.0,
         recent_max: int = 10000,
     ) -> None:
         self.registry = registry
         self.task_timeout_s = float(task_timeout_s)
+        self.node_notify_chat_ids = node_notify_chat_ids or []
+        self.node_notify_min_interval_s = float(node_notify_min_interval_s)
         self.recent_ttl_s = float(recent_ttl_s)
         self.recent_max = int(recent_max)
 
@@ -469,12 +576,101 @@ class ManagerCore:
         self._waiters: dict[str, asyncio.Future[JsonDict]] = {}
         self._rpc_waiters: dict[str, asyncio.Future[JsonDict]] = {}
         self._approvals: dict[str, ApprovalContext] = {}
+        self._proxy_presence: dict[str, ProxyPresenceRecord] = {}
         self.progress_update_interval_s = 5.0
 
     def set_outbox(self, outbox: TelegramOutbox) -> None:
         self._outbox = outbox
         if self._timeout_task is None:
             self._timeout_task = asyncio.create_task(self._timeout_loop(), name="task_timeout_loop")
+        # Flush any pending node-online notifications that happened before TG was ready.
+        asyncio.create_task(self._flush_pending_node_online_notifications(), name="flush_node_online_notifies")
+
+    async def _flush_pending_node_online_notifications(self) -> None:
+        # Best-effort: if outbox is missing, there is nothing to do.
+        if self._outbox is None or not self.node_notify_chat_ids:
+            return
+        # Snapshot current online nodes and presence records.
+        async with self._lock:
+            online_ids = set(self.registry.online_proxy_ids())
+            records = list(self._proxy_presence.values())
+        for rec in records:
+            if not rec.online:
+                continue
+            if rec.proxy_id not in online_ids:
+                continue
+            if rec.pending_online_notify or rec.last_notify_at <= 0.0:
+                await self._notify_node_online(proxy_id=rec.proxy_id, peer=rec.last_peer, force=True)
+
+    async def tg_send(self, *, chat_id: int, text: str, kind: str, timeout_s: float = 8.0, retries_left: int | None = None) -> bool:
+        outbox = self._outbox
+        if outbox is None:
+            return False
+        return await outbox.enqueue(TgAction(type="send", chat_id=chat_id, text=text, kind=kind, timeout_s=timeout_s, retries_left=retries_left))
+
+    def _format_node_online_text(self, *, proxy_id: str, peer: str) -> str:
+        # Keep message short and mobile-friendly.
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        peer_s = peer or "?"
+        return f"[node online] {proxy_id} peer={peer_s} at {ts}\n\nTips: /node to select"
+
+    async def _notify_node_online(self, *, proxy_id: str, peer: str, force: bool = False) -> None:
+        now = time.time()
+        async with self._lock:
+            rec = self._proxy_presence.get(proxy_id)
+            if rec is None:
+                rec = ProxyPresenceRecord(proxy_id=proxy_id, first_seen_at=now, last_seen_at=now, online=True, last_online_at=now, last_peer=peer or "")
+                self._proxy_presence[proxy_id] = rec
+            # Rate-limit per proxy.
+            if not force and (now - rec.last_notify_at) < max(5.0, self.node_notify_min_interval_s):
+                return
+        if not self.node_notify_chat_ids:
+            return
+        text = self._format_node_online_text(proxy_id=proxy_id, peer=peer)
+        ok_any = False
+        for chat_id in self.node_notify_chat_ids:
+            ok_any = (await self.tg_send(chat_id=int(chat_id), text=text, kind="node_online", timeout_s=15.0, retries_left=6)) or ok_any
+        async with self._lock:
+            rec = self._proxy_presence.get(proxy_id)
+            if rec is None:
+                return
+            if ok_any:
+                rec.last_notify_at = now
+                rec.pending_online_notify = False
+            else:
+                rec.pending_online_notify = True
+
+    async def on_proxy_online(self, proxy_id: str, *, peer: str = "") -> None:
+        now = time.time()
+        async with self._lock:
+            rec = self._proxy_presence.get(proxy_id)
+            if rec is None:
+                rec = ProxyPresenceRecord(proxy_id=proxy_id, first_seen_at=now, last_seen_at=now)
+                self._proxy_presence[proxy_id] = rec
+            rec.last_seen_at = now
+            rec.last_peer = peer or rec.last_peer
+            if not rec.online:
+                rec.online = True
+                rec.last_online_at = now
+                rec.online_count += 1
+                rec.pending_online_notify = True
+        # If TG isn't ready yet, keep pending_online_notify=true; it'll be flushed in set_outbox().
+        if self._outbox is None:
+            return
+        await self._notify_node_online(proxy_id=proxy_id, peer=peer, force=False)
+
+    async def on_proxy_offline(self, proxy_id: str) -> None:
+        now = time.time()
+        async with self._lock:
+            rec = self._proxy_presence.get(proxy_id)
+            if rec is None:
+                rec = ProxyPresenceRecord(proxy_id=proxy_id, first_seen_at=now, last_seen_at=now)
+                self._proxy_presence[proxy_id] = rec
+            rec.last_seen_at = now
+            if rec.online:
+                rec.online = False
+                rec.last_offline_at = now
+                rec.offline_count += 1
 
     async def register_task(self, ctx: TaskContext) -> None:
         async with self._lock:
@@ -513,6 +709,8 @@ class ManagerCore:
             "thread_key": thread_key,
             "thread_id": thread_id,
             "prompt": prompt,
+            # Let the proxy align its local turn timeout with manager's wait time.
+            "timeout_s": float(timeout_s),
         }
         if model:
             msg["model"] = model
@@ -656,7 +854,7 @@ class ManagerCore:
         return summary
 
     def _render_progress_text(self, ctx: TaskContext) -> str:
-        head = f"working (proxy={ctx.proxy_id}, threadId={ctx.thread_id[-8:]}) ..."
+        head = f"working (node={ctx.proxy_id}, threadId={ctx.thread_id[-8:]}) ..."
         lines: list[str] = [head]
         if ctx.progress_lines:
             lines.append("")
@@ -669,7 +867,7 @@ class ManagerCore:
     def _render_progress_done_text(self, ctx: TaskContext, *, ok: bool) -> str:
         lines = [self._render_progress_text(ctx), ""]
         status = "working done" if ok else "working failed"
-        lines.append(f"{status} (proxy={ctx.proxy_id}, threadId={ctx.thread_id[-8:]})")
+        lines.append(f"{status} (node={ctx.proxy_id}, threadId={ctx.thread_id[-8:]})")
         return "\n".join(lines)
 
     async def _handle_task_progress(self, *, proxy_id: str, msg: JsonDict) -> None:
@@ -689,9 +887,14 @@ class ManagerCore:
             if ctx is None:
                 return
             now = time.time()
+            ctx.last_progress_seen_at = now
             if ctx.progress_lines is None:
                 ctx.progress_lines = []
             stage = str(msg.get("stage") or "")
+            # Treat retrying as internal liveness signal; don't spam TG with reconnect noise.
+            if stage == "retrying" and not force:
+                ctx.last_progress_event = event
+                return
             label = self._normalize_progress_line(event=event, stage=stage, summary=summary, ctx=ctx, now=now)
             if label is not None:
                 self._push_progress_line(ctx.progress_lines, label)
@@ -797,12 +1000,37 @@ class ManagerCore:
             if reason:
                 text_lines.append(f"reason: {reason}")
         text_lines.append("")
-        text_lines.append("回复以下命令进行选择：")
+        text_lines.append("请选择：")
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Approve", callback_data=f"approve:accept:{approval_id}"),
+                    InlineKeyboardButton("Decline", callback_data=f"approve:decline:{approval_id}"),
+                ],
+                [InlineKeyboardButton("Approve (Session)", callback_data=f"approve:session:{approval_id}")],
+            ]
+        )
+
+        # Fallback for clients without inline buttons.
+        text_lines.append("")
+        text_lines.append("备用命令：")
         text_lines.append(f"/approve {approval_id}")
-        text_lines.append(f"/approve_session {approval_id}")
+        text_lines.append(f"/approve session {approval_id}")
         text_lines.append(f"/decline {approval_id}")
 
-        await outbox.enqueue(TgAction(type="send", chat_id=ctx.chat_id, text="\n".join(text_lines), trace_id=ac.trace_id, proxy_id=proxy_id, task_id=task_id, kind="approval"))
+        await outbox.enqueue(
+            TgAction(
+                type="send",
+                chat_id=ctx.chat_id,
+                text="\n".join(text_lines),
+                reply_markup=kb,
+                trace_id=ac.trace_id,
+                proxy_id=proxy_id,
+                task_id=task_id,
+                kind="approval",
+            )
+        )
 
     async def approval_decide(self, *, approval_id: str, decision: str, chat_id: int) -> tuple[bool, str]:
         decision = (decision or "").strip()
@@ -986,7 +1214,9 @@ class ManagerCore:
             expired: list[tuple[str, TaskContext]] = []
             async with self._lock:
                 for tid, ctx in list(self._tasks_inflight.items()):
-                    if (now - ctx.created_at) > self.task_timeout_s:
+                    # Activity-based timeout: reset the timer on any progress event.
+                    last = ctx.last_progress_seen_at or ctx.created_at
+                    if (now - last) > self.task_timeout_s:
                         expired.append((tid, ctx))
                         self._tasks_inflight.pop(tid, None)
                         self._recent[tid] = (ctx, now)
@@ -1034,6 +1264,7 @@ async def run_ws_server(listen: str, registry: ProxyRegistry, core: ManagerCore)
     async def handler(ws: Any):
         proxy_id = ""
         try:
+            peer = getattr(ws, "remote_address", None)
             raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
             msg = json.loads(raw)
             if not isinstance(msg, dict) or msg.get("type") != "register":
@@ -1044,12 +1275,20 @@ async def run_ws_server(listen: str, registry: ProxyRegistry, core: ManagerCore)
             if not proxy_id:
                 await ws.send(json.dumps({"type": "register_error", "error": "missing proxy_id"}))
                 return
+            logger.info(f"op=ws.register peer={peer!r} proxy_id={proxy_id}")
             ok = await registry.register(proxy_id=proxy_id, token=token, ws=ws)
             if not ok:
+                logger.warning(f"op=ws.register.reject peer={peer!r} proxy_id={proxy_id}")
                 await ws.send(json.dumps({"type": "register_error", "error": "unauthorized"}))
                 return
             await ws.send(json.dumps({"type": "register_ok"}))
             logger.info(f"proxy online: {proxy_id}")
+            peer_s = ""
+            if isinstance(peer, tuple) and len(peer) >= 2:
+                peer_s = f"{peer[0]}:{peer[1]}"
+            elif peer is not None:
+                peer_s = str(peer)
+            await core.on_proxy_online(proxy_id, peer=peer_s)
 
             async for raw in ws:
                 try:
@@ -1074,6 +1313,10 @@ async def run_ws_server(listen: str, registry: ProxyRegistry, core: ManagerCore)
             if proxy_id:
                 await registry.unregister_if_matches(proxy_id, ws)
                 logger.info(f"proxy offline: {proxy_id}")
+                try:
+                    await core.on_proxy_offline(proxy_id)
+                except Exception:
+                    pass
 
     async with websockets.serve(handler, host, port, ping_interval=20, ping_timeout=20, max_size=8 * 1024 * 1024):
         logger.info(f"WS listening on {listen}")
@@ -1344,6 +1587,26 @@ class ManagerApp:
         sess["defaults"] = defaults
         self.sessions[sk] = sess
 
+    def _get_default_effort(self, sk: str) -> str:
+        defaults = self._get_defaults(sk)
+        effort = str(defaults.get("effort") or "").strip().lower()
+        if effort in ("low", "medium", "high"):
+            return effort
+        # Default to medium unless explicitly set otherwise.
+        return "medium"
+
+    def _set_default_effort(self, sk: str, effort: str) -> None:
+        effort = str(effort or "").strip().lower()
+        if effort not in ("low", "medium", "high"):
+            effort = "medium"
+        sess = self._get_sess(sk)
+        defaults = sess.get("defaults")
+        if not isinstance(defaults, dict):
+            defaults = {}
+        defaults["effort"] = effort
+        sess["defaults"] = defaults
+        self.sessions[sk] = sess
+
     def _set_current_thread_id(self, sk: str, proxy_id: str, thread_id: str) -> None:
         sess = self._get_sess(sk)
         byp = sess["by_proxy"]
@@ -1440,12 +1703,31 @@ class ManagerApp:
                 models.append(mid)
         return effective_model, proxy_default_model, models
 
-    def _render_model_text(self, *, proxy_id: str, effective_model: str, proxy_default_model: str, session_model: str, models: list[str]) -> str:
+    async def _fetch_model_detail(self, *, proxy_id: str, core: ManagerCore, model_id: str) -> JsonDict:
+        rep = await core.appserver_call(proxy_id, "model/list", {}, timeout_s=min(60.0, self.task_timeout_s))
+        if not bool(rep.get("ok")):
+            raise RuntimeError(str(rep.get("error") or "model/list failed"))
+        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+        data = result.get("data") if isinstance(result.get("data"), list) else []
+        for item in data:
+            if isinstance(item, dict) and str(item.get("id") or "").strip() == model_id:
+                return item
+        return {}
+
+    def _render_model_text(self, *, proxy_id: str, effective_model: str, proxy_default_model: str, session_model: str, models: list[str], effort: str, model_detail: JsonDict | None) -> str:
         lines = [f"model: {effective_model or '(unknown)'}", f"proxy: {proxy_id}"]
+        lines.append(f"effort: {effort}")
         if session_model:
             lines.append("source: session override")
         elif proxy_default_model:
             lines.append("source: proxy default")
+        if isinstance(model_detail, dict) and model_detail:
+            de = str(model_detail.get("defaultReasoningEffort") or "").strip()
+            if de:
+                lines.append(f"defaultReasoningEffort: {de}")
+            sup = model_detail.get("supportedReasoningEfforts")
+            if isinstance(sup, list) and sup:
+                lines.append(f"supportedReasoningEfforts: {', '.join([str(x) for x in sup if x])}")
         # Keep the text compact: available models are selectable via buttons.
         if models:
             shown = min(len(models), 12)
@@ -1454,7 +1736,7 @@ class ManagerApp:
             lines.append("available: (none)")
         return "\n".join(lines)
 
-    def _build_model_keyboard(self, *, models: list[str], effective_model: str, session_model: str) -> InlineKeyboardMarkup:
+    def _build_model_keyboard(self, *, models: list[str], effective_model: str, session_model: str, effort: str) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = []
         row: list[InlineKeyboardButton] = []
         for mid in models[:12]:
@@ -1465,103 +1747,108 @@ class ManagerApp:
                 row = []
         if row:
             rows.append(row)
+        # Effort controls (low/medium/high). Default is medium.
+        eff_row: list[InlineKeyboardButton] = []
+        for e in ("low", "medium", "high"):
+            lab = f"• {e}" if e == effort else e
+            eff_row.append(InlineKeyboardButton(lab, callback_data=f"effort:set:{e}"))
+        rows.append(eff_row)
         rows.append([
             InlineKeyboardButton("Clear", callback_data="model:clear"),
             InlineKeyboardButton("Refresh", callback_data="model:refresh"),
         ])
         return InlineKeyboardMarkup(rows)
 
-    async def cmd_proxy_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /proxy_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+    def _render_node_text(self, *, selected: str, online: list[str], allowed: list[str]) -> str:
+        lines: list[str] = []
+        lines.append(f"current: {selected or '(none)'}")
+        lines.append(f"online_count: {len(online)}")
+        lines.append("")
+        lines.append("点击按钮选择 node：")
+        return "\n".join(lines)
+
+    def _build_node_keyboard(self, *, online: list[str], selected: str) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        row: list[InlineKeyboardButton] = []
+        for nid in online[:20]:
+            label = f"• {nid}" if nid == selected else nid
+            row.append(InlineKeyboardButton(label[:32], callback_data=f"node:set:{nid}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("Refresh", callback_data="node:refresh")])
+        return InlineKeyboardMarkup(rows)
+
+    async def cmd_node(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info(f"cmd /node chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        if not update.message:
+            return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/proxy_list reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/node reply")
             return
         sk = _session_key(update)
         selected = self._get_selected_proxy(sk)
         online = self.registry.online_proxy_ids()
         allowed = self.registry.allowed_proxy_ids()
-        lines = []
-        lines.append(f"online: {', '.join(online) if online else '(none)'}")
-        lines.append(f"selected: {selected or '(none)'}")
-        if allowed:
-            lines.append(f"allowed: {', '.join(allowed)}")
-        if online:
-            lines.append("")
-            lines.append("可直接复制切换：")
-            for pid in online:
-                lines.append(f"/proxy_use {pid}")
+        text = self._render_node_text(selected=selected, online=online, allowed=allowed)
+        kb = self._build_node_keyboard(online=online, selected=selected)
+        await _tg_call(lambda: update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/node reply")
+
+    async def on_node_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        if not self._is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        data = str(q.data or "")
+        if not data.startswith("node:"):
+            return
+        sk = _session_key(update)
+        if data == "node:refresh":
+            pass
+        elif data.startswith("node:set:"):
+            node_id = data[len("node:set:") :].strip()
+            if not node_id:
+                await q.answer("bad node id", show_alert=True)
+                return
+            if not self.registry.is_online(node_id):
+                await q.answer(f"node offline: {node_id}", show_alert=True)
+                return
+            self._set_selected_proxy(sk, node_id)
+            save_sessions(self.sessions)
         else:
-            lines.append("use: /proxy_use <id>")
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/proxy_list reply")
+            await q.answer()
+            return
 
-    async def cmd_proxy_use(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /proxy_use chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/proxy_use reply")
-            return
-        sk = _session_key(update)
-        # Keep /proxy_use strict: only accept a single positional proxy id.
-        # (No proxyId=... form; avoid redundant syntax.)
-        proxy_id = (context.args[0] if context.args else "").strip()
-        if not proxy_id:
-            await _tg_call(update.message.reply_text("usage: /proxy_use <id>"), timeout_s=15.0, what="/proxy_use reply")
-            return
-        if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id}"), timeout_s=15.0, what="/proxy_use reply")
-            return
-        self._set_selected_proxy(sk, proxy_id)
-        save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"ok proxy={proxy_id}"), timeout_s=15.0, what="/proxy_use reply")
-
-    async def cmd_proxy_current(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /proxy_current chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/proxy_current reply")
-            return
-        sk = _session_key(update)
-        proxy_id = self._get_selected_proxy(sk)
-        await _tg_call(update.message.reply_text(f"proxy: {proxy_id or '(none)'}"), timeout_s=15.0, what="/proxy_current reply")
-
-    async def cmd_result_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.info(f"cmd /result_mode chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not update.message:
-            return
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/result_mode reply")
-            return
-        sk = _session_key(update)
-        if not context.args:
-            mode = self._get_result_mode(sk)
-            await _tg_call(update.message.reply_text(f"result_mode: {mode}"), timeout_s=15.0, what="/result_mode reply")
-            return
-        mode = (context.args[0] or "").strip().lower()
-        aliases = {"replace": "replace", "edit": "replace", "send": "send", "separate": "send"}
-        mode = aliases.get(mode, "")
-        if not mode:
-            await _tg_call(update.message.reply_text("usage: /result_mode <replace|send>"), timeout_s=15.0, what="/result_mode reply")
-            return
-        self._set_result_mode(sk, mode)
-        save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"ok result_mode={mode}"), timeout_s=15.0, what="/result_mode reply")
+        selected = self._get_selected_proxy(sk)
+        online = self.registry.online_proxy_ids()
+        allowed = self.registry.allowed_proxy_ids()
+        text = self._render_node_text(selected=selected, online=online, allowed=allowed)
+        kb = self._build_node_keyboard(online=online, selected=selected)
+        await _tg_call(lambda: q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="node callback edit")
+        await q.answer(f"current={selected or '(none)'}")
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /status chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/status reply")
             return
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use <id> 选择一台机器"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="/status reply")
             return
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /proxy_list)"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="/status reply")
             return
         core = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/status reply")
             return
         session_model = self._get_default_model(sk)
         current_thread_id = self._get_current_thread_id(sk, proxy_id)
@@ -1569,7 +1856,7 @@ class ManagerApp:
 
         cfg_rep = await core.appserver_call(proxy_id, "config/read", {}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(cfg_rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {cfg_rep.get('error')}"), timeout_s=15.0, what="/status reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {cfg_rep.get('error')}"), timeout_s=15.0, what="/status reply")
             return
         cfg_result = cfg_rep.get("result") if isinstance(cfg_rep.get("result"), dict) else {}
         cfg_obj = cfg_result.get("config") if isinstance(cfg_result.get("config"), dict) else {}
@@ -1663,43 +1950,57 @@ class ManagerApp:
                     lines.append(f"git: branch={branch or '?'} sha={sha[:12] if sha else '?'}")
 
         lines.append(f"loaded_threads: {len(loaded_data)}")
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/status reply")
+        await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/status reply")
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /model chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/model reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/model reply")
             return
         sk = _session_key(update)
         session_model = self._get_default_model(sk)
+        session_effort = self._get_default_effort(sk)
         if not context.args:
             proxy_id = await self._require_proxy_online(update)
             if not proxy_id:
                 return
             core: ManagerCore | None = context.application.bot_data.get("core")
             if core is None:
-                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/model reply")
+                await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/model reply")
                 return
             try:
                 effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
+                detail = await self._fetch_model_detail(proxy_id=proxy_id, core=core, model_id=effective_model)
             except Exception as e:
-                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {type(e).__name__}: {e}"), timeout_s=15.0, what="/model reply")
+                await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {type(e).__name__}: {e}"), timeout_s=15.0, what="/model reply")
                 return
-            text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models)
-            kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model)
-            await _tg_call(update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/model reply")
+            text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
+            kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
+            await _tg_call(lambda: update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/model reply")
             return
         arg = " ".join(context.args).strip()
+        if context.args and str(context.args[0]).strip().lower() == "effort":
+            if len(context.args) < 2:
+                await _tg_call(lambda: update.message.reply_text("usage: /model effort <low|medium|high>"), timeout_s=15.0, what="/model reply")
+                return
+            eff = str(context.args[1]).strip().lower()
+            if eff not in ("low", "medium", "high"):
+                await _tg_call(lambda: update.message.reply_text("usage: /model effort <low|medium|high>"), timeout_s=15.0, what="/model reply")
+                return
+            self._set_default_effort(sk, eff)
+            save_sessions(self.sessions)
+            await _tg_call(lambda: update.message.reply_text(f"ok effort={eff}"), timeout_s=15.0, what="/model reply")
+            return
         if arg.lower() in ("clear", "default", "reset"):
             self._set_default_model(sk, "")
             save_sessions(self.sessions)
-            await _tg_call(update.message.reply_text("ok model=(default)"), timeout_s=15.0, what="/model reply")
+            await _tg_call(lambda: update.message.reply_text("ok model=(default)"), timeout_s=15.0, what="/model reply")
             return
         self._set_default_model(sk, arg)
         save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"ok model={arg}"), timeout_s=15.0, what="/model reply")
+        await _tg_call(lambda: update.message.reply_text(f"ok model={arg}"), timeout_s=15.0, what="/model reply")
 
     async def on_model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -1737,45 +2038,121 @@ class ManagerApp:
             return
 
         session_model = self._get_default_model(sk)
+        session_effort = self._get_default_effort(sk)
         try:
             effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
+            detail = await self._fetch_model_detail(proxy_id=proxy_id, core=core, model_id=effective_model)
         except Exception as e:
             await q.answer(f"{type(e).__name__}: {e}", show_alert=True)
             return
-        text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models)
-        kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model)
-        await _tg_call(q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="model callback edit")
+        text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
+        kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
+        await _tg_call(lambda: q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="model callback edit")
         await q.answer(f"model={session_model or proxy_default_model or '(default)'}")
+
+    async def on_effort_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        if not self._is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        data = str(q.data or "")
+        if not data.startswith("effort:"):
+            return
+        sk = _session_key(update)
+        proxy_id = self._get_selected_proxy(sk)
+        if not proxy_id or not self.registry.is_online(proxy_id):
+            await q.answer("node offline", show_alert=True)
+            return
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await q.answer("manager core missing", show_alert=True)
+            return
+        if data.startswith("effort:set:"):
+            eff = data[len("effort:set:") :].strip().lower()
+            if eff not in ("low", "medium", "high"):
+                await q.answer("bad effort", show_alert=True)
+                return
+            self._set_default_effort(sk, eff)
+            save_sessions(self.sessions)
+        else:
+            await q.answer()
+            return
+        session_model = self._get_default_model(sk)
+        session_effort = self._get_default_effort(sk)
+        try:
+            effective_model, proxy_default_model, models = await self._fetch_model_state(proxy_id=proxy_id, core=core, session_model=session_model)
+            detail = await self._fetch_model_detail(proxy_id=proxy_id, core=core, model_id=effective_model)
+        except Exception as e:
+            await q.answer(f"{type(e).__name__}: {e}", show_alert=True)
+            return
+        text = self._render_model_text(proxy_id=proxy_id, effective_model=effective_model, proxy_default_model=proxy_default_model, session_model=session_model, models=models, effort=session_effort, model_detail=detail)
+        kb = self._build_model_keyboard(models=models, effective_model=effective_model, session_model=session_model, effort=session_effort)
+        await _tg_call(lambda: q.edit_message_text(text=text, reply_markup=kb), timeout_s=15.0, what="effort callback edit")
+        await q.answer(f"effort={session_effort}")
 
     async def cmd_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(
             f"cmd /ping from chat={update.effective_chat.id if update.effective_chat else '?'} "
             f"user={update.effective_user.id if update.effective_user else '?'}"
         )
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/ping reply")
+        if not update.effective_chat:
             return
-        await _tg_call(update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
+        if not self._is_allowed(update):
+            core: ManagerCore | None = context.application.bot_data.get("core")
+            if core is not None and await core.tg_send(chat_id=update.effective_chat.id, text="unauthorized", kind="ping", retries_left=12):
+                return
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/ping reply")
+            return
+        core2: ManagerCore | None = context.application.bot_data.get("core")
+        if core2 is not None and await core2.tg_send(chat_id=update.effective_chat.id, text="pong", kind="ping", timeout_s=5.0, retries_left=12):
+            return
+        await _tg_call(lambda: update.message.reply_text("pong"), timeout_s=15.0, what="/ping reply")
+
+    async def cmd_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /result [send|replace]
+        (Replaces legacy /result_mode)
+        """
+        logger.info(f"cmd /result chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/result reply")
+            return
+        sk = _session_key(update)
+        if not context.args:
+            mode = self._get_result_mode(sk)
+            await _tg_call(lambda: update.message.reply_text(f"result: {mode}"), timeout_s=15.0, what="/result reply")
+            return
+        mode = (context.args[0] or "").strip().lower()
+        aliases = {"replace": "replace", "edit": "replace", "send": "send", "separate": "send"}
+        mode = aliases.get(mode, "")
+        if not mode:
+            await _tg_call(lambda: update.message.reply_text("usage: /result <replace|send>"), timeout_s=15.0, what="/result reply")
+            return
+        self._set_result_mode(sk, mode)
+        save_sessions(self.sessions)
+        await _tg_call(lambda: update.message.reply_text(f"ok result={mode}"), timeout_s=15.0, what="/result reply")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /help chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/help reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/help reply")
             return
 
         lines: list[str] = []
         lines.append("Codex Manager (TG -> Manager -> Proxy -> Codex app-server)")
         lines.append("")
-        lines.append("1) 选择机器（proxy）")
-        lines.append("- /proxy_list  查看在线机器（旧命令: /servers）")
-        lines.append("- /proxy_use <id>  选择机器（旧命令: /use <id>）")
-        lines.append("- /proxy_current  查看当前选择")
+        lines.append("1) 选择机器（node）")
+        lines.append("- /node  弹出在线机器按钮，并显示 current")
         lines.append("- /status  查看当前会话状态汇总")
         lines.append("- /model  查看当前会话模型（以及 proxy 默认模型），并列出可点按钮切换")
         lines.append("- /model <model_id>  切换当前会话模型（会在每次 turn/start 里下发，按 app-server 语义写回 thread 默认）")
-        lines.append("- /result_mode [replace|send]  结果输出模式：覆盖占位 / 单独发结果")
+        lines.append("- /result [replace|send]  结果输出模式：覆盖占位 / 单独发结果")
         lines.append("")
         lines.append("2) 日常对话（turn）")
         lines.append("- 直接发送文本即可。")
@@ -1783,117 +2160,321 @@ class ManagerApp:
         lines.append(f"- 运行中会用 placeholder 追加进度日志，默认约每 {int(self.core.progress_update_interval_s) if hasattr(self, 'core') else 5} 秒最多更新一次。")
         lines.append("")
         lines.append("3) Thread 会话（对齐 app-server method）")
-        lines.append("- /thread_current  显示当前 threadId（按 proxy 隔离保存）")
-        lines.append("- /thread_start [cwd=...] [sandbox=workspaceWrite] [approvalPolicy=onRequest] [personality=pragmatic]")
-        lines.append("- /thread_resume <id>  (也支持: /thread_resume threadId=<id>)")
-        lines.append("- /thread_list [limit=5] [archived=true|false] [cursor=...] [sortKey=created_at|updated_at]")
-        lines.append("- /thread_read <id> [includeTurns=true|false]  (也支持: threadId=<id>)")
-        lines.append("- /thread_archive [threadId=<id>]   (不填则归档当前 thread)")
-        lines.append("- /thread_unarchive <id>  (也支持: threadId=<id>)")
+        lines.append("- /thread current")
+        lines.append("- /thread start [cwd=...] [sandbox=workspaceWrite] [approvalPolicy=onRequest] [personality=pragmatic]")
+        lines.append("- /thread resume <id>  (也支持: threadId=<id>)")
+        lines.append("- /thread list [limit=5] [archived=true|false] [cursor=...] [sortKey=created_at|updated_at]")
+        lines.append("- /thread read <id> [includeTurns=true|false]  (也支持: threadId=<id>)")
+        lines.append("- /thread archive [threadId=<id>]   (不填则归档当前 thread)")
+        lines.append("- /thread unarchive <id>  (也支持: threadId=<id>)")
         lines.append("")
         lines.append("4) 其它 app-server 查询/配置")
         lines.append("- /model")
         lines.append("- /model <model_id>")
-        lines.append("- /skills_list [cwds=/a,/b] [forceReload=true|false]")
-        lines.append("- /config_read [includeLayers=true|false]")
-        lines.append("- /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]")
-        lines.append("- /collaborationmode_list")
+        lines.append("- /skills list [cwds=/a,/b] [forceReload=true|false]")
+        lines.append("- /config read [includeLayers=true|false]")
+        lines.append("- /config write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]")
+        lines.append("- /collaborationmode list")
         lines.append("")
         lines.append("5) 审批（approval）")
         lines.append("- 当 approvalPolicy=onRequest 时，某些命令/文件变更会触发审批。")
         lines.append("- /approve <approval_id>  同意一次")
-        lines.append("- /approve_session <approval_id>  本会话同意（如果 codex 支持）")
+        lines.append("- /approve session <approval_id>  本会话同意（如果 codex 支持）")
         lines.append("- /decline <approval_id>  拒绝")
         lines.append("")
         lines.append("参数格式：key=value（多个参数用空格分隔）。JSON 参数用 value=<json>。")
         lines.append("示例：")
-        lines.append("- /proxy_use proxy27")
+        lines.append("- /node")
         lines.append("- /model gpt-5-codex")
-        lines.append("- /result_mode send")
-        lines.append("- /thread_list limit=3 archived=false")
-        lines.append("- /config_value_write keyPath=apps._default.enabled value=true mergeStrategy=replace")
+        lines.append("- /result send")
+        lines.append("- /thread list limit=3 archived=false")
+        lines.append("- /config write keyPath=apps._default.enabled value=true mergeStrategy=replace")
         lines.append("")
         lines.append("提示：thread 内容由 Codex 保存在 proxy 机器的 ~/.codex/；manager 只保存 chat->(proxy, threadId) 路由。")
 
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/help reply")
+        await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/help reply")
 
     async def cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message:
             return
         logger.info(f"cmd /approve chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve reply")
             return
-        approval_id = (context.args[0] if context.args else "").strip()
+        if not context.args:
+            await _tg_call(lambda: update.message.reply_text("usage: /approve <approval_id> | /approve session <approval_id>"), timeout_s=15.0, what="/approve reply")
+            return
+        decision = "accept"
+        approval_id = ""
+        if len(context.args) >= 2 and str(context.args[0]).strip().lower() == "session":
+            decision = "acceptForSession"
+            approval_id = str(context.args[1]).strip()
+        else:
+            approval_id = str(context.args[0]).strip()
         if not approval_id:
-            await _tg_call(update.message.reply_text("usage: /approve <approval_id>"), timeout_s=15.0, what="/approve reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /approve <approval_id> | /approve session <approval_id>"), timeout_s=15.0, what="/approve reply")
             return
-        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="accept", chat_id=update.effective_chat.id)
-        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve reply")
-
-    async def cmd_approve_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.message:
-            return
-        logger.info(f"cmd /approve_session chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/approve_session reply")
-            return
-        approval_id = (context.args[0] if context.args else "").strip()
-        if not approval_id:
-            await _tg_call(update.message.reply_text("usage: /approve_session <approval_id>"), timeout_s=15.0, what="/approve_session reply")
-            return
-        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="acceptForSession", chat_id=update.effective_chat.id)
-        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve_session reply")
+        ok, msg = await self.core.approval_decide(approval_id=approval_id, decision=decision, chat_id=update.effective_chat.id)
+        await _tg_call(lambda: update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/approve reply")
 
     async def cmd_decline(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message:
             return
         logger.info(f"cmd /decline chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/decline reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/decline reply")
             return
         approval_id = (context.args[0] if context.args else "").strip()
         if not approval_id:
-            await _tg_call(update.message.reply_text("usage: /decline <approval_id>"), timeout_s=15.0, what="/decline reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /decline <approval_id>"), timeout_s=15.0, what="/decline reply")
             return
         ok, msg = await self.core.approval_decide(approval_id=approval_id, decision="decline", chat_id=update.effective_chat.id)
-        await _tg_call(update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/decline reply")
+        await _tg_call(lambda: update.message.reply_text(msg if ok else f"error: {msg}"), timeout_s=15.0, what="/decline reply")
+
+    async def on_approve_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        if not self._is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        data = str(q.data or "")
+        if not data.startswith("approve:"):
+            return
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await q.answer("bad approve data", show_alert=True)
+            return
+        _prefix, action, approval_id = parts[0], parts[1], parts[2].strip()
+        if not approval_id:
+            await q.answer("missing approval_id", show_alert=True)
+            return
+        decision = ""
+        if action == "accept":
+            decision = "accept"
+        elif action == "session":
+            decision = "acceptForSession"
+        elif action == "decline":
+            decision = "decline"
+        else:
+            await q.answer("bad action", show_alert=True)
+            return
+        core: ManagerCore | None = context.application.bot_data.get("core")
+        if core is None:
+            await q.answer("manager core missing", show_alert=True)
+            return
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        ok, msg = await core.approval_decide(approval_id=approval_id, decision=decision, chat_id=int(chat_id))
+        if ok:
+            # Remove the keyboard to prevent double-clicks.
+            try:
+                await _tg_call(lambda: q.edit_message_reply_markup(reply_markup=None), timeout_s=15.0, what="approve callback edit")
+            except Exception:
+                pass
+            await q.answer("ok")
+        else:
+            await q.answer(f"error: {msg}", show_alert=True)
+
+    async def cmd_thread(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /thread <subcmd> ...
+        subcmd: current|start|resume|list|read|archive|unarchive
+        (Replaces legacy /thread_* commands)
+        """
+        logger.info(f"cmd /thread chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        msg = update.effective_message
+        if msg is None:
+            return
+        if not context.args:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("/thread start", callback_data="thread:shortcut:start"),
+                InlineKeyboardButton("/thread list", callback_data="thread:shortcut:list"),
+                InlineKeyboardButton("/thread current", callback_data="thread:shortcut:current"),
+            ]])
+            await _tg_call(
+                lambda: msg.reply_text(
+                    "usage: /thread <current|start|resume|list|read|archive|unarchive> ...\n\n"
+                    "快捷按钮：",
+                    reply_markup=kb,
+                ),
+                timeout_s=15.0,
+                what="/thread reply",
+            )
+            return
+        sub = str(context.args[0] or "").strip().lower()
+        rest = list(context.args[1:])
+        # Reuse existing implementations by temporarily rewriting context.args.
+        orig_args = context.args
+        context.args = rest
+        try:
+            if sub == "current":
+                await self.cmd_thread_current(update, context)
+            elif sub == "start":
+                await self.cmd_thread_start(update, context)
+            elif sub == "resume":
+                await self.cmd_thread_resume(update, context)
+            elif sub == "list":
+                await self.cmd_thread_list(update, context)
+            elif sub == "read":
+                await self.cmd_thread_read(update, context)
+            elif sub == "archive":
+                await self.cmd_thread_archive(update, context)
+            elif sub == "unarchive":
+                await self.cmd_thread_unarchive(update, context)
+            else:
+                await _tg_call(lambda: update.message.reply_text("usage: /thread <current|start|resume|list|read|archive|unarchive> ..."), timeout_s=15.0, what="/thread reply")
+        finally:
+            context.args = orig_args
+
+    async def on_thread_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        if not self._is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        data = str(q.data or "")
+        if not data.startswith("thread:shortcut:"):
+            return
+        action = data.split(":", 2)[2].strip()
+        # Reuse the same command implementations, but for callback queries we need
+        # to rely on update.effective_message (handled in _require_proxy_online now).
+        orig_args = context.args
+        context.args = []
+        try:
+            if action == "current":
+                await self.cmd_thread_current(update, context)
+            elif action == "list":
+                await self.cmd_thread_list(update, context)
+            elif action == "start":
+                # Preset per your request.
+                context.args = [
+                    "sandbox=danger-full-access",
+                    "approvalPolicy=onRequest",
+                    "personality=pragmatic",
+                ]
+                await self.cmd_thread_start(update, context)
+            else:
+                await q.answer("bad action", show_alert=True)
+                return
+        finally:
+            context.args = orig_args
+        await q.answer("ok")
+
+    async def cmd_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /config <subcmd> ...
+        subcmd: read|write
+        (Replaces legacy /config_read and /config_value_write)
+        """
+        logger.info(f"cmd /config chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not context.args:
+            await _tg_call(lambda: update.message.reply_text("usage: /config read ... | /config write keyPath=<...> value=<json> ..."), timeout_s=15.0, what="/config reply")
+            return
+        sub = str(context.args[0] or "").strip().lower()
+        rest = list(context.args[1:])
+        orig_args = context.args
+        context.args = rest
+        try:
+            if sub == "read":
+                await self.cmd_config_read(update, context)
+            elif sub == "write":
+                await self.cmd_config_value_write(update, context)
+            else:
+                await _tg_call(lambda: update.message.reply_text("usage: /config read ... | /config write keyPath=<...> value=<json> ..."), timeout_s=15.0, what="/config reply")
+        finally:
+            context.args = orig_args
+
+    async def cmd_skills(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /skills <subcmd> ...
+        subcmd: list
+        (Replaces legacy /skills_list)
+        """
+        logger.info(f"cmd /skills chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not context.args:
+            await _tg_call(lambda: update.message.reply_text("usage: /skills list [cwds=/a,/b] [forceReload=true|false]"), timeout_s=15.0, what="/skills reply")
+            return
+        sub = str(context.args[0] or "").strip().lower()
+        rest = list(context.args[1:])
+        orig_args = context.args
+        context.args = rest
+        try:
+            if sub == "list":
+                await self.cmd_skills_list(update, context)
+            else:
+                await _tg_call(lambda: update.message.reply_text("usage: /skills list [cwds=/a,/b] [forceReload=true|false]"), timeout_s=15.0, what="/skills reply")
+        finally:
+            context.args = orig_args
+
+    async def cmd_collaborationmode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /collaborationmode <subcmd> ...
+        subcmd: list
+        (Replaces legacy /collaborationmode_list)
+        """
+        logger.info(f"cmd /collaborationmode chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        if not update.message:
+            return
+        if not context.args:
+            await _tg_call(lambda: update.message.reply_text("usage: /collaborationmode list"), timeout_s=15.0, what="/collaborationmode reply")
+            return
+        sub = str(context.args[0] or "").strip().lower()
+        rest = list(context.args[1:])
+        orig_args = context.args
+        context.args = rest
+        try:
+            if sub == "list":
+                await self.cmd_collaborationmode_list(update, context)
+            else:
+                await _tg_call(lambda: update.message.reply_text("usage: /collaborationmode list"), timeout_s=15.0, what="/collaborationmode reply")
+        finally:
+            context.args = orig_args
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Telegram common entrypoint.
         await self.cmd_help(update, context)
 
     async def _require_proxy_online(self, update: Update) -> str | None:
-        if not update.message:
+        msg = update.effective_message
+        if msg is None:
             return None
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use <id> 选择一台机器"), timeout_s=15.0, what="require proxy")
+            await _tg_call(lambda: msg.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="require proxy")
             return None
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /proxy_list)"), timeout_s=15.0, what="require proxy")
+            await _tg_call(lambda: msg.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="require proxy")
             return None
         return proxy_id
 
     async def cmd_thread_current(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_current chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        msg = update.effective_message
+        if msg is None:
+            return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_current reply")
+            await _tg_call(lambda: msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_current reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
             return
         sk = _session_key(update)
         tid = self._get_current_thread_id(sk, proxy_id)
-        await _tg_call(update.message.reply_text(f"threadId: {tid or '(none)'}"), timeout_s=15.0, what="/thread_current reply")
+        await _tg_call(lambda: msg.reply_text(f"threadId: {tid or '(none)'}"), timeout_s=15.0, what="/thread_current reply")
 
     async def cmd_thread_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_start chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not update.message:
+        msg = update.effective_message
+        if msg is None:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_start reply")
+            await _tg_call(lambda: msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_start reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -1910,28 +2491,28 @@ class ManagerApp:
                 params["model"] = default_model
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_start reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_start reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_start reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_start reply")
             return
         result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
         thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
         thread_id = str(thread.get("id") or "")
         if not thread_id:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="/thread_start reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="/thread_start reply")
             return
         self._set_current_thread_id(sk, proxy_id, thread_id)
         save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_start reply")
+        await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_start reply")
 
     async def cmd_thread_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_resume chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_resume reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -1939,27 +2520,28 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_resume <id>"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /thread_resume <id>"), timeout_s=15.0, what="/thread_resume reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_resume reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/resume", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_resume reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_resume reply")
             return
         sk = _session_key(update)
         self._set_current_thread_id(sk, proxy_id, thread_id)
         save_sessions(self.sessions)
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_resume reply")
+        await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_resume reply")
 
     async def cmd_thread_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
-        if not update.message:
+        msg = update.effective_message
+        if msg is None:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_list reply")
+            await _tg_call(lambda: msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_list reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -1981,11 +2563,11 @@ class ManagerApp:
                 params[k] = v
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_list reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_list reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/list", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_list reply")
+            await _tg_call(lambda: msg.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_list reply")
             return
         result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
         data = result.get("data") if isinstance(result.get("data"), list) else []
@@ -2000,14 +2582,14 @@ class ManagerApp:
             lines.append(f"{i}. {tid} [{stype}] {preview[:80]}")
         if result.get("nextCursor"):
             lines.append(f"nextCursor: {result.get('nextCursor')}")
-        await _tg_call(update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/thread_list reply")
+        await _tg_call(lambda: msg.reply_text("\n".join(lines)), timeout_s=15.0, what="/thread_list reply")
 
     async def cmd_thread_read(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_read chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_read reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2015,25 +2597,25 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_read <id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /thread_read <id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
             return
         include_turns = str(kv.get("includeTurns") or "false").lower() in ("1", "true", "yes", "y", "on")
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_read reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/read", {"threadId": thread_id, "includeTurns": include_turns}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_read reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_read reply")
             return
-        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/thread_read reply")
+        await _tg_call(lambda: update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/thread_read reply")
 
     async def cmd_thread_archive(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_archive chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_archive reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_archive reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2044,24 +2626,24 @@ class ManagerApp:
             sk = _session_key(update)
             thread_id = self._get_current_thread_id(sk, proxy_id)
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_archive threadId=<id> (or set current thread first)"), timeout_s=15.0, what="/thread_archive reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /thread_archive threadId=<id> (or set current thread first)"), timeout_s=15.0, what="/thread_archive reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_archive reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_archive reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/archive", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_archive reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_archive reply")
             return
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok archived threadId={thread_id}"), timeout_s=15.0, what="/thread_archive reply")
+        await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] ok archived threadId={thread_id}"), timeout_s=15.0, what="/thread_archive reply")
 
     async def cmd_thread_unarchive(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /thread_unarchive chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/thread_unarchive reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2069,24 +2651,24 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
         if not thread_id:
-            await _tg_call(update.message.reply_text("usage: /thread_unarchive <id>"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /thread_unarchive <id>"), timeout_s=15.0, what="/thread_unarchive reply")
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/thread_unarchive reply")
             return
         rep = await core.appserver_call(proxy_id, "thread/unarchive", {"threadId": thread_id}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_unarchive reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_unarchive reply")
             return
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok unarchived threadId={thread_id}"), timeout_s=15.0, what="/thread_unarchive reply")
+        await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] ok unarchived threadId={thread_id}"), timeout_s=15.0, what="/thread_unarchive reply")
 
     async def cmd_skills_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /skills_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/skills_list reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/skills_list reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2099,20 +2681,20 @@ class ManagerApp:
             params["forceReload"] = str(kv["forceReload"]).lower() in ("1", "true", "yes", "y", "on")
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/skills_list reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/skills_list reply")
             return
         rep = await core.appserver_call(proxy_id, "skills/list", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/skills_list reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/skills_list reply")
             return
-        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/skills_list reply")
+        await _tg_call(lambda: update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/skills_list reply")
 
     async def cmd_config_read(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /config_read chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_read reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_read reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2123,20 +2705,20 @@ class ManagerApp:
             params["includeLayers"] = str(kv["includeLayers"]).lower() in ("1", "true", "yes", "y", "on")
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_read reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_read reply")
             return
         rep = await core.appserver_call(proxy_id, "config/read", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_read reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_read reply")
             return
-        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/config_read reply")
+        await _tg_call(lambda: update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/config_read reply")
 
     async def cmd_config_value_write(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /config_value_write chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/config_value_write reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
@@ -2144,45 +2726,45 @@ class ManagerApp:
         kv = self._parse_kv(context.args or [])
         key_path = (kv.get("keyPath") or "").strip()
         if not key_path or "value" not in kv:
-            await _tg_call(update.message.reply_text("usage: /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text("usage: /config_value_write keyPath=<...> value=<json> [mergeStrategy=replace|upsert]"), timeout_s=15.0, what="/config_value_write reply")
             return
         try:
             value_obj = json.loads(kv["value"])
         except Exception as e:
-            await _tg_call(update.message.reply_text(f"bad value json: {type(e).__name__}: {e}"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text(f"bad value json: {type(e).__name__}: {e}"), timeout_s=15.0, what="/config_value_write reply")
             return
         params: JsonDict = {"keyPath": key_path, "value": value_obj}
         if "mergeStrategy" in kv:
             params["mergeStrategy"] = kv["mergeStrategy"]
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/config_value_write reply")
             return
         rep = await core.appserver_call(proxy_id, "config/value/write", params, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_value_write reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/config_value_write reply")
             return
-        await _tg_call(update.message.reply_text(f"[{proxy_id}] ok"), timeout_s=15.0, what="/config_value_write reply")
+        await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] ok"), timeout_s=15.0, what="/config_value_write reply")
 
     async def cmd_collaborationmode_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"cmd /collaborationmode_list chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="/collaborationmode_list reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/collaborationmode_list reply")
             return
         proxy_id = await self._require_proxy_online(update)
         if not proxy_id:
             return
         core: ManagerCore | None = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/collaborationmode_list reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="/collaborationmode_list reply")
             return
         rep = await core.appserver_call(proxy_id, "collaborationMode/list", {}, timeout_s=min(60.0, self.task_timeout_s))
         if not bool(rep.get("ok")):
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/collaborationmode_list reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/collaborationmode_list reply")
             return
-        await _tg_call(update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/collaborationmode_list reply")
+        await _tg_call(lambda: update.message.reply_text(self._pretty_json(rep.get("result"))), timeout_s=15.0, what="/collaborationmode_list reply")
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         trace_id = uuid.uuid4().hex
@@ -2191,7 +2773,7 @@ class ManagerApp:
         text_len = len(update.message.text) if update.message and update.message.text else 0
         logger.info(f"op=tg.update trace_id={trace_id} chat_id={chat_id} user_id={user_id} text_len={text_len}")
         if not self._is_allowed(update):
-            await _tg_call(update.message.reply_text("unauthorized"), timeout_s=15.0, what="msg reply")
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="msg reply")
             return
         if not update.message or not isinstance(update.message.text, str):
             return
@@ -2199,17 +2781,17 @@ class ManagerApp:
         sk = _session_key(update)
         proxy_id = self._get_selected_proxy(sk)
         if not proxy_id:
-            await _tg_call(update.message.reply_text("请先 /proxy_list 查看在线代理，然后 /proxy_use <id> 选择一台机器"), timeout_s=15.0, what="msg reply")
+            await _tg_call(lambda: update.message.reply_text("请先 /node 选择一台机器"), timeout_s=15.0, what="msg reply")
             return
         if not self.registry.is_online(proxy_id):
-            await _tg_call(update.message.reply_text(f"proxy offline: {proxy_id} (use /proxy_list)"), timeout_s=15.0, what="msg reply")
+            await _tg_call(lambda: update.message.reply_text(f"node offline: {proxy_id} (use /node)"), timeout_s=15.0, what="msg reply")
             return
 
         task_id = uuid.uuid4().hex
         thread_id = self._get_current_thread_id(sk, proxy_id)
         core = context.application.bot_data.get("core")
         if core is None:
-            await _tg_call(update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="msg reply")
+            await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: manager core missing"), timeout_s=15.0, what="msg reply")
             return
         if not thread_id:
             # Auto-create a thread on first message for this (chat, proxy).
@@ -2219,20 +2801,20 @@ class ManagerApp:
                 params["model"] = default_model
             rep = await core.appserver_call(proxy_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
             if not bool(rep.get("ok")):
-                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start failed: {rep.get('error')}"), timeout_s=15.0, what="msg reply")
+                await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: thread/start failed: {rep.get('error')}"), timeout_s=15.0, what="msg reply")
                 return
             result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
             thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
             thread_id = str(thread.get("id") or "")
             if not thread_id:
-                await _tg_call(update.message.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="msg reply")
+                await _tg_call(lambda: update.message.reply_text(f"[{proxy_id}] error: thread/start missing id"), timeout_s=15.0, what="msg reply")
                 return
             self._set_current_thread_id(sk, proxy_id, thread_id)
             save_sessions(self.sessions)
 
         prompt = update.message.text
         placeholder = await _tg_call(
-            update.message.reply_text(f"working (proxy={proxy_id}, threadId={thread_id[-8:]}) ..."),
+            lambda: update.message.reply_text(f"working (node={proxy_id}, threadId={thread_id[-8:]}) ..."),
             timeout_s=15.0,
             what="placeholder",
         )
@@ -2252,6 +2834,8 @@ class ManagerApp:
         session_model = self._get_default_model(sk)
         if session_model:
             task_msg["model"] = session_model
+        # Default to medium.
+        task_msg["effort"] = self._get_default_effort(sk)
 
         # Event-driven: send immediately, do not await result here.
         if chat_id is None:
@@ -2317,6 +2901,15 @@ def main() -> int:
         if not startup_notify_chat_ids and allowed_users:
             startup_notify_chat_ids = sorted(allowed_users)
 
+    node_notify_env = os.environ.get("TELEGRAM_NODE_NOTIFY_CHAT_IDS", "").strip()
+    node_notify_min_interval_s = float(os.environ.get("TELEGRAM_NODE_NOTIFY_MIN_INTERVAL_S", "60") or "60")
+    node_notify_chat_ids: list[int] = []
+    if node_notify_env:
+        node_notify_chat_ids = _parse_int_list_env(node_notify_env)
+    else:
+        # Default: follow startup notifications (usually same private chat ids).
+        node_notify_chat_ids = list(startup_notify_chat_ids)
+
     git_sha = _read_git_short_sha(BASE_DIR)
 
     proxies_cfg = cfg.get("proxies") if isinstance(cfg.get("proxies"), dict) else {}
@@ -2329,17 +2922,34 @@ def main() -> int:
             token = str(entry.get("token") or "")
         elif isinstance(entry, str):
             token = entry
-        if token:
-            allowed_proxies[pid.strip()] = token
+        # Keep even empty tokens: empty means "id allowlisted but token not enforced".
+        allowed_proxies[pid.strip()] = token.strip()
+
+    # Optional: allowlist via env without managing tokens.
+    allow_ids_env = os.environ.get("CODEX_ALLOWED_PROXIES", "").strip()
+    if allow_ids_env:
+        for pid in sorted(_parse_csv_set(allow_ids_env)):
+            allowed_proxies.setdefault(pid, "")
+
+    enforce_allowlist = bool(int(os.environ.get("CODEX_ENFORCE_PROXY_ALLOWLIST", "0") or "0"))
 
     if not allowed_proxies:
         logger.warning("No proxies allowlist configured; accepting ANY proxy registration (dev mode).")
+    elif enforce_allowlist:
+        logger.info(f"Proxy allowlist enforced: {sorted(allowed_proxies.keys())}")
+    else:
+        logger.warning("Proxy allowlist present but NOT enforced (dev mode). Set CODEX_ENFORCE_PROXY_ALLOWLIST=1 to enforce.")
 
-    registry = ProxyRegistry(allowed=allowed_proxies)
+    registry = ProxyRegistry(allowed=allowed_proxies, enforce_allowlist=enforce_allowlist)
     sessions = load_sessions()
 
     async def runner():
-        core = ManagerCore(registry, task_timeout_s=args.timeout)
+        core = ManagerCore(
+            registry,
+            task_timeout_s=args.timeout,
+            node_notify_chat_ids=node_notify_chat_ids,
+            node_notify_min_interval_s=node_notify_min_interval_s,
+        )
         ws_task = asyncio.create_task(run_ws_server(args.ws_listen, registry, core), name="ws_server")
         ctl_task: asyncio.Task | None = None
         if args.control_listen:
@@ -2357,6 +2967,15 @@ def main() -> int:
                 loop.add_signal_handler(sig, _stop)
             except NotImplementedError:
                 pass
+
+        # Debug aid: dump stack traces on SIGUSR1 to diagnose hangs in the field.
+        # Usage: kill -USR1 <pid> (see journalctl for the dump)
+        try:
+            faulthandler.enable()
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
+            logger.info("faulthandler enabled (SIGUSR1 dumps stacks)")
+        except Exception as e:
+            logger.warning(f"faulthandler setup failed: {type(e).__name__}: {e}")
 
         if args.dispatch_proxy:
             # WS-only probe mode: wait for proxy then dispatch once and exit.
@@ -2397,60 +3016,91 @@ def main() -> int:
                 tg = None
                 try:
                     # Telegram 代理策略：
-                    # - 优先使用显式配置：TELEGRAM_PROXY 或 manager_config.json 的 telegram_proxy
-                    # - 若未显式配置，则继承系统 HTTP(S)_PROXY（trust_env=true）
-                    proxy = (os.environ.get("TELEGRAM_PROXY") or str(cfg.get("telegram_proxy") or cfg.get("telegram_http_proxy") or "")).strip() or None
-                    trust_env = proxy is None
-                    req = HTTPXRequest(
-                        connect_timeout=20.0,
-                        read_timeout=60.0,
+                    # - 只使用系统环境变量 HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+                    # - 不再读取 TELEGRAM_PROXY / manager_config.json 里的 telegram_proxy（避免多处配置互相打架）
+                    proxy = None
+                    trust_env = True
+                    logger.info("Telegram http: proxy=<env> trust_env=true")
+                    # PTB long-polling (getUpdates) can occupy connections for a long time.
+                    # If we share the same httpx pool for both getUpdates and send/edit calls,
+                    # we can hit:
+                    #   "Pool timeout: All connections in the connection pool are occupied."
+                    # Fix: use dedicated request clients for:
+                    # - API calls (send/edit/delete webhook)
+                    # - getUpdates long-polling
+                    req_api = HTTPXRequest(
+                        connection_pool_size=64,
+                        # connect timeout should be short; retries handle transient proxy issues.
+                        connect_timeout=10.0,
+                        read_timeout=120.0,
                         write_timeout=60.0,
-                        pool_timeout=20.0,
+                        pool_timeout=180.0,
                         proxy=proxy,
                         httpx_kwargs={"trust_env": trust_env},
                     )
-                    tg = Application.builder().token(bot_token).request(req).build()
+                    req_updates = HTTPXRequest(
+                        connection_pool_size=32,
+                        connect_timeout=10.0,
+                        # getUpdates is long-polling. read_timeout must be > polling timeout.
+                        read_timeout=180.0,
+                        write_timeout=60.0,
+                        pool_timeout=180.0,
+                        proxy=proxy,
+                        httpx_kwargs={"trust_env": trust_env},
+                    )
+                    tg = (
+                        Application.builder()
+                        .token(bot_token)
+                        .request(req_api)
+                        .get_updates_request(req_updates)
+                        .build()
+                    )
                     tg.bot_data["core"] = core
                     tg.add_handler(CommandHandler("help", app.cmd_help))
                     tg.add_handler(CommandHandler("start", app.cmd_start))
                     tg.add_handler(CommandHandler("ping", app.cmd_ping))
                     tg.add_handler(CommandHandler("approve", app.cmd_approve))
-                    tg.add_handler(CommandHandler("approve_session", app.cmd_approve_session))
                     tg.add_handler(CommandHandler("decline", app.cmd_decline))
-                    # Back-compat aliases.
-                    tg.add_handler(CommandHandler("servers", app.cmd_proxy_list))
-                    tg.add_handler(CommandHandler("use", app.cmd_proxy_use))
-                    tg.add_handler(CommandHandler("proxy_list", app.cmd_proxy_list))
-                    tg.add_handler(CommandHandler("proxy_use", app.cmd_proxy_use))
-                    tg.add_handler(CommandHandler("proxy_current", app.cmd_proxy_current))
+                    tg.add_handler(CallbackQueryHandler(app.on_approve_callback, pattern=r"^approve:"))
+                    tg.add_handler(CommandHandler("node", app.cmd_node))
+                    tg.add_handler(CallbackQueryHandler(app.on_node_callback, pattern=r"^node:"))
                     tg.add_handler(CommandHandler("status", app.cmd_status))
                     tg.add_handler(CommandHandler("model", app.cmd_model))
                     tg.add_handler(CallbackQueryHandler(app.on_model_callback, pattern=r"^model:"))
-                    tg.add_handler(CommandHandler("result_mode", app.cmd_result_mode))
-                    tg.add_handler(CommandHandler("thread_current", app.cmd_thread_current))
-                    tg.add_handler(CommandHandler("thread_start", app.cmd_thread_start))
-                    tg.add_handler(CommandHandler("thread_resume", app.cmd_thread_resume))
-                    tg.add_handler(CommandHandler("thread_list", app.cmd_thread_list))
-                    tg.add_handler(CommandHandler("thread_read", app.cmd_thread_read))
-                    tg.add_handler(CommandHandler("thread_archive", app.cmd_thread_archive))
-                    tg.add_handler(CommandHandler("thread_unarchive", app.cmd_thread_unarchive))
-                    tg.add_handler(CommandHandler("skills_list", app.cmd_skills_list))
-                    tg.add_handler(CommandHandler("config_read", app.cmd_config_read))
-                    tg.add_handler(CommandHandler("config_value_write", app.cmd_config_value_write))
-                    tg.add_handler(CommandHandler("collaborationmode_list", app.cmd_collaborationmode_list))
+                    tg.add_handler(CallbackQueryHandler(app.on_effort_callback, pattern=r"^effort:"))
+                    tg.add_handler(CommandHandler("result", app.cmd_result))
+                    tg.add_handler(CommandHandler("thread", app.cmd_thread))
+                    tg.add_handler(CallbackQueryHandler(app.on_thread_callback, pattern=r"^thread:"))
+                    tg.add_handler(CommandHandler("skills", app.cmd_skills))
+                    tg.add_handler(CommandHandler("config", app.cmd_config))
+                    tg.add_handler(CommandHandler("collaborationmode", app.cmd_collaborationmode))
                     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app.on_text))
-                    tg.add_error_handler(lambda _u, c: logger.warning(f"telegram handler error: {c.error!r}"), block=False)
+                    async def _on_tg_error(_update: object, context: object) -> None:
+                        err = getattr(context, "error", None)
+                        logger.warning(f"telegram handler error: {err!r}")
 
-                    await tg.initialize()
+                    tg.add_error_handler(_on_tg_error, block=False)
+
+                    logger.info("Telegram init: begin")
+                    await asyncio.wait_for(tg.initialize(), timeout=30.0)
+                    logger.info("Telegram init: ok")
                     # Ensure we're in polling mode. If a webhook is set, getUpdates won't deliver anything.
                     try:
-                        await tg.bot.delete_webhook(drop_pending_updates=False)
+                        logger.info("Telegram delete_webhook: begin")
+                        await asyncio.wait_for(tg.bot.delete_webhook(drop_pending_updates=False), timeout=20.0)
+                        logger.info("Telegram delete_webhook: ok")
                     except Exception as e:
                         logger.warning(f"delete_webhook failed: {type(e).__name__}: {e}")
-                    await tg.start()
+                    logger.info("Telegram start: begin")
+                    await asyncio.wait_for(tg.start(), timeout=30.0)
+                    logger.info("Telegram start: ok")
                     core.set_outbox(TelegramOutbox(tg.bot))
                     assert tg.updater is not None
-                    await tg.updater.start_polling()
+                    logger.info("Telegram polling: begin")
+                    await asyncio.wait_for(
+                        tg.updater.start_polling(drop_pending_updates=False, timeout=60, allowed_updates=Update.ALL_TYPES),
+                        timeout=30.0,
+                    )
                     logger.info("Telegram polling started")
                     if startup_notify_chat_ids:
                         online = registry.online_proxy_ids()
@@ -2463,12 +3113,48 @@ def main() -> int:
                         text_lines.append(f"ws_listen: {args.ws_listen}")
                         if args.control_listen:
                             text_lines.append(f"control_listen: {args.control_listen}")
-                        text_lines.append(f"proxies_online: {', '.join(online) if online else '(none)'}")
-                        text_lines.append("tips: /help, /proxy_list, /proxy_use <id>, /status, /model")
+                        text_lines.append(f"nodes_online: {', '.join(online) if online else '(none)'}")
+                        text_lines.append("tips: /help, /node, /status, /model")
+
+                        # Startup helper: show a ready-to-copy node_config.json template.
+                        # This is best-effort because ws_listen may be 0.0.0.0 and the real reachable
+                        # address might be a public IP / VPN IP.
+                        public_ws = (os.environ.get("CODEX_MANAGER_PUBLIC_WS") or str(cfg.get("public_manager_ws") or "")).strip()
+                        if not public_ws:
+                            guessed_ip = ""
+                            try:
+                                guessed_ip = socket.gethostbyname(socket.gethostname())
+                            except Exception:
+                                guessed_ip = ""
+                            port = str(args.ws_listen).rsplit(":", 1)[-1]
+                            public_ws = f"ws://{guessed_ip or '<MANAGER_IP>'}:{port}"
+
+                        shared_token = (os.environ.get("AGENT_NODE_TOKEN") or str(cfg.get("agent_node_token") or "")).strip()
+                        if not shared_token:
+                            shared_token = "<NODE_TOKEN>"
+
+                        node_tpl = {
+                            "manager_ws": public_ws,
+                            "node_id": "<node_id>",
+                            "node_token": shared_token,
+                            "max_pending": 10,
+                            "sandbox": "dangerFullAccess",
+                            "approval_policy": "onRequest",
+                            "codex_cwd": "/root/telegram-bot",
+                            "codex_bin": "codex",
+                            "http_proxy": "http://127.0.0.1:8080",
+                            "https_proxy": "http://127.0.0.1:8080",
+                            "no_proxy": "localhost,127.0.0.1,::1",
+                        }
+                        text_lines.append("")
+                        text_lines.append("node_config.json 模板（复制到 node 机器的 /root/telegram-bot/node_config.json）：")
+                        text_lines.append("```json")
+                        text_lines.append(json.dumps(node_tpl, ensure_ascii=False, indent=2))
+                        text_lines.append("```")
                         msg_text = "\n".join(text_lines)
                         for chat_id in startup_notify_chat_ids:
                             try:
-                                await _tg_call(tg.bot.send_message(chat_id=chat_id, text=msg_text), timeout_s=15.0, what="startup_notify")
+                                await _tg_call(lambda: tg.bot.send_message(chat_id=chat_id, text=msg_text), timeout_s=15.0, what="startup_notify")
                                 logger.info(f"op=startup_notify ok=true chat_id={chat_id}")
                             except Exception as e:
                                 logger.warning(f"op=startup_notify ok=false chat_id={chat_id} error={type(e).__name__}: {e}")
@@ -2477,22 +3163,28 @@ def main() -> int:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning(f"Telegram start failed: {type(e).__name__}: {e} (retry in {backoff_s:.1f}s)")
+                    # Avoid leaking Telegram bot token in logs. python-telegram-bot may include the token
+                    # in InvalidToken error messages.
+                    msg = f"{type(e).__name__}: {e}"
+                    if "InvalidToken" in msg and "The token" in msg:
+                        # Example: "InvalidToken: The token `123:ABC...` was rejected by the server."
+                        msg = re.sub(r"(The token\s+)(`[^`]+`|'[^']+'|\S+)(\s+was rejected)", r"\1<redacted>\3", msg)
+                    logger.warning(f"Telegram start failed: {msg} (retry in {backoff_s:.1f}s)")
                     await asyncio.sleep(backoff_s)
                     backoff_s = min(30.0, backoff_s * 1.7)
                 finally:
                     if tg is not None:
                         try:
                             if tg.updater is not None:
-                                await tg.updater.stop()
+                                await asyncio.wait_for(tg.updater.stop(), timeout=5.0)
                         except Exception:
                             pass
                         try:
-                            await tg.stop()
+                            await asyncio.wait_for(tg.stop(), timeout=5.0)
                         except Exception:
                             pass
                         try:
-                            await tg.shutdown()
+                            await asyncio.wait_for(tg.shutdown(), timeout=5.0)
                         except Exception:
                             pass
 

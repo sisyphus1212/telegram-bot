@@ -1,0 +1,260 @@
+---
+# 部署目标：一台机器同时跑 manager + 多实例 node（agent-manager.service + agent-node@.service）
+# 约定：
+# - 代码目录固定为 /root/telegram-bot
+# - 使用 systemd 管理服务
+# - 本 playbook 不管理代理连通性（不碰 v2ray / 不做外网 smoke test）
+# - 代理变量（HTTP_PROXY/HTTPS_PROXY/NO_PROXY）由你在目标机登录后的 shell 环境提供，然后同步到 systemd env 文件
+#
+# 用法示例：
+# ansible-playbook -i /root/opencode/.opencode/config/inventory -l 54.168.243.68 ansible/deploy_cloud_huang.yml \
+#   -e telegram_bot_token='...'
+#
+# 可选变量：
+# - repo_ref: 默认 refactor/node-naming
+# - manager_ws_listen: 默认 0.0.0.0:8765
+# - node_ids: 默认 ["cloud_huang_1","cloud_huang_2"]
+
+- name: Deploy Codex manager+multi-node to cloud_huang
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    repo_url: "https://github.com/sisyphus1212/telegram-bot.git"
+    repo_ref: "refactor/node-naming"
+    deploy_dir: "/root/telegram-bot"
+    # If true, deploy from *this* local working tree instead of git checkout on remote.
+    # Usage:
+    #   ansible-playbook -i ~/ansible/inventory -l cloud_huang ansible/deploy_cloud_huang.yml -e deploy_from_local=true
+    deploy_from_local: false
+    # Whether to manage TELEGRAM_BOT_TOKEN in /etc/agent-manager.env.
+    # Recommended:
+    # - First bring-up: manage_telegram_token=true -e telegram_bot_token='123:ABC...'
+    # - Subsequent deploys: manage_telegram_token=false (do not touch token)
+    manage_telegram_token: false
+    manager_ws_listen: "0.0.0.0:8765"
+    manager_control_listen: "127.0.0.1:18766"
+    manager_control_token: "devtoken"
+    # Empty means "allow everyone" (dangerous on public bots; use only temporarily).
+    telegram_allowed_user_ids: ""
+    telegram_startup_notify_chat_ids: "5974809970"
+
+    node_ids:
+      - "cloud_huang_1"
+      - "cloud_huang_2"
+    # Extra proxy/node ids allowed to register to manager (e.g. your local node id).
+    extra_allowed_proxy_ids: []
+    enforce_proxy_allowlist: true
+
+    # NOTE: 代理变量不在这里写死（目标机 .bashrc 里已有 export）。
+    # systemd 不读取 ~/.bashrc，因此部署完成后需要在目标机登录后执行：
+    #   sudo -E /root/telegram-bot/scripts/sync_proxy_to_agent_env.sh
+    #   CODEX_AGENT_MANAGER_ENV_FILE=/etc/agent-node.env sudo -E /root/telegram-bot/scripts/sync_proxy_to_agent_env.sh
+    #   sudo systemctl restart agent-manager.service agent-node@1.service agent-node@2.service
+
+  tasks:
+    - name: Normalize extra_allowed_proxy_ids to list
+      ansible.builtin.set_fact:
+        extra_allowed_proxy_ids_list: >-
+          {{
+            extra_allowed_proxy_ids
+            if (extra_allowed_proxy_ids is sequence and (extra_allowed_proxy_ids is not string))
+            else (
+              (extra_allowed_proxy_ids | string).split(',')
+              if (extra_allowed_proxy_ids | default('') | string | length) > 0
+              else []
+            )
+          }}
+
+    - name: Assert telegram_bot_token is provided (avoid writing placeholders)
+      ansible.builtin.assert:
+        that:
+          - telegram_bot_token is defined
+          - (telegram_bot_token | string | length) > 10
+          - "'${' not in (telegram_bot_token | string)"
+        fail_msg: >
+          telegram_bot_token is missing or looks like a shell placeholder.
+          Pass it explicitly: -e telegram_bot_token='123:ABC...'
+      when: manage_telegram_token | bool
+
+    - name: Ensure base packages
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - git
+          - python3
+          - python3-venv
+          - python3-pip
+          - curl
+        state: present
+
+    - name: Check codex binary exists
+      ansible.builtin.shell: |
+        set -e
+        command -v codex
+        codex --version || true
+      register: codex_check
+      changed_when: false
+
+    - name: Build local source tarball
+      ansible.builtin.shell: |
+        set -euo pipefail
+        src="{{ playbook_dir }}/.."
+        tar -C "$src" -czf /tmp/telegram-bot-src.tgz \
+          --exclude .git \
+          --exclude .venv \
+          --exclude __pycache__ \
+          --exclude log \
+          --exclude sessions.json \
+          --exclude manager_config.json \
+          --exclude proxy_config.json \
+          .
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      run_once: true
+      become: false
+      when: deploy_from_local | bool
+
+    - name: Ensure deploy dir exists
+      ansible.builtin.file:
+        path: "{{ deploy_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Deploy from local tarball (overlay)
+      ansible.builtin.unarchive:
+        src: /tmp/telegram-bot-src.tgz
+        dest: "{{ deploy_dir }}"
+        remote_src: false
+      when: deploy_from_local | bool
+
+    - name: Git checkout repo (remote)
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ deploy_dir }}"
+        version: "{{ repo_ref }}"
+        force: true
+      when: not (deploy_from_local | bool)
+
+    - name: Install Python deps (venv)
+      ansible.builtin.shell: |
+        set -e
+        cd "{{ deploy_dir }}"
+        ./scripts/install.sh
+      args:
+        executable: /bin/bash
+
+    - name: Ensure /etc/agent-manager.env exists (do not overwrite proxy keys)
+      ansible.builtin.file:
+        path: /etc/agent-manager.env
+        state: touch
+        mode: "0600"
+
+    - name: Remove unmanaged TELEGRAM_ALLOWED_USER_IDS lines (avoid duplicates overriding managed block)
+      ansible.builtin.lineinfile:
+        path: /etc/agent-manager.env
+        regexp: '^[[:space:]]*TELEGRAM_ALLOWED_USER_IDS='
+        state: absent
+
+    - name: Manage manager vars block in /etc/agent-manager.env (proxy handled separately)
+      ansible.builtin.blockinfile:
+        path: /etc/agent-manager.env
+        marker: "# {mark} CODEX_MANAGER"
+        block: |
+          {% if manage_telegram_token | bool %}
+          TELEGRAM_BOT_TOKEN={{ telegram_bot_token }}
+          {% endif %}
+          TELEGRAM_ALLOWED_USER_IDS={{ telegram_allowed_user_ids }}
+          TELEGRAM_STARTUP_NOTIFY_CHAT_IDS={{ telegram_startup_notify_chat_ids }}
+          CODEX_MANAGER_WS_LISTEN={{ manager_ws_listen }}
+          CODEX_DEFAULT_PROXY={{ node_ids[0] }}
+          CODEX_TASK_TIMEOUT=120
+          CODEX_MANAGER_CONTROL_LISTEN={{ manager_control_listen }}
+          CODEX_MANAGER_CONTROL_TOKEN={{ manager_control_token }}
+          CODEX_ALLOWED_PROXIES={{ (node_ids + extra_allowed_proxy_ids_list) | join(',') }}
+          CODEX_ENFORCE_PROXY_ALLOWLIST={{ 1 if (enforce_proxy_allowlist | bool) else 0 }}
+
+    - name: Ensure /etc/agent-node.env exists (optional proxy for agent-node@.service)
+      ansible.builtin.file:
+        path: /etc/agent-node.env
+        state: touch
+        mode: "0600"
+
+    - name: Seed /etc/agent-node.env from /etc/agent-manager.env (proxy only, if missing)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if [ ! -f /etc/agent-node.env ] || ! grep -q '^[[:space:]]*HTTP_PROXY=' /etc/agent-node.env; then
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          if [ -f /etc/agent-manager.env ]; then
+            awk -F= '/^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)=/ {print}' /etc/agent-manager.env >"$tmp" || true
+          fi
+          if [ -s "$tmp" ]; then
+            install -m 0600 "$tmp" /etc/agent-node.env
+          fi
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Write node instance configs (node service reads node_config.<instance>.json)
+      ansible.builtin.copy:
+        dest: "{{ deploy_dir }}/node_config.{{ idx + 1 }}.json"
+        mode: "0600"
+        content: |
+          {
+            "manager_ws": "ws://127.0.0.1:8765",
+            "node_id": "{{ item }}",
+            "node_token": "",
+            "max_pending": 10,
+            "sandbox": "dangerFullAccess",
+            "approval_policy": "onRequest",
+            "codex_cwd": "{{ deploy_dir }}",
+            "codex_bin": "codex"
+          }
+      loop: "{{ node_ids }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item }}"
+
+    - name: Install systemd units
+      ansible.builtin.copy:
+        src: "{{ deploy_dir }}/systemd/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        remote_src: true
+        mode: "0644"
+      loop:
+        - agent-manager.service
+        - agent-node@.service
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Disable legacy single node service if present
+      ansible.builtin.systemd:
+        name: agent-node.service
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Enable and restart manager service
+      ansible.builtin.systemd:
+        name: agent-manager.service
+        state: restarted
+        enabled: true
+
+    - name: Enable and restart node instance services
+      ansible.builtin.systemd:
+        name: "agent-node@{{ item }}.service"
+        state: restarted
+        enabled: true
+      loop: "{{ range(1, (node_ids | length) + 1) | list }}"
+
+    - name: Show manager + node instance status
+      ansible.builtin.shell: |
+        set -e
+        systemctl --no-pager --full status agent-manager.service $(for i in $(seq 1 {{ node_ids | length }}); do echo -n "agent-node@$i.service "; done) | sed -n '1,200p'
+      changed_when: false

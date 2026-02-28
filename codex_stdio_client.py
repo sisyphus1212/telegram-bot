@@ -119,13 +119,27 @@ class CodexAppServerStdioProcess:
         if not self._proc or not self._proc.stderr:
             return
         try:
+            # asyncio StreamReader.readline() has an internal line length limit (64KiB default).
+            # app-server can emit long stderr lines; read in chunks and split manually.
+            buf = bytearray()
             while True:
-                line = await self._proc.stderr.readline()
-                if not line:
+                chunk = await self._proc.stderr.read(65536)
+                if not chunk:
+                    if buf:
+                        s = bytes(buf).decode("utf-8", errors="ignore").rstrip()
+                        if s:
+                            self._log(f"[app-server stderr] {s}")
                     break
-                s = line.decode("utf-8", errors="ignore").rstrip()
-                if s:
-                    self._log(f"[app-server stderr] {s}")
+                buf.extend(chunk)
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line = bytes(buf[:nl])
+                    del buf[: nl + 1]
+                    s = line.decode("utf-8", errors="ignore").rstrip()
+                    if s:
+                        self._log(f"[app-server stderr] {s}")
         except asyncio.CancelledError:
             return
 
@@ -262,7 +276,18 @@ class CodexAppServerStdioProcess:
                     # {"message":"Reconnecting... 1/5", "willRetry":true, ...}
                     # Treat these as progress notifications; only fail on non-retriable errors.
                     if isinstance(params, dict) and bool(params.get("willRetry")):
-                        self._log(f"[app-server] transient error (willRetry=true): {str(params)[:500]}")
+                        # Keep logs short; upstream network reconnects are common and noisy.
+                        # Note: avoid logging large nested error payloads here.
+                        msg = ""
+                        try:
+                            err = params.get("error") if isinstance(params, dict) else None
+                            if isinstance(err, dict):
+                                msg = str(err.get("message") or "")
+                            if not msg:
+                                msg = str(params.get("message") or "")
+                        except Exception:
+                            msg = ""
+                        self._log(f"[app-server] transient error (willRetry=true): {msg[:200] or 'reconnecting'}")
                         continue
                     raise CodexAppServerError(str(params))
 
@@ -317,36 +342,62 @@ class CodexAppServerStdioProcess:
     async def _reader_loop(self) -> None:
         assert self._stdout is not None
         try:
+            # asyncio StreamReader.readline() has an internal line length limit (64KiB default).
+            # app-server can emit JSONL lines larger than that (e.g. long agentMessage), which
+            # would crash the reader loop. Read in chunks and split on '\n' ourselves.
+            buf = bytearray()
+            max_line_bytes = 32 * 1024 * 1024  # guardrail against unbounded growth if newline never arrives
             while True:
-                line = await self._stdout.readline()
-                if not line:
-                    raise CodexAppServerError("app-server stdout closed")
-                s = line.decode("utf-8", errors="ignore").strip()
-                if not s:
-                    continue
-                try:
-                    msg = json.loads(s)
-                except Exception:
-                    self._log(f"[app-server] non-json line: {s[:200]}")
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                if "id" in msg and ("result" in msg or "error" in msg) and "method" not in msg:
-                    req_id = msg.get("id")
-                    if isinstance(req_id, int) and req_id in self._pending:
-                        fut = self._pending.pop(req_id)
-                        if "error" in msg and msg["error"] is not None:
-                            fut.set_exception(CodexAppServerError(str(msg["error"])))
-                        else:
-                            fut.set_result(msg.get("result") or {})
-                    continue
-                if "id" in msg and "method" in msg:
-                    asyncio.create_task(self._handle_server_request(msg))
-                    continue
-                if "method" in msg and "id" not in msg:
-                    asyncio.create_task(self._dispatch_notification(msg))
-                    await self._notifications.put(msg)
-                    continue
+                chunk = await self._stdout.read(65536)
+                if not chunk:
+                    # EOF: process any trailing partial line, then treat as closed.
+                    if buf:
+                        lines = [bytes(buf)]
+                        buf.clear()
+                    else:
+                        lines = []
+                    if not lines:
+                        raise CodexAppServerError("app-server stdout closed")
+                else:
+                    buf.extend(chunk)
+                    if len(buf) > max_line_bytes and b"\n" not in buf:
+                        raise CodexAppServerError(f"app-server stdout line exceeds {max_line_bytes} bytes (no newline)")
+                    lines = []
+                    while True:
+                        nl = buf.find(b"\n")
+                        if nl < 0:
+                            break
+                        line = bytes(buf[:nl])
+                        del buf[: nl + 1]
+                        lines.append(line)
+
+                for line in lines:
+                    s = line.decode("utf-8", errors="ignore").strip()
+                    if not s:
+                        continue
+                    try:
+                        msg = json.loads(s)
+                    except Exception:
+                        self._log(f"[app-server] non-json line: {s[:200]}")
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if "id" in msg and ("result" in msg or "error" in msg) and "method" not in msg:
+                        req_id = msg.get("id")
+                        if isinstance(req_id, int) and req_id in self._pending:
+                            fut = self._pending.pop(req_id)
+                            if "error" in msg and msg["error"] is not None:
+                                fut.set_exception(CodexAppServerError(str(msg["error"])))
+                            else:
+                                fut.set_result(msg.get("result") or {})
+                        continue
+                    if "id" in msg and "method" in msg:
+                        asyncio.create_task(self._handle_server_request(msg))
+                        continue
+                    if "method" in msg and "id" not in msg:
+                        asyncio.create_task(self._dispatch_notification(msg))
+                        await self._notifications.put(msg)
+                        continue
         except asyncio.CancelledError:
             return
         except Exception as e:

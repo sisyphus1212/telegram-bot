@@ -32,9 +32,9 @@ python codex_manager.py --ws-only
 
 ```bash
 . .venv/bin/activate
-cp proxy_config.example.json proxy_config.json
-editor proxy_config.json
-python codex_proxy.py --config proxy_config.json
+cp node_config.example.json node_config.json
+editor node_config.json
+python codex_proxy.py --config node_config.json
 ```
 
 终端 3（派发一次任务并退出）：

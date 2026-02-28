@@ -318,6 +318,16 @@ class CodexProxyAgent:
         task_id = str(msg.get("task_id") or "")
         thread_id = str(msg.get("thread_id") or "")
         prompt = str(msg.get("prompt") or "")
+        timeout_s = msg.get("timeout_s")
+        try:
+            timeout_s = float(timeout_s) if timeout_s is not None else 120.0
+        except Exception:
+            timeout_s = 120.0
+        # Guardrails: avoid nonsense values; keep a sensible upper bound.
+        if timeout_s < 10.0:
+            timeout_s = 10.0
+        if timeout_s > 600.0:
+            timeout_s = 600.0
         model = msg.get("model")
         effort = msg.get("effort")
         if not isinstance(model, str):
@@ -366,7 +376,7 @@ class CodexProxyAgent:
                     self._thread_locks[thread_id] = lock
                 async with lock:
                     turn_id = await self.app.turn_start_text(thread_id=thread_id, text=prompt, model=model or None, effort=effort or None)
-                    text = await self.app.run_turn_and_collect_agent_message(thread_id=thread_id, turn_id=turn_id, timeout_s=120.0)
+                    text = await self.app.run_turn_and_collect_agent_message(thread_id=thread_id, turn_id=turn_id, timeout_s=timeout_s)
                 latency_ms = int((time.time() - t0) * 1000.0)
                 logger.info(
                     _kv(
@@ -395,6 +405,14 @@ class CodexProxyAgent:
                         thread_id=thread_id,
                     )
                 )
+                # Treat app-server errors as potentially "poisoning" the in-memory server state.
+                # Restarting app-server is cheap and tends to recover from stuck child processes.
+                try:
+                    await self.app.stop()
+                    self._resumed_threads.clear()
+                    logger.warning(_kv(op="appserver.restart", proxy_id=self.proxy_id, trace_id=trace_id, task_id=task_id, reason="CodexAppServerError"))
+                except Exception as restart_e:
+                    logger.warning(_kv(op="appserver.restart", proxy_id=self.proxy_id, trace_id=trace_id, task_id=task_id, ok=False, error=f"{type(restart_e).__name__}: {restart_e}"))
                 return {"type": "task_result", "trace_id": trace_id, "task_id": task_id, "ok": False, "error": str(e)}
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
@@ -411,6 +429,14 @@ class CodexProxyAgent:
                         thread_id=thread_id,
                     )
                 )
+                if isinstance(e, TimeoutError):
+                    # app-server can get stuck after upstream timeouts; restart to recover.
+                    try:
+                        await self.app.stop()
+                        self._resumed_threads.clear()
+                        logger.warning(_kv(op="appserver.restart", proxy_id=self.proxy_id, trace_id=trace_id, task_id=task_id, reason="TimeoutError"))
+                    except Exception as restart_e:
+                        logger.warning(_kv(op="appserver.restart", proxy_id=self.proxy_id, trace_id=trace_id, task_id=task_id, ok=False, error=f"{type(restart_e).__name__}: {restart_e}"))
                 return {"type": "task_result", "trace_id": trace_id, "task_id": task_id, "ok": False, "error": err}
             finally:
                 self._current_task_id = ""
@@ -637,17 +663,32 @@ class CodexProxyAgent:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.environ.get("CODEX_PROXY_CONFIG") or "", help="path to proxy_config.json")
+    ap.add_argument(
+        "--config",
+        default=os.environ.get("CODEX_NODE_CONFIG") or os.environ.get("CODEX_PROXY_CONFIG") or "",
+        help="path to node_config.json (back-compat: proxy_config.json)",
+    )
     ap.add_argument("--manager-ws", default="", help="override manager WS (ws://host:port)")
-    ap.add_argument("--proxy-id", default="", help="override proxy id")
-    ap.add_argument("--token", default="", help="override proxy token")
+    # Prefer "node" naming, but keep proxy-* flags for back-compat.
+    ap.add_argument("--node-id", default="", help="override node id (same as --proxy-id)")
+    ap.add_argument("--node-token", default="", help="override node token (same as --token)")
+    ap.add_argument("--proxy-id", default="", help="override proxy id (deprecated; use --node-id)")
+    ap.add_argument("--token", default="", help="override proxy token (deprecated; use --node-token)")
     ap.add_argument("--codex-bin", default="", help="override codex bin")
     ap.add_argument("--cwd", default="", help="override codex cwd")
     ap.add_argument("--sandbox", default="", help="override codex sandbox (e.g. workspace-write / danger-full-access)")
     ap.add_argument("--approval-policy", default="", help="override approval policy (e.g. on-request / never)")
     args = ap.parse_args()
 
-    cfg_path = Path(args.config) if args.config else (BASE_DIR / "proxy_config.json" if (BASE_DIR / "proxy_config.json").exists() else None)
+    cfg_path = None
+    if args.config:
+        cfg_path = Path(args.config)
+    else:
+        # Prefer the new name, but keep the old one working.
+        if (BASE_DIR / "node_config.json").exists():
+            cfg_path = BASE_DIR / "node_config.json"
+        elif (BASE_DIR / "proxy_config.json").exists():
+            cfg_path = BASE_DIR / "proxy_config.json"
     cfg = _load_json(cfg_path) if cfg_path else {}
 
     # Optional network proxy config for codex connectivity on some hosts.
@@ -668,8 +709,22 @@ def main() -> int:
         env["no_proxy"] = np
 
     manager_ws = args.manager_ws or os.environ.get("CODEX_MANAGER_WS") or _cfg_get_str(cfg, "manager_ws") or "ws://127.0.0.1:8765"
-    proxy_id = args.proxy_id or os.environ.get("PROXY_ID") or _cfg_get_str(cfg, "proxy_id")
-    token = args.token or os.environ.get("PROXY_TOKEN") or _cfg_get_str(cfg, "proxy_token")
+    proxy_id = (
+        args.node_id
+        or args.proxy_id
+        or os.environ.get("NODE_ID")
+        or os.environ.get("PROXY_ID")
+        or _cfg_get_str(cfg, "node_id")
+        or _cfg_get_str(cfg, "proxy_id")
+    )
+    token = (
+        args.node_token
+        or args.token
+        or os.environ.get("NODE_TOKEN")
+        or os.environ.get("PROXY_TOKEN")
+        or _cfg_get_str(cfg, "node_token")
+        or _cfg_get_str(cfg, "proxy_token")
+    )
     codex_bin = args.codex_bin or os.environ.get("CODEX_BIN") or _cfg_get_str(cfg, "codex_bin") or "codex"
     cwd = args.cwd or os.environ.get("CODEX_CWD") or _cfg_get_str(cfg, "codex_cwd") or str(BASE_DIR)
     max_pending = int(os.environ.get("PROXY_MAX_PENDING") or str(cfg.get("max_pending") or 10))
@@ -677,7 +732,7 @@ def main() -> int:
     approval_policy = args.approval_policy or os.environ.get("CODEX_APPROVAL_POLICY") or _cfg_get_str(cfg, "approval_policy") or "unlessTrusted"
 
     if not proxy_id:
-        raise SystemExit("missing PROXY_ID / --proxy-id")
+        raise SystemExit("missing NODE_ID/PROXY_ID / --node-id/--proxy-id")
     # Dev mode: allow empty PROXY_TOKEN if manager doesn't enforce an allowlist.
 
     if env:

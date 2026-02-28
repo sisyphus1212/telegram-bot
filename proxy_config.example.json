@@ -1,13 +1,15 @@
 {
   // ===========================
-  // Codex Proxy 配置模板（JSONC）
+  // Codex Node 配置模板（JSONC）
   // 说明：
   // - 本文件支持 // 与 /* */ 注释（codex_proxy.py 会自动剥离注释后再解析 JSON）。
   // - “通过注释开关”：把你不想用的那行注释掉即可。
   // ===========================
   //
   "manager_ws": "ws://MANAGER_IP:8765",
-  "proxy_id": "proxy1",
+  // 注意：虽然字段名仍为 proxy_id/proxy_token（兼容旧协议），
+  // 但在对外概念上我们更推荐称其为 node_id/node_token。
+  "proxy_id": "home_hw",
   "proxy_token": "",
   "max_pending": 10,
   // sandbox：控制文件系统/命令能力
