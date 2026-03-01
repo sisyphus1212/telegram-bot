@@ -36,11 +36,13 @@ class CodexAppServerStdioProcess:
         on_log: Callable[[str], None] | None = None,
         *,
         on_approval_request: Callable[[JsonDict], Awaitable[str]] | None = None,
+        on_dynamic_tool_call: Callable[[JsonDict], Awaitable[JsonDict | None]] | None = None,
         on_notification: Callable[[JsonDict], Awaitable[None] | None] | None = None,
     ) -> None:
         self._config = config
         self._on_log = on_log
         self._on_approval_request = on_approval_request
+        self._on_dynamic_tool_call = on_dynamic_tool_call
         self._on_notification = on_notification
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -318,7 +320,7 @@ class CodexAppServerStdioProcess:
     async def _handle_server_request(self, req: JsonDict) -> None:
         req_id = req.get("id")
         method = req.get("method")
-        if not isinstance(req_id, int) or not isinstance(method, str):
+        if not isinstance(req_id, (int, str)) or not isinstance(method, str):
             return
 
         if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
@@ -330,8 +332,95 @@ class CodexAppServerStdioProcess:
                 except Exception as e:
                     self._log(f"[app-server] approval handler failed: {type(e).__name__}: {e}")
                     decision = "decline"
+            if method == "item/commandExecution/requestApproval":
+                decision = {
+                    "approved": "accept",
+                    "approved_for_session": "acceptForSession",
+                    "denied": "decline",
+                    "abort": "cancel",
+                }.get(decision, decision)
+            elif method == "item/fileChange/requestApproval":
+                decision = {
+                    "approved": "accept",
+                    "approved_for_session": "acceptForSession",
+                    "denied": "decline",
+                    "abort": "cancel",
+                }.get(decision, decision)
             await self._send_raw({"id": req_id, "result": {"decision": decision}})
             return
+        if method in ("execCommandApproval", "applyPatchApproval"):
+            # Legacy approval APIs. Reuse the same callback and map to legacy enums.
+            decision = "denied"
+            if self._on_approval_request is not None:
+                try:
+                    d = (await self._on_approval_request(req)) or "decline"
+                    decision = {
+                        "accept": "approved",
+                        "acceptForSession": "approved_for_session",
+                        "decline": "denied",
+                        "cancel": "abort",
+                    }.get(d, str(d))
+                except Exception as e:
+                    self._log(f"[app-server] approval handler failed: {type(e).__name__}: {e}")
+                    decision = "denied"
+            await self._send_raw({"id": req_id, "result": {"decision": decision}})
+            return
+        if method == "item/tool/requestUserInput":
+            params = req.get("params") if isinstance(req.get("params"), dict) else {}
+            questions = params.get("questions") if isinstance(params.get("questions"), list) else []
+            answers: dict[str, dict[str, list[str]]] = {}
+            for q in questions:
+                if not isinstance(q, dict):
+                    continue
+                qid = str(q.get("id") or "").strip()
+                if not qid:
+                    continue
+                # Provide a safe default answer so app-server always receives a valid response.
+                answers[qid] = {"answers": []}
+            await self._send_raw({"id": req_id, "result": {"answers": answers}})
+            return
+        if method == "item/tool/call":
+            params = req.get("params") if isinstance(req.get("params"), dict) else {}
+            if self._on_dynamic_tool_call is not None:
+                try:
+                    r = await self._on_dynamic_tool_call(params)
+                    if isinstance(r, dict):
+                        await self._send_raw({"id": req_id, "result": r})
+                        return
+                except Exception as e:
+                    self._log(f"[app-server] dynamic tool handler failed: {type(e).__name__}: {e}")
+            # Fallback: return a valid DynamicToolCallResponse, not -32601, so the turn won't hang
+            # on "missing tool output".
+            tool_name = str(params.get("tool") or "unknown")
+            await self._send_raw(
+                {
+                    "id": req_id,
+                    "result": {
+                        "success": False,
+                        "contentItems": [
+                            {
+                                "type": "inputText",
+                                "text": f"dynamic tool not handled by client: {tool_name}",
+                            }
+                        ],
+                    },
+                }
+            )
+            return
+        if method == "account/chatgptAuthTokens/refresh":
+            await self._send_raw(
+                {
+                    "id": req_id,
+                    "error": {
+                        "code": -32000,
+                        "message": "chatgpt auth refresh not supported in this node client",
+                    },
+                }
+            )
+            return
+        params = req.get("params")
+        pkeys = list(params.keys()) if isinstance(params, dict) else []
+        self._log(f"[app-server] unsupported server request: method={method} id_type={type(req_id).__name__} params_keys={pkeys}")
         await self._send_raw({"id": req_id, "error": {"code": -32601, "message": f"Unsupported request: {method}"}})
 
     async def _dispatch_notification(self, msg: JsonDict) -> None:
