@@ -18,7 +18,10 @@ fi
 
 run_rpc() {
   local action="$1"
-  local params_json="${2:-{}}"
+  local params_json="${2-}"
+  if [[ -z "$params_json" ]]; then
+    params_json='{}'
+  fi
   "$PY" "$RPC" "$action" --token "$TOKEN" --hostport "$HOSTPORT" --params-json "$params_json" --print-json
 }
 
