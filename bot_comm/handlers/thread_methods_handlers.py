@@ -163,11 +163,7 @@ class ThreadMethodsHandlers:
                 f"[{node_id}] thread fork",
                 f"source: {source_tid}",
                 "",
-                "请先输入目标路径后再选择权限：",
-                "/thread fork /your/path",
-                "或",
-                "/thread fork <idx|threadId> /your/path",
-                "或直接发一条：cwd=/your/path",
+                "请输入路径（cwd=/path）",
             ]
         )
 
@@ -682,6 +678,15 @@ class ThreadMethodsHandlers:
             params: dict[str, Any] = {"threadId": source_tid, "cwd": cwd, "sandbox": sandbox, "approvalPolicy": approval}
             rep = await core.appserver_call(node_id, "thread/fork", params, timeout_s=min(60.0, self.task_timeout_s))
             if not bool(rep.get("ok")):
+                self.logger.warning(
+                    "thread fork failed node=%s source=%s cwd=%s sandbox=%s approval=%s rep=%r",
+                    node_id,
+                    source_tid,
+                    cwd,
+                    sandbox,
+                    approval,
+                    rep,
+                )
                 await q.answer("fork failed", show_alert=True)
                 await self.tg_call(lambda: msg.reply_text(f"[{node_id}] error: {rep.get('error')}"), timeout_s=15.0, what="thread fork create")
                 return
