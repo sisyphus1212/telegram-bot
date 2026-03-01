@@ -1068,7 +1068,7 @@ def main() -> int:
                     node_auth=node_auth,
                     session_store=SESSION_STORE,
                     base_dir=BASE_DIR,
-                    manager_public_ws=args.manager_public_ws,
+                    manager_public_ws=public_ws,
                     logger=logger,
                 ),
                 name="control_server",
