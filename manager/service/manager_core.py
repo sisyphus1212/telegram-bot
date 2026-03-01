@@ -722,7 +722,8 @@ class ManagerCore:
                 for tid, ctx in list(self._tasks_inflight.items()):
                     # Activity-based timeout: reset the timer on any progress event.
                     last = ctx.last_progress_seen_at or ctx.created_at
-                    if (now - last) > self.task_timeout_s:
+                    timeout_s = max(30.0, float(getattr(ctx, "timeout_s", self.task_timeout_s) or self.task_timeout_s))
+                    if (now - last) > timeout_s:
                         expired.append((tid, ctx))
                         self._tasks_inflight.pop(tid, None)
                         self._recent[tid] = (ctx, now)

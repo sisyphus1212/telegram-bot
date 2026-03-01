@@ -32,6 +32,7 @@ class TaskContext:
     chat_id: int
     placeholder_msg_id: int
     created_at: float
+    timeout_s: float = 120.0
     session_key: str = ""
     result_mode: str = "send"
     last_progress_at: float = 0.0

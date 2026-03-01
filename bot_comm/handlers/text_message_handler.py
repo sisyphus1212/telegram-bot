@@ -109,6 +109,9 @@ class TextMessageHandler:
             "thread_id": thread_id,
             "prompt": prompt,
         }
+        # Avoid accidental 120s default timeout on node side for long-running turns.
+        turn_timeout_s = max(600.0, float(self.task_timeout_s))
+        task_msg["timeout_s"] = turn_timeout_s
         session_model = self.get_default_model(sk)
         if session_model:
             task_msg["model"] = session_model
@@ -125,6 +128,7 @@ class TextMessageHandler:
                 chat_id=int(chat_id),
                 placeholder_msg_id=int(placeholder.message_id),
                 created_at=time.time(),
+                timeout_s=turn_timeout_s,
                 session_key=sk,
                 result_mode=self.get_result_mode(sk),
             )
