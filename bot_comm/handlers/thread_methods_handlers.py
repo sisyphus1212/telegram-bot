@@ -66,7 +66,15 @@ class ThreadMethodsHandlers:
             by_node[node_id] = entry
         entry["thread_list_index"] = ids[:50]
 
-    async def _resolve_thread_token(self, *, update: Update, node_id: str, token: str, usage: str) -> str:
+    async def _resolve_thread_token(
+        self,
+        *,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        node_id: str,
+        token: str,
+        usage: str,
+    ) -> str:
         token = (token or "").strip()
         if not token:
             return ""
@@ -76,6 +84,27 @@ class ThreadMethodsHandlers:
                 return ""
             sk = self.session_key_fn(update)
             arr = self._get_thread_index_map(sk, node_id)
+            if not arr:
+                # Fallback: fetch latest thread list on-demand so users can run `/thread resume 2`
+                # directly without a prior `/thread list`.
+                core = context.application.bot_data.get("core")
+                if core is not None:
+                    try:
+                        rep = await core.appserver_call(node_id, "thread/list", {"limit": 20}, timeout_s=min(60.0, self.task_timeout_s))
+                        if bool(rep.get("ok")):
+                            result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+                            data = result.get("data") if isinstance(result.get("data"), list) else []
+                            arr = []
+                            for item in data[:20]:
+                                if isinstance(item, dict):
+                                    tid = str(item.get("id") or "").strip()
+                                    if tid:
+                                        arr.append(tid)
+                            if arr:
+                                self._set_thread_index_map(sk, node_id, arr)
+                                self.save_sessions_fn(self.sessions_ref)
+                    except Exception:
+                        pass
             if idx <= len(arr):
                 return str(arr[idx - 1])
             msg = update.effective_message
@@ -154,7 +183,7 @@ class ThreadMethodsHandlers:
             return
         kv = self.parse_kv(context.args or [])
         raw = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
-        thread_id = await self._resolve_thread_token(update=update, node_id=node_id, token=raw, usage="/thread_resume")
+        thread_id = await self._resolve_thread_token(update=update, context=context, node_id=node_id, token=raw, usage="/thread_resume")
         if not thread_id:
             await self.tg_call(lambda: update.message.reply_text("usage: /thread_resume <id>"), timeout_s=15.0, what="/thread_resume reply")
             return
@@ -241,7 +270,7 @@ class ThreadMethodsHandlers:
             return
         kv = self.parse_kv(context.args or [])
         raw = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
-        thread_id = await self._resolve_thread_token(update=update, node_id=node_id, token=raw, usage="/thread_read")
+        thread_id = await self._resolve_thread_token(update=update, context=context, node_id=node_id, token=raw, usage="/thread_read")
         if not thread_id:
             await self.tg_call(lambda: update.message.reply_text("usage: /thread_read <id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
             return
@@ -268,7 +297,7 @@ class ThreadMethodsHandlers:
             return
         kv = self.parse_kv(context.args or [])
         raw = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
-        thread_id = await self._resolve_thread_token(update=update, node_id=node_id, token=raw, usage="/thread_archive")
+        thread_id = await self._resolve_thread_token(update=update, context=context, node_id=node_id, token=raw, usage="/thread_archive")
         if not thread_id:
             sk = self.session_key_fn(update)
             thread_id = self.get_current_thread_id(sk, node_id)
@@ -297,7 +326,7 @@ class ThreadMethodsHandlers:
             return
         kv = self.parse_kv(context.args or [])
         raw = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
-        thread_id = await self._resolve_thread_token(update=update, node_id=node_id, token=raw, usage="/thread_unarchive")
+        thread_id = await self._resolve_thread_token(update=update, context=context, node_id=node_id, token=raw, usage="/thread_unarchive")
         if not thread_id:
             await self.tg_call(lambda: update.message.reply_text("usage: /thread_unarchive <id>"), timeout_s=15.0, what="/thread_unarchive reply")
             return
