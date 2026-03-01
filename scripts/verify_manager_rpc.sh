@@ -61,8 +61,7 @@ assert cfg.get("node_id")==r.get("node_id")
 assert cfg.get("node_token")==r.get("token")
 print("ok")
 PY
-TOKEN_ID="$(echo "$gen_json" | "$PY" - <<'PY'
-"$PY" - "$gen_json" <<'PY'
+TOKEN_ID="$("$PY" - "$gen_json" <<'PY'
 import json,sys
 j=json.loads(sys.argv[1])
 print((j.get("result") or {}).get("token_id") or "")
@@ -75,7 +74,7 @@ fi
 
 echo "[4/6] token.list include_revoked=false"
 list_json="$(run_rpc token.list '{"include_revoked":false}')"
- "$PY" - "$list_json" "$TOKEN_ID" <<'PY'
+"$PY" - "$list_json" "$TOKEN_ID" <<'PY'
 import json,sys
 token_id=sys.argv[2]
 j=json.loads(sys.argv[1])
@@ -87,7 +86,7 @@ PY
 
 echo "[5/6] token.revoke token_id=$TOKEN_ID"
 rev_json="$(run_rpc token.revoke "{\"token_id\":\"$TOKEN_ID\"}")"
- "$PY" - "$rev_json" "$TOKEN_ID" <<'PY'
+"$PY" - "$rev_json" "$TOKEN_ID" <<'PY'
 import json,sys
 token_id=sys.argv[2]
 j=json.loads(sys.argv[1])
@@ -100,7 +99,7 @@ PY
 
 echo "[6/6] token.list include_revoked=true"
 list2_json="$(run_rpc token.list '{"include_revoked":true}')"
- "$PY" - "$list2_json" "$TOKEN_ID" <<'PY'
+"$PY" - "$list2_json" "$TOKEN_ID" <<'PY'
 import json,sys
 token_id=sys.argv[2]
 j=json.loads(sys.argv[1])
