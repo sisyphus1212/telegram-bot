@@ -40,6 +40,8 @@
 - `manager_data.db` - manager 本地 SQLite 数据库（运行后生成）
   - 保存 chat -> node 路由、per-node current threadId、会话默认参数、node 鉴权 token、TG 用户授权表
   - thread 内容由 Codex 自己保存在 `~/.codex/`，本项目只保存“指针/路由”
+- `run/node.<node_id>.json` - node 运行标识（运行后生成）
+  - 便于同机多 node 运维快速定位：`node_id/pid/manager_ws/config_path/codex_cwd/sandbox/approval_policy/current_task_id/log_path_hint`
 
 ## 依赖
 
@@ -277,6 +279,16 @@ sudo journalctl -u agent-node@1.service -f
 5. 安全：
    - 真实接管 PC 前必须加 `TELEGRAM_ALLOWED_USER_IDS`，并只给可信节点分发 token
 
+6. 同机多 node 运维定位：
+   - 先看运行标识文件：`ls -l run/node.*.json`
+   - 查看某个 node 详情：`cat run/node.<node_id>.json`
+   - 关键字段：
+     - `pid`：当前进程号
+     - `state`：`starting/appserver_ready/online/reconnecting/disconnected/stopped`
+     - `config_path`：该实例使用的配置文件
+     - `log_path_hint`：日志查看建议命令
+     - `current_task_id/current_thread_id`：正在处理的任务与线程
+
 ## 日志与可观测性（重要）
 
 当前链路采用统一元信息，所有关键消息都应带：
@@ -353,6 +365,8 @@ journalctl -u agent-manager.service --since "10 min ago" --no-pager | rg "telegr
 ```
 
 排障时务必固定一个 `task_id` 做主线，禁止只按时间片段盲查。
+
+补充：可通过 `NODE_LOG_PATH` 覆盖 `run/node.<node_id>.json` 中的 `log_path_hint`，便于按你实际部署方式给出统一日志路径。
 
 ## 多机管理
 

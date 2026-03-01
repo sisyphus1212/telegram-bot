@@ -23,6 +23,7 @@
 7. node 启动时 `codex_cwd` 不存在需自动创建并 warning；创建失败才退出。
 8. 任何发往 TG 的任务相关消息必须带 `task_id`、`trace_id`、`node`、`status` 元信息。
 9. 涉及超时逻辑的改动必须保留 `timeout_kind`（`queue/execution/return`）并继续支持 `late_progress/late_result`。
+10. node 进程必须写 `run/node.<node_id>.json` 运行标识，至少包含：`node_id/pid/state/manager_ws/config_path/codex_cwd/sandbox/approval_policy/log_path_hint/current_task_id`。
 
 ## 3. 项目结构（代码定位）
 

@@ -128,6 +128,27 @@ def _maybe_set_env(name: str, value: str) -> None:
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
+
+def _safe_file_tag(v: str) -> str:
+    s = (v or "").strip()
+    if not s:
+        return "unknown"
+    out: list[str] = []
+    for ch in s:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out)
+
+
+def _write_json_atomic(path: Path, obj: JsonDict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
 def _map_threadstart_sandbox(v: str) -> str:
     # TG/official docs commonly use workspaceWrite/readOnly/dangerFullAccess.
     # Our local codex currently expects kebab-case for thread/start sandbox.
@@ -260,6 +281,8 @@ class CodexNodeAgent:
         *,
         sandbox: str,
         approval_policy: str,
+        config_path: str,
+        log_path_hint: str,
     ) -> None:
         self.node_id = node_id
         self.token = token
@@ -279,6 +302,9 @@ class CodexNodeAgent:
         self._queue_len: int = 0
         self._appserver_state: str = "starting"
         self._probe_fail_count: int = 0
+        self._meta_path = BASE_DIR / "run" / f"node.{_safe_file_tag(node_id)}.json"
+        self._config_path = config_path
+        self._log_path_hint = log_path_hint
 
         async def _on_approval(req: JsonDict) -> str:
             # Forward approval request to manager and wait for TG user decision.
@@ -354,6 +380,35 @@ class CodexNodeAgent:
         self._resumed_threads: set[str] = set()
         self._busy = asyncio.Lock()  # single execution loop (node feeds Codex sequentially)
         self.max_pending = int(os.environ.get("NODE_MAX_PENDING", "10") or "10")
+
+    def _write_runtime_meta(self, *, state: str) -> None:
+        now = int(time.time())
+        payload: JsonDict = {
+            "node_id": self.node_id,
+            "pid": os.getpid(),
+            "host_name": socket.gethostname(),
+            "state": state,
+            "updated_at_epoch": now,
+            "updated_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "manager_ws": self.manager_ws,
+            "max_pending": self.max_pending,
+            "sandbox": self.sandbox,
+            "approval_policy": self.approval_policy,
+            "codex_cwd": self.cwd,
+            "config_path": self._config_path or "",
+            "log_path_hint": self._log_path_hint or "",
+            "current_task_id": self._current_task_id,
+            "current_trace_id": self._current_trace_id,
+            "current_thread_id": self._current_thread_id,
+            "current_stage": self._current_stage,
+            "queue_len": self._queue_len,
+            "busy": bool(self._busy.locked()),
+            "appserver_state": self._appserver_state,
+        }
+        try:
+            _write_json_atomic(self._meta_path, payload)
+        except Exception as e:
+            logger.warning(_kv(op="run.meta.write_failed", node_id=self.node_id, path=str(self._meta_path), error=f"{type(e).__name__}: {e}"))
 
     async def _probe_openai_connectivity(self, *, timeout_s: float = 5.0) -> tuple[bool, str]:
         host = "api.openai.com"
@@ -588,9 +643,11 @@ class CodexNodeAgent:
 
     async def run_forever(self) -> None:
         try:
+            self._write_runtime_meta(state="starting")
             # Keep local app-server warm even if manager is temporarily down.
             await self.app.start()
             await self.app.ensure_started_and_initialized(client_name=f"codex_node:{self.node_id}", version="0.0")
+            self._write_runtime_meta(state="appserver_ready")
 
             backoff_s = 0.5
             while True:
@@ -679,6 +736,7 @@ class CodexNodeAgent:
                             raise RuntimeError(f"register failed: {err}")
 
                         logger.info(_kv(op="register.ok", node_id=self.node_id, manager_ws=self.manager_ws, sandbox=self.sandbox, approval_policy=self.approval_policy))
+                        self._write_runtime_meta(state="online")
                         backoff_s = 0.5
                         stop_hb = asyncio.Event()
                         stop_exec = asyncio.Event()
@@ -873,11 +931,13 @@ class CodexNodeAgent:
                             await asyncio.gather(probe_task, return_exceptions=True)
                             if rpc_tasks:
                                 await asyncio.gather(*rpc_tasks, return_exceptions=True)
+                            self._write_runtime_meta(state="reconnecting")
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     # Manager down / network blip. Retry with backoff.
                     logger.warning(f"manager connection failed; retrying in {backoff_s:.1f}s")
+                    self._write_runtime_meta(state="disconnected")
                     await asyncio.sleep(backoff_s + random.random() * 0.2)
                     backoff_s = min(10.0, backoff_s * 1.7)
         finally:
@@ -885,6 +945,7 @@ class CodexNodeAgent:
                 await self.app.stop()
             except Exception:
                 pass
+            self._write_runtime_meta(state="stopped")
 
 
 def main() -> int:
@@ -902,6 +963,7 @@ def main() -> int:
     ap.add_argument("--sandbox", default="", help="override codex sandbox (e.g. workspace-write / danger-full-access)")
     ap.add_argument("--approval-policy", default="", help="override approval policy (e.g. on-request / never)")
     args = ap.parse_args()
+    config_path_str = str(Path(args.config).resolve()) if args.config else str((BASE_DIR / "node_config.json").resolve())
 
     cfg_path = None
     if args.config:
@@ -952,6 +1014,10 @@ def main() -> int:
     if env:
         logger.info(_kv(op="env.proxy", node_id=node_id, HTTP_PROXY=env.get("HTTP_PROXY"), HTTPS_PROXY=env.get("HTTPS_PROXY"), NO_PROXY=env.get("NO_PROXY")))
 
+    log_path_hint = os.environ.get("NODE_LOG_PATH", "").strip()
+    if not log_path_hint:
+        log_path_hint = "journalctl -u agent-node@<instance>.service -f"
+
     agent = CodexNodeAgent(
         node_id=node_id,
         token=token,
@@ -961,6 +1027,8 @@ def main() -> int:
         env=env or None,
         sandbox=sandbox,
         approval_policy=approval_policy,
+        config_path=config_path_str,
+        log_path_hint=log_path_hint,
     )
     agent.max_pending = max(1, max_pending)
     try:
