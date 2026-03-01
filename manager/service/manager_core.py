@@ -495,9 +495,6 @@ class ManagerCore:
             reason = params.get("reason")
             if reason:
                 text_lines.append(f"reason: {reason}")
-        text_lines.append("")
-        text_lines.append("请选择：")
-
         kb = InlineKeyboardMarkup(
             [
                 [
@@ -507,19 +504,23 @@ class ManagerCore:
                 [InlineKeyboardButton("Approve (Session)", callback_data=f"approve:session:{approval_id}")],
             ]
         )
-
-        # Fallback for clients without inline buttons.
-        text_lines.append("")
-        text_lines.append("备用命令：")
-        text_lines.append(f"/approve {approval_id}")
-        text_lines.append(f"/approve session {approval_id}")
-        text_lines.append(f"/decline {approval_id}")
-
+        # Send details and actions separately so button card stays compact and never gets split.
         await outbox.enqueue(
             TgAction(
                 type="send",
                 chat_id=ctx.chat_id,
                 text="\n".join(text_lines),
+                trace_id=ac.trace_id,
+                node_id=node_id,
+                task_id=task_id,
+                kind="approval_detail",
+            )
+        )
+        await outbox.enqueue(
+            TgAction(
+                type="send",
+                chat_id=ctx.chat_id,
+                text=f"[{node_id}] 审批操作\napproval_id: {approval_id}",
                 reply_markup=kb,
                 trace_id=ac.trace_id,
                 node_id=node_id,
