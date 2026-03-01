@@ -88,15 +88,25 @@ class ThreadMethodsHandlers:
             entry.pop("fork_wizard", None)
 
     def _build_fork_keyboard(self, *, sandbox: str, approval: str) -> InlineKeyboardMarkup:
-        sb_vals = [("workspace-write", "workspace"), ("read-only", "readonly"), ("danger-full-access", "danger")]
-        ap_vals = [("on-request", "onRequest"), ("never", "never")]
+        sb_vals = [
+            ("workspace-write", "workspace"),
+            ("read-only", "readonly"),
+            ("danger-full-access", "danger"),
+        ]
+        ap_vals = [
+            ("on-request", "onRequest"),
+            ("on-failure", "onFailure"),
+            ("untrusted", "unlessTrusted"),
+            ("never", "never"),
+        ]
         row1 = [InlineKeyboardButton(("• " if sandbox == v else "") + lab, callback_data=f"thread:fork:sandbox:{v}") for v, lab in sb_vals]
-        row2 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:fork:approval:{v}") for v, lab in ap_vals]
-        row3 = [
+        row2 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:fork:approval:{v}") for v, lab in ap_vals[:2]]
+        row3 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:fork:approval:{v}") for v, lab in ap_vals[2:]]
+        row4 = [
             InlineKeyboardButton("Create Fork", callback_data="thread:fork:create"),
             InlineKeyboardButton("Cancel", callback_data="thread:fork:cancel"),
         ]
-        return InlineKeyboardMarkup([row1, row2, row3])
+        return InlineKeyboardMarkup([row1, row2, row3, row4])
 
     def _render_fork_text(self, *, node_id: str, source_tid: str, cwd: str, sandbox: str, approval: str) -> str:
         return "\n".join(
