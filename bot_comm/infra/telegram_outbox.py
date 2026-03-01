@@ -48,6 +48,27 @@ class TelegramOutbox:
         self._last_edit_text: dict[tuple[int, int], str] = {}
 
     @staticmethod
+    def _split_text(text: str, limit: int = 3900) -> list[str]:
+        s = text or ""
+        if len(s) <= limit:
+            return [s]
+        out: list[str] = []
+        i = 0
+        n = len(s)
+        while i < n:
+            j = min(i + limit, n)
+            k = s.rfind("\n", i, j)
+            if k <= i:
+                k = s.rfind(" ", i, j)
+            if k <= i:
+                k = j
+            out.append(s[i:k])
+            i = k
+            while i < n and s[i] in " \n":
+                i += 1
+        return out if out else [""]
+
+    @staticmethod
     def _is_low_priority(action: TgAction) -> bool:
         return action.type == "typing" or action.kind in ("progress", "progress_batch")
 
@@ -123,29 +144,40 @@ class TelegramOutbox:
                         last_text = self._last_edit_text.get(key)
                         if last_text == action.text:
                             continue
+                        parts = self._split_text(action.text, limit=3900)
                         await self.tg_call(
                             lambda: self.bot.edit_message_text(
                                 chat_id=action.chat_id,
                                 message_id=action.message_id,
-                                text=action.text,
+                                text=parts[0],
                                 reply_markup=action.reply_markup,
                             ),
                             timeout_s=action.timeout_s,
                             what="tg edit",
                             retries=1,
                         )
-                        self._last_edit_text[key] = action.text
+                        self._last_edit_text[key] = parts[0]
+                        if len(parts) > 1:
+                            for extra in parts[1:]:
+                                await self.tg_call(
+                                    lambda t=extra: self.bot.send_message(chat_id=action.chat_id, text=t),
+                                    timeout_s=action.timeout_s,
+                                    what="tg send(split from edit)",
+                                    retries=1,
+                                )
                         self.logger.info(
                             f"op=tg.edit ok=true chat_id={action.chat_id} msg_id={action.message_id} "
                             f"trace_id={action.trace_id} node_id={action.node_id} task_id={action.task_id} kind={action.kind}"
                         )
                     elif action.type == "send":
-                        await self.tg_call(
-                            lambda: self.bot.send_message(chat_id=action.chat_id, text=action.text, reply_markup=action.reply_markup),
-                            timeout_s=action.timeout_s,
-                            what="tg send",
-                            retries=1,
-                        )
+                        parts = self._split_text(action.text, limit=3900)
+                        for idx, part in enumerate(parts):
+                            await self.tg_call(
+                                lambda t=part, rm=(action.reply_markup if idx == 0 else None): self.bot.send_message(chat_id=action.chat_id, text=t, reply_markup=rm),
+                                timeout_s=action.timeout_s,
+                                what="tg send",
+                                retries=1,
+                            )
                         self.logger.info(
                             f"op=tg.send ok=true chat_id={action.chat_id} trace_id={action.trace_id} "
                             f"node_id={action.node_id} task_id={action.task_id} kind={action.kind}"
