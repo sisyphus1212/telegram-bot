@@ -49,6 +49,8 @@ class ThreadHandlers:
                 InlineKeyboardButton("/thread start", callback_data="thread:shortcut:start"),
                 InlineKeyboardButton("/thread list", callback_data="thread:shortcut:list"),
                 InlineKeyboardButton("/thread current", callback_data="thread:shortcut:current"),
+            ], [
+                InlineKeyboardButton("/thread fork", callback_data="thread:shortcut:fork"),
             ]])
             await self.tg_call(
                 lambda: msg.reply_text(
@@ -117,6 +119,9 @@ class ThreadHandlers:
                     "personality=pragmatic",
                 ]
                 await self.cmd_thread_start(update, context)
+            elif action == "fork":
+                context.args = []
+                await self.cmd_thread_fork(update, context)
             else:
                 await q.answer("bad action", show_alert=True)
                 return
