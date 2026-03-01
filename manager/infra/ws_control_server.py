@@ -59,6 +59,22 @@ async def run_control_server(
                             continue
                     except Exception:
                         pass
+                if t == "status":
+                    try:
+                        status = await core.get_runtime_status()
+                    except Exception:
+                        status = {"draining": bool(core.is_draining()), "inflight_tasks": -1, "pending_approvals": -1}
+                    resp = {"ok": True, "type": "status", "status": status}
+                    writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    logger.info(
+                        "op=ctl.send peer=%s type=status ok=true draining=%s inflight=%s approvals=%s",
+                        peer,
+                        status.get("draining"),
+                        status.get("inflight_tasks"),
+                        status.get("pending_approvals"),
+                    )
+                    continue
                 if t == "servers":
                     details: list[dict[str, Any]] = []
                     try:

@@ -12,6 +12,7 @@ REPO_DIR="${REPO_DIR:-/root/telegram-bot}"
 BRANCH="${BRANCH:-main}"
 SERVICE_NAME="${SERVICE_NAME:-agent-manager}"
 GIT_TIMEOUT_S="${GIT_TIMEOUT_S:-60}"
+FORCE="${FORCE:-0}"
 
 if [[ ! -d "$REPO_DIR/.git" ]]; then
   echo "ERR: not a git repo: $REPO_DIR" >&2
@@ -53,6 +54,36 @@ echo "[upgrade] after=$after_sha"
 
 if [[ -x .venv/bin/python ]]; then
   .venv/bin/python -m py_compile manager/entry/app.py
+fi
+
+if [[ "$FORCE" != "1" ]] && [[ -n "${CODEX_MANAGER_CONTROL_LISTEN:-}" ]] && [[ -n "${CODEX_MANAGER_CONTROL_TOKEN:-}" ]] && [[ -x .venv/bin/python ]]; then
+  status_json="$(
+    CODEX_CTL_LISTEN="$CODEX_MANAGER_CONTROL_LISTEN" CODEX_CTL_TOKEN="$CODEX_MANAGER_CONTROL_TOKEN" .venv/bin/python - <<'PY' 2>/dev/null || true
+import json, os, socket
+listen = os.environ.get("CODEX_CTL_LISTEN", "")
+token = os.environ.get("CODEX_CTL_TOKEN", "")
+if ":" not in listen or not token:
+    raise SystemExit(0)
+host, port_s = listen.rsplit(":", 1)
+port = int(port_s)
+req = {"type": "status", "token": token}
+s = socket.create_connection((host, port), timeout=2.0)
+s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+buf = b""
+while not buf.endswith(b"\n"):
+    part = s.recv(4096)
+    if not part:
+        break
+    buf += part
+s.close()
+print(buf.decode("utf-8", "replace").strip())
+PY
+  )"
+  inflight="$(printf '%s' "$status_json" | sed -n 's/.*"inflight_tasks":[[:space:]]*\([0-9]\+\).*/\1/p' | head -n1)"
+  if [[ -n "$inflight" ]] && (( inflight > 0 )); then
+    echo "[upgrade] ABORT: inflight_tasks=$inflight (set FORCE=1 to override)" >&2
+    exit 4
+  fi
 fi
 
 systemctl restart "$SERVICE_NAME"

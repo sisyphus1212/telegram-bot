@@ -246,6 +246,16 @@ class ManagerCore:
                 return pending
             await asyncio.sleep(0.2)
 
+    async def get_runtime_status(self) -> dict[str, int | bool]:
+        async with self._lock:
+            inflight = len(self._tasks_inflight)
+            approvals = len(self._approvals)
+        return {
+            "draining": bool(self._draining),
+            "inflight_tasks": int(inflight),
+            "pending_approvals": int(approvals),
+        }
+
     def _start_typing_for_task(self, ctx: TaskContext) -> None:
         # Keep "typing" alive while task is inflight. Telegram expires this state quickly.
         self._stop_typing_for_task(ctx.task_id)
