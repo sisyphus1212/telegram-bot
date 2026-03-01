@@ -29,7 +29,24 @@ cd "$REPO_DIR"
 before_sha="$(git rev-parse --short HEAD)"
 echo "[upgrade] repo=$REPO_DIR branch=$BRANCH before=$before_sha"
 
-timeout "$GIT_TIMEOUT_S" git fetch origin "$BRANCH"
+fetch_ok=0
+for i in 1 2; do
+  if timeout "$GIT_TIMEOUT_S" git fetch origin "$BRANCH"; then
+    fetch_ok=1
+    break
+  fi
+  echo "[upgrade] WARN: git fetch attempt $i failed (timeout/network), retrying..." >&2
+  sleep 1
+done
+
+if [[ "$fetch_ok" -ne 1 ]]; then
+  if ! git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    echo "[upgrade] ERR: fetch failed and missing origin/$BRANCH ref" >&2
+    exit 3
+  fi
+  echo "[upgrade] WARN: fetch failed; continue with existing origin/$BRANCH ref" >&2
+fi
+
 git merge --ff-only "origin/$BRANCH"
 after_sha="$(git rev-parse --short HEAD)"
 echo "[upgrade] after=$after_sha"
