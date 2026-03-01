@@ -793,17 +793,36 @@ class ManagerApp:
         m = (uptime_s % 3600) // 60
         s = uptime_s % 60
         online = self.registry.online_node_ids()
+        public_ip = _detect_public_ipv4_no_proxy(timeout_s=4) or "(unknown)"
+        ws_port = ""
+        if self.ws_listen and ":" in self.ws_listen:
+            ws_port = self.ws_listen.rsplit(":", 1)[-1].strip()
+        http_proxy = (os.environ.get("HTTP_PROXY") or "").strip()
+        https_proxy = (os.environ.get("HTTPS_PROXY") or "").strip()
+        no_proxy = (os.environ.get("NO_PROXY") or "").strip()
+        http_proxy_l = (os.environ.get("http_proxy") or "").strip()
+        https_proxy_l = (os.environ.get("https_proxy") or "").strip()
+        no_proxy_l = (os.environ.get("no_proxy") or "").strip()
         lines: list[str] = []
         lines.append("manager:")
         lines.append(f"uptime: {h:02d}:{m:02d}:{s:02d}")
         lines.append(f"git: {self.git_sha or '(unknown)'}")
         lines.append(f"ws_listen: {self.ws_listen or '(unknown)'}")
+        lines.append(f"ws_port: {ws_port or '(unknown)'}")
         lines.append(f"manager_ws(public): {self.manager_public_ws or '(unknown)'}")
+        lines.append(f"public_ip(no_proxy): {public_ip}")
         lines.append(f"control_listen: {self.control_listen or '(disabled)'}")
         lines.append(f"default_node: {self.default_node or '(none)'}")
         lines.append(f"online_count: {len(online)}")
         if online:
             lines.append(f"online_nodes: {', '.join(online)}")
+        lines.append("proxy_env:")
+        lines.append(f"HTTP_PROXY: {http_proxy or '(unset)'}")
+        lines.append(f"HTTPS_PROXY: {https_proxy or '(unset)'}")
+        lines.append(f"NO_PROXY: {no_proxy or '(unset)'}")
+        lines.append(f"http_proxy: {http_proxy_l or '(unset)'}")
+        lines.append(f"https_proxy: {https_proxy_l or '(unset)'}")
+        lines.append(f"no_proxy: {no_proxy_l or '(unset)'}")
         await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/manager reply")
 
     async def cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
