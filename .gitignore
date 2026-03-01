@@ -17,6 +17,7 @@ venv/
 
 # Session data (user specific)
 sessions.json
+manager_data.db
 
 # Manager config (contains Telegram bot token)
 manager_config.json

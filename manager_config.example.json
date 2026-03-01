@@ -4,17 +4,13 @@
     "telegram_bot_token: Telegram bot token（敏感）",
     "telegram_proxy: 已弃用（manager 只使用系统 HTTP_PROXY/HTTPS_PROXY/NO_PROXY）",
     "startup_notify_chat_ids: 可选，manager 启动后向这些 chat_id 发一条启动汇报（私聊时一般等于 user_id）",
-    "manager_ws_listen: manager 对 proxy 的 WS 监听地址",
-    "default_proxy: 新聊天默认选择的 proxy_id",
-    "proxies: 可选 allowlist（后续可收紧为强校验）"
+    "manager_ws_listen: manager 对 node 的 WS 监听地址",
+    "default_node: 新聊天默认选择的 node_id",
+    "node 鉴权 token 由 manager 本地 SQLite (manager_data.db) 维护（通过 TG /token 命令管理）"
   ],
   "telegram_bot_token": "PUT-YOUR-TELEGRAM-BOT-TOKEN-HERE",
   "telegram_proxy": "",
   "startup_notify_chat_ids": [],
   "manager_ws_listen": "0.0.0.0:8765",
-  "default_proxy": "home_hw",
-  "proxies": {
-    "home_hw": "",
-    "home_vm": ""
-  }
+  "default_node": "home_hw"
 }

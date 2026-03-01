@@ -10,10 +10,11 @@ EnvironmentFile=/etc/agent-manager.env
 ExecStart=/root/telegram-bot/scripts/run.sh
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=90
+KillSignal=SIGTERM
 
 NoNewPrivileges=true
 PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
-

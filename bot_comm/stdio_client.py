@@ -172,7 +172,7 @@ class CodexAppServerStdioProcess:
         result = await self.request(
             "initialize",
             {
-                "clientInfo": {"name": client_name, "title": "Codex Proxy", "version": version},
+                "clientInfo": {"name": client_name, "title": "Codex Node", "version": version},
                 "capabilities": {"experimentalApi": True},
             },
         )

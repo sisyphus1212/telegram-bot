@@ -42,7 +42,7 @@ fi
 echo "phase=1 prompt=${PROMPT@Q} repeat=$REPEAT timeout=$TIMEOUT interval_ms=$INTERVAL_MS jsonl=${JSONL@Q}"
 
 set +e
-python codex_proxy_probe.py \
+python codex_node_probe.py \
   --prompt "$PROMPT" \
   --repeat "$REPEAT" \
   --timeout "$TIMEOUT" \

@@ -5,17 +5,17 @@ cd "$(dirname "$0")/.."
 
 CONTROL_HOSTPORT="${CODEX_MANAGER_CONTROL:-127.0.0.1:18766}"
 CONTROL_TOKEN="${CODEX_MANAGER_CONTROL_TOKEN:-}"
-PROXY_ID="${1:-}"
+NODE_ID="${1:-}"
 PROMPT="${PROMPT:-ping}"
 MODEL="${MODEL:-${CODEX_TEST_MODEL:-}}"
 EFFORT="${EFFORT:-${CODEX_TEST_EFFORT:-}}"
 REPEAT="${REPEAT:-10}"
 TIMEOUT="${TIMEOUT:-60}"
 
-if [[ -z "$PROXY_ID" ]]; then
+if [[ -z "$NODE_ID" ]]; then
   cat <<EOF >&2
 Usage:
-  CODEX_MANAGER_CONTROL_TOKEN=... scripts/verify_phase2_ws.sh <proxy_id>
+  CODEX_MANAGER_CONTROL_TOKEN=... scripts/verify_phase2_ws.sh <node_id>
 
 Optional env:
   CODEX_MANAGER_CONTROL=127.0.0.1:18766
@@ -40,11 +40,11 @@ fi
 
 . .venv/bin/activate
 
-echo "phase=2 proxy_id=$PROXY_ID repeat=$REPEAT timeout=$TIMEOUT control=$CONTROL_HOSTPORT"
+echo "phase=2 node_id=$NODE_ID repeat=$REPEAT timeout=$TIMEOUT control=$CONTROL_HOSTPORT"
 
 export CONTROL_HOSTPORT
 export CONTROL_TOKEN
-export PROXY_ID
+export NODE_ID
 export PROMPT
 export MODEL
 export EFFORT
@@ -68,12 +68,13 @@ import json, os, socket, sys, time
 
 hostport=os.environ.get("CONTROL_HOSTPORT")
 token=os.environ.get("CONTROL_TOKEN")
-proxy_id=os.environ.get("PROXY_ID")
+node_id=os.environ.get("NODE_ID")
 prompt=os.environ.get("PROMPT","ping")
 model=os.environ.get("MODEL","").strip()
 effort=os.environ.get("EFFORT","").strip()
 repeat=int(os.environ.get("REPEAT","10"))
 timeout=float(os.environ.get("TIMEOUT","60"))
+wait_online_s=float(os.environ.get("WAIT_ONLINE","30"))
 
 host, port_s = hostport.rsplit(":", 1)
 port = int(port_s)
@@ -104,17 +105,26 @@ resp = rpc({"type":"servers","token":token})
 if not resp.get("ok"):
   print("phase=2 FAIL control servers:", resp, file=sys.stderr)
   raise SystemExit(2)
-online=resp.get("online") or []
-print("servers online:", online)
-if proxy_id not in online:
-  print(f"phase=2 FAIL proxy not online: {proxy_id}", file=sys.stderr)
-  raise SystemExit(2)
+deadline=time.time() + max(1.0, wait_online_s)
+while True:
+  online=resp.get("online") or []
+  print("servers online:", online)
+  if node_id in online:
+    break
+  if time.time() >= deadline:
+    print(f"phase=2 FAIL node not online: {node_id}", file=sys.stderr)
+    raise SystemExit(2)
+  time.sleep(0.5)
+  resp = rpc({"type":"servers","token":token})
+  if not resp.get("ok"):
+    print("phase=2 FAIL control servers:", resp, file=sys.stderr)
+    raise SystemExit(2)
 
 ok=0
 lat=[]
 for i in range(1, repeat+1):
   t0=time.time()
-  payload={"type":"dispatch","token":token,"proxy_id":proxy_id,"prompt":prompt,"timeout":timeout}
+  payload={"type":"dispatch","token":token,"node_id":node_id,"prompt":prompt,"timeout":timeout}
   if model:
     payload["model"]=model
   if effort:

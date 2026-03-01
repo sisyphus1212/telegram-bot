@@ -15,7 +15,7 @@ EnvironmentFile=-/etc/agent-node.env
 # If you need a clean env for this unit, clear it in /etc/agent-node.env explicitly.
 # Each instance reads its own config file:
 #   /root/telegram-bot/node_config.<instance>.json
-ExecStart=/root/telegram-bot/.venv/bin/python /root/telegram-bot/codex_proxy.py --config /root/telegram-bot/node_config.%i.json
+ExecStart=/root/telegram-bot/.venv/bin/python /root/telegram-bot/codex_node.py --config /root/telegram-bot/node_config.%i.json
 Restart=on-failure
 RestartSec=3
 

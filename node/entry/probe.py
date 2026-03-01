@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
-from codex_stdio_client import CodexAppServerStdioProcess, CodexLocalAppServerConfig
+from bot_comm.stdio_client import CodexAppServerStdioProcess, CodexLocalAppServerConfig
 
 
 def _kv(**items: object) -> str:
@@ -25,7 +25,7 @@ async def _run(prompt: str, cwd: str, codex_bin: str, *, timeout_s: float, sandb
     app = CodexAppServerStdioProcess(CodexLocalAppServerConfig(codex_bin=codex_bin, cwd=cwd))
     try:
         await app.start()
-        await app.ensure_started_and_initialized(client_name="codex_proxy_probe", version="0.0")
+        await app.ensure_started_and_initialized(client_name="codex_node_probe", version="0.0")
         tid = await app.thread_start(cwd=cwd, sandbox=sandbox, approval_policy=approval_policy, personality="pragmatic")
         turn_id = await app.turn_start_text(thread_id=tid, text=prompt)
         text = await app.run_turn_and_collect_agent_message(thread_id=tid, turn_id=turn_id, timeout_s=float(timeout_s))

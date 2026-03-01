@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/telegram-bot
-ExecStart=/root/telegram-bot/scripts/run_proxy.sh
+ExecStart=/root/telegram-bot/scripts/run_node.sh
 Restart=on-failure
 RestartSec=3
 

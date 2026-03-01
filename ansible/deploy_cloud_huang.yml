@@ -43,9 +43,9 @@
     node_ids:
       - "cloud_huang_1"
       - "cloud_huang_2"
-    # Extra proxy/node ids allowed to register to manager (e.g. your local node id).
-    extra_allowed_proxy_ids: []
-    enforce_proxy_allowlist: true
+    # Extra node ids allowed to register to manager (e.g. your local node id).
+    extra_allowed_node_ids: []
+    enforce_node_allowlist: true
 
     # NOTE: 代理变量不在这里写死（目标机 .bashrc 里已有 export）。
     # systemd 不读取 ~/.bashrc，因此部署完成后需要在目标机登录后执行：
@@ -54,15 +54,15 @@
     #   sudo systemctl restart agent-manager.service agent-node@1.service agent-node@2.service
 
   tasks:
-    - name: Normalize extra_allowed_proxy_ids to list
+    - name: Normalize extra_allowed_node_ids to list
       ansible.builtin.set_fact:
-        extra_allowed_proxy_ids_list: >-
+        extra_allowed_node_ids_list: >-
           {{
-            extra_allowed_proxy_ids
-            if (extra_allowed_proxy_ids is sequence and (extra_allowed_proxy_ids is not string))
+            extra_allowed_node_ids
+            if (extra_allowed_node_ids is sequence and (extra_allowed_node_ids is not string))
             else (
-              (extra_allowed_proxy_ids | string).split(',')
-              if (extra_allowed_proxy_ids | default('') | string | length) > 0
+              (extra_allowed_node_ids | string).split(',')
+              if (extra_allowed_node_ids | default('') | string | length) > 0
               else []
             )
           }}
@@ -108,7 +108,7 @@
           --exclude log \
           --exclude sessions.json \
           --exclude manager_config.json \
-          --exclude proxy_config.json \
+          --exclude node_config.json \
           .
       args:
         executable: /bin/bash
@@ -146,7 +146,7 @@
       args:
         executable: /bin/bash
 
-    - name: Ensure /etc/agent-manager.env exists (do not overwrite proxy keys)
+    - name: Ensure /etc/agent-manager.env exists (do not overwrite node-related keys)
       ansible.builtin.file:
         path: /etc/agent-manager.env
         state: touch
@@ -158,7 +158,7 @@
         regexp: '^[[:space:]]*TELEGRAM_ALLOWED_USER_IDS='
         state: absent
 
-    - name: Manage manager vars block in /etc/agent-manager.env (proxy handled separately)
+    - name: Manage manager vars block in /etc/agent-manager.env (node handled separately)
       ansible.builtin.blockinfile:
         path: /etc/agent-manager.env
         marker: "# {mark} CODEX_MANAGER"
@@ -169,20 +169,20 @@
           TELEGRAM_ALLOWED_USER_IDS={{ telegram_allowed_user_ids }}
           TELEGRAM_STARTUP_NOTIFY_CHAT_IDS={{ telegram_startup_notify_chat_ids }}
           CODEX_MANAGER_WS_LISTEN={{ manager_ws_listen }}
-          CODEX_DEFAULT_PROXY={{ node_ids[0] }}
+          CODEX_DEFAULT_NODE={{ node_ids[0] }}
           CODEX_TASK_TIMEOUT=120
           CODEX_MANAGER_CONTROL_LISTEN={{ manager_control_listen }}
           CODEX_MANAGER_CONTROL_TOKEN={{ manager_control_token }}
-          CODEX_ALLOWED_PROXIES={{ (node_ids + extra_allowed_proxy_ids_list) | join(',') }}
-          CODEX_ENFORCE_PROXY_ALLOWLIST={{ 1 if (enforce_proxy_allowlist | bool) else 0 }}
+          CODEX_ALLOWED_NODES={{ (node_ids + extra_allowed_node_ids_list) | join(',') }}
+          CODEX_ENFORCE_NODE_ALLOWLIST={{ 1 if (enforce_node_allowlist | bool) else 0 }}
 
-    - name: Ensure /etc/agent-node.env exists (optional proxy for agent-node@.service)
+    - name: Ensure /etc/agent-node.env exists (optional network proxy for agent-node@.service)
       ansible.builtin.file:
         path: /etc/agent-node.env
         state: touch
         mode: "0600"
 
-    - name: Seed /etc/agent-node.env from /etc/agent-manager.env (proxy only, if missing)
+    - name: Seed /etc/agent-node.env from /etc/agent-manager.env (network proxy only, if missing)
       ansible.builtin.shell: |
         set -euo pipefail
         if [ ! -f /etc/agent-node.env ] || ! grep -q '^[[:space:]]*HTTP_PROXY=' /etc/agent-node.env; then
