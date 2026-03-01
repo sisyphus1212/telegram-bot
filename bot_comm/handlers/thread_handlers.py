@@ -20,6 +20,7 @@ class ThreadHandlers:
         cmd_thread_archive: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
         cmd_thread_unarchive: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
         cmd_thread_fork: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
+        on_thread_start_callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
         on_thread_fork_callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
         logger: Any,
     ) -> None:
@@ -33,6 +34,7 @@ class ThreadHandlers:
         self.cmd_thread_archive = cmd_thread_archive
         self.cmd_thread_unarchive = cmd_thread_unarchive
         self.cmd_thread_fork = cmd_thread_fork
+        self.on_thread_start_callback = on_thread_start_callback
         self.on_thread_fork_callback = on_thread_fork_callback
         self.logger = logger
 
@@ -101,6 +103,9 @@ class ThreadHandlers:
             return
         data = str(q.data or "")
         if not data.startswith("thread:shortcut:"):
+            if data.startswith("thread:start:"):
+                await self.on_thread_start_callback(update, context)
+                return
             if data.startswith("thread:fork:"):
                 await self.on_thread_fork_callback(update, context)
             return
@@ -113,11 +118,7 @@ class ThreadHandlers:
             elif action == "list":
                 await self.cmd_thread_list(update, context)
             elif action == "start":
-                context.args = [
-                    "sandbox=danger-full-access",
-                    "approvalPolicy=onRequest",
-                    "personality=pragmatic",
-                ]
+                context.args = []
                 await self.cmd_thread_start(update, context)
             elif action == "fork":
                 context.args = []

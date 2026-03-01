@@ -59,6 +59,17 @@ class TextMessageHandler:
             return wiz
         return {}
 
+    def _get_start_wizard(self, sk: str, node_id: str) -> dict[str, Any]:
+        sess = self.sessions_ref.get(sk)
+        if not isinstance(sess, dict):
+            return {}
+        by_node = sess.get("by_node") if isinstance(sess.get("by_node"), dict) else {}
+        entry = by_node.get(node_id) if isinstance(by_node.get(node_id), dict) else {}
+        wiz = entry.get("start_wizard")
+        if isinstance(wiz, dict):
+            return wiz
+        return {}
+
     def _build_fork_select_keyboard(self, *, sandbox: str, approval: str) -> InlineKeyboardMarkup:
         sb_vals = [
             ("workspace-write", "workspace"),
@@ -80,11 +91,44 @@ class TextMessageHandler:
         ]
         return InlineKeyboardMarkup([row1, row2, row3, row4])
 
+    def _build_start_select_keyboard(self, *, sandbox: str, approval: str) -> InlineKeyboardMarkup:
+        sb_vals = [
+            ("workspace-write", "workspace"),
+            ("read-only", "readonly"),
+            ("danger-full-access", "danger"),
+        ]
+        ap_vals = [
+            ("on-request", "onRequest"),
+            ("on-failure", "onFailure"),
+            ("untrusted", "unlessTrusted"),
+            ("never", "never"),
+        ]
+        row1 = [InlineKeyboardButton(("• " if sandbox == v else "") + lab, callback_data=f"thread:start:sandbox:{v}") for v, lab in sb_vals]
+        row2 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:start:approval:{v}") for v, lab in ap_vals[:2]]
+        row3 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:start:approval:{v}") for v, lab in ap_vals[2:]]
+        row4 = [
+            InlineKeyboardButton("Next: Confirm", callback_data="thread:start:review"),
+            InlineKeyboardButton("Cancel", callback_data="thread:start:cancel"),
+        ]
+        return InlineKeyboardMarkup([row1, row2, row3, row4])
+
     def _render_fork_text(self, *, node_id: str, source_tid: str, cwd: str, sandbox: str, approval: str) -> str:
         return "\n".join(
             [
                 f"[{node_id}] thread fork",
                 f"source: {source_tid}",
+                f"cwd: {cwd or '(missing)'}",
+                f"sandbox: {sandbox} (please choose)",
+                f"approval: {approval} (please choose)",
+                "",
+                "已接收路径，请继续选择权限后确认创建。",
+            ]
+        )
+
+    def _render_start_text(self, *, node_id: str, cwd: str, sandbox: str, approval: str) -> str:
+        return "\n".join(
+            [
+                f"[{node_id}] thread start",
                 f"cwd: {cwd or '(missing)'}",
                 f"sandbox: {sandbox} (please choose)",
                 f"approval: {approval} (please choose)",
@@ -146,6 +190,36 @@ class TextMessageHandler:
                     approval=str(wiz.get("approvalPolicy") or "on-request"),
                 )
                 await self.tg_call(lambda: update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="fork cwd input")
+                return
+        sw = self._get_start_wizard(sk, node_id)
+        if isinstance(sw, dict) and not str(sw.get("cwd") or "").strip() and self._looks_like_path_text(raw_text):
+            cwd = raw_text
+            if raw_text.lower().startswith("cwd="):
+                cwd = raw_text.split("=", 1)[1].strip()
+            if cwd:
+                sw["cwd"] = cwd
+                sw["sandbox"] = str(sw.get("sandbox") or "workspace-write")
+                sw["approvalPolicy"] = str(sw.get("approvalPolicy") or "on-request")
+                sw["sandbox_selected"] = False
+                sw["approval_selected"] = False
+                self.save_sessions_fn(self.sessions_ref)
+                kb = self._build_start_select_keyboard(
+                    sandbox=str(sw.get("sandbox") or "workspace-write"),
+                    approval=str(sw.get("approvalPolicy") or "on-request"),
+                )
+                await self.tg_call(
+                    lambda: update.message.reply_text(
+                        self._render_start_text(
+                            node_id=node_id,
+                            cwd=str(sw.get("cwd") or ""),
+                            sandbox=str(sw.get("sandbox") or "workspace-write"),
+                            approval=str(sw.get("approvalPolicy") or "on-request"),
+                        ),
+                        reply_markup=kb,
+                    ),
+                    timeout_s=15.0,
+                    what="start cwd input",
+                )
                 return
 
         task_id = uuid.uuid4().hex

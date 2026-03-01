@@ -400,6 +400,7 @@ class ManagerApp:
             cmd_thread_archive=self.cmd_thread_archive,
             cmd_thread_unarchive=self.cmd_thread_unarchive,
             cmd_thread_fork=self.cmd_thread_fork,
+            on_thread_start_callback=self.on_thread_start_callback,
             on_thread_fork_callback=self.on_thread_fork_callback,
             logger=logger,
         )
@@ -949,6 +950,9 @@ class ManagerApp:
 
     async def on_thread_fork_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.thread_methods_handlers.on_thread_fork_callback(update, context)
+
+    async def on_thread_start_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.thread_methods_handlers.on_thread_start_callback(update, context)
 
     async def cmd_skills_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.remote_command_handlers.cmd_skills_list(update, context)

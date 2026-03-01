@@ -78,6 +78,73 @@ class ThreadMethodsHandlers:
             entry["fork_wizard"] = wiz
         return wiz
 
+    def _get_start_wizard(self, sk: str, node_id: str) -> dict[str, Any]:
+        sess = self.sessions_ref.setdefault(sk, {"node": node_id, "by_node": {}, "defaults": {}})
+        by_node = sess.setdefault("by_node", {}) if isinstance(sess, dict) else {}
+        entry = by_node.setdefault(node_id, {}) if isinstance(by_node, dict) else {}
+        wiz = entry.get("start_wizard")
+        if not isinstance(wiz, dict):
+            wiz = {}
+            entry["start_wizard"] = wiz
+        return wiz
+
+    def _clear_start_wizard(self, sk: str, node_id: str) -> None:
+        sess = self.sessions_ref.get(sk)
+        if not isinstance(sess, dict):
+            return
+        by_node = sess.get("by_node") if isinstance(sess.get("by_node"), dict) else {}
+        entry = by_node.get(node_id) if isinstance(by_node.get(node_id), dict) else {}
+        if "start_wizard" in entry:
+            entry.pop("start_wizard", None)
+
+    def _build_start_select_keyboard(self, *, sandbox: str, approval: str) -> InlineKeyboardMarkup:
+        row1 = [InlineKeyboardButton(("• " if sandbox == v else "") + lab, callback_data=f"thread:start:sandbox:{v}") for v, lab in [
+            ("workspace-write", "workspace"), ("read-only", "readonly"), ("danger-full-access", "danger")
+        ]]
+        row2 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:start:approval:{v}") for v, lab in [
+            ("on-request", "onRequest"), ("on-failure", "onFailure")
+        ]]
+        row3 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:start:approval:{v}") for v, lab in [
+            ("untrusted", "unlessTrusted"), ("never", "never")
+        ]]
+        row4 = [InlineKeyboardButton("Next: Confirm", callback_data="thread:start:review"), InlineKeyboardButton("Cancel", callback_data="thread:start:cancel")]
+        return InlineKeyboardMarkup([row1, row2, row3, row4])
+
+    def _build_start_confirm_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("Create Thread", callback_data="thread:start:create"),
+            InlineKeyboardButton("Back", callback_data="thread:start:back"),
+            InlineKeyboardButton("Cancel", callback_data="thread:start:cancel"),
+        ]])
+
+    def _render_start_need_cwd_text(self, *, node_id: str) -> str:
+        return f"[{node_id}] thread start\n\n请输入路径（cwd=/path）"
+
+    def _render_start_text(self, *, node_id: str, cwd: str, sandbox: str, approval: str, sandbox_selected: bool, approval_selected: bool) -> str:
+        return "\n".join([
+            f"[{node_id}] thread start",
+            f"cwd: {cwd or '(missing)'}",
+            f"sandbox: {sandbox} {'(ok)' if sandbox_selected else '(please choose)'}",
+            f"approval: {approval} {'(ok)' if approval_selected else '(please choose)'}",
+            "",
+            "先选择 sandbox 和 approval，然后点 Next: Confirm",
+        ])
+
+    def _render_start_confirm_text(self, *, node_id: str, cwd: str, sandbox: str, approval: str, model: str) -> str:
+        cmd = f"/thread start cwd={cwd} sandbox={sandbox} approvalPolicy={approval}"
+        if model:
+            cmd += f" model={model}"
+        return "\n".join([
+            f"[{node_id}] start confirm",
+            f"target_cwd: {cwd}",
+            f"sandbox: {sandbox}",
+            f"approval: {approval}",
+            f"model: {model or '(default)'}",
+            "",
+            "full_command:",
+            cmd,
+        ])
+
     def _clear_fork_wizard(self, sk: str, node_id: str) -> None:
         sess = self.sessions_ref.get(sk)
         if not isinstance(sess, dict):
@@ -304,33 +371,146 @@ class ThreadMethodsHandlers:
         node_id = await self.require_node_online(update)
         if not node_id:
             return
-        kv = self.parse_kv(context.args or [])
-        params: dict[str, Any] = {}
-        for k in ("cwd", "sandbox", "approvalPolicy", "personality", "model", "baseInstructions"):
-            if k in kv:
-                params[k] = kv[k]
         sk = self.session_key_fn(update)
-        if "model" not in params:
-            default_model = self.get_default_model(sk)
-            if default_model:
-                params["model"] = default_model
-        core = context.application.bot_data.get("core")
-        if core is None:
-            await self.tg_call(lambda: msg.reply_text(f"[{node_id}] error: manager core missing"), timeout_s=15.0, what="/thread_start reply")
-            return
-        rep = await core.appserver_call(node_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
-        if not bool(rep.get("ok")):
-            await self.tg_call(lambda: msg.reply_text(f"[{node_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_start reply")
-            return
-        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
-        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
-        thread_id = str(thread.get("id") or "")
-        if not thread_id:
-            await self.tg_call(lambda: msg.reply_text(f"[{node_id}] error: thread/start missing id"), timeout_s=15.0, what="/thread_start reply")
-            return
-        self.set_current_thread_id(sk, node_id, thread_id)
+        kv = self.parse_kv(context.args or [])
+        wiz = self._get_start_wizard(sk, node_id)
+        cwd = str(kv.get("cwd") or "").strip()
+        if cwd:
+            wiz["cwd"] = cwd
+        if "sandbox" in kv:
+            wiz["sandbox"] = str(kv.get("sandbox") or "workspace-write")
+            wiz["sandbox_selected"] = True
+        else:
+            wiz["sandbox"] = str(wiz.get("sandbox") or "workspace-write")
+            wiz["sandbox_selected"] = bool(wiz.get("sandbox_selected"))
+        if "approvalPolicy" in kv:
+            wiz["approvalPolicy"] = str(kv.get("approvalPolicy") or "on-request")
+            wiz["approval_selected"] = True
+        else:
+            wiz["approvalPolicy"] = str(wiz.get("approvalPolicy") or "on-request")
+            wiz["approval_selected"] = bool(wiz.get("approval_selected"))
+        wiz["model"] = str(kv.get("model") or wiz.get("model") or self.get_default_model(sk) or "")
         self.save_sessions_fn(self.sessions_ref)
-        await self.tg_call(lambda: msg.reply_text(f"[{node_id}] ok threadId={thread_id}"), timeout_s=15.0, what="/thread_start reply")
+        if not str(wiz.get("cwd") or "").strip():
+            await self.tg_call(lambda: msg.reply_text(self._render_start_need_cwd_text(node_id=node_id)), timeout_s=15.0, what="/thread_start need cwd")
+            return
+        await self.tg_call(
+            lambda: msg.reply_text(
+                self._render_start_text(
+                    node_id=node_id,
+                    cwd=str(wiz.get("cwd") or ""),
+                    sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                    approval=str(wiz.get("approvalPolicy") or "on-request"),
+                    sandbox_selected=bool(wiz.get("sandbox_selected")),
+                    approval_selected=bool(wiz.get("approval_selected")),
+                ),
+                reply_markup=self._build_start_select_keyboard(
+                    sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                    approval=str(wiz.get("approvalPolicy") or "on-request"),
+                ),
+            ),
+            timeout_s=15.0,
+            what="/thread_start reply",
+        )
+
+    async def on_thread_start_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        msg = update.effective_message
+        if msg is None:
+            return
+        if not self.is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        node_id = await self.require_node_online(update)
+        if not node_id:
+            await q.answer("node offline", show_alert=True)
+            return
+        sk = self.session_key_fn(update)
+        wiz = self._get_start_wizard(sk, node_id)
+        data = str(q.data or "")
+        if data.startswith("thread:start:sandbox:"):
+            wiz["sandbox"] = data.split(":", 3)[3].strip() or "workspace-write"
+            wiz["sandbox_selected"] = True
+        elif data.startswith("thread:start:approval:"):
+            wiz["approvalPolicy"] = data.split(":", 3)[3].strip() or "on-request"
+            wiz["approval_selected"] = True
+        elif data == "thread:start:cancel":
+            self._clear_start_wizard(sk, node_id)
+            self.save_sessions_fn(self.sessions_ref)
+            await q.answer("cancelled")
+            return
+        elif data == "thread:start:review":
+            if not bool(wiz.get("sandbox_selected")) or not bool(wiz.get("approval_selected")):
+                await q.answer("请先完成 sandbox + approval 选择", show_alert=True)
+                return
+            text = self._render_start_confirm_text(
+                node_id=node_id,
+                cwd=str(wiz.get("cwd") or ""),
+                sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                approval=str(wiz.get("approvalPolicy") or "on-request"),
+                model=str(wiz.get("model") or ""),
+            )
+            await self.tg_call(lambda: context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=text, reply_markup=self._build_start_confirm_keyboard()), timeout_s=15.0, what="thread start review")
+            await q.answer("confirm")
+            return
+        elif data == "thread:start:back":
+            pass
+        elif data == "thread:start:create":
+            core = context.application.bot_data.get("core")
+            if core is None:
+                await q.answer("manager core missing", show_alert=True)
+                return
+            params: dict[str, Any] = {
+                "cwd": str(wiz.get("cwd") or ""),
+                "sandbox": str(wiz.get("sandbox") or "workspace-write"),
+                "approvalPolicy": str(wiz.get("approvalPolicy") or "on-request"),
+                "personality": "pragmatic",
+            }
+            model = str(wiz.get("model") or "").strip()
+            if model:
+                params["model"] = model
+            rep = await core.appserver_call(node_id, "thread/start", params, timeout_s=min(60.0, self.task_timeout_s))
+            if not bool(rep.get("ok")):
+                await q.answer("start failed", show_alert=True)
+                await self.tg_call(lambda: msg.reply_text(f"[{node_id}] error: {rep.get('error')}"), timeout_s=15.0, what="thread start create")
+                return
+            result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+            thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+            thread_id = str(thread.get("id") or "").strip()
+            if not thread_id:
+                await q.answer("start missing id", show_alert=True)
+                return
+            self.set_current_thread_id(sk, node_id, thread_id)
+            self._clear_start_wizard(sk, node_id)
+            self.save_sessions_fn(self.sessions_ref)
+            await q.answer("start ok")
+            await self.tg_call(lambda: msg.reply_text(f"[{node_id}] ok threadId={thread_id}"), timeout_s=15.0, what="thread start create")
+            return
+        self.save_sessions_fn(self.sessions_ref)
+        self.save_sessions_fn(self.sessions_ref)
+        await self.tg_call(
+            lambda: context.bot.edit_message_text(
+                chat_id=msg.chat_id,
+                message_id=msg.message_id,
+                text=self._render_start_text(
+                    node_id=node_id,
+                    cwd=str(wiz.get("cwd") or ""),
+                    sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                    approval=str(wiz.get("approvalPolicy") or "on-request"),
+                    sandbox_selected=bool(wiz.get("sandbox_selected")),
+                    approval_selected=bool(wiz.get("approval_selected")),
+                ),
+                reply_markup=self._build_start_select_keyboard(
+                    sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                    approval=str(wiz.get("approvalPolicy") or "on-request"),
+                ),
+            ),
+            timeout_s=15.0,
+            what="thread start update",
+        )
+        await q.answer("ok")
 
     async def cmd_thread_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         self.logger.info(f"cmd /thread_resume chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
