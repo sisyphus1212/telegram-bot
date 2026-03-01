@@ -135,8 +135,20 @@ class ThreadMethodsHandlers:
         lines: list[str] = [f"threadId: {tid or '(none)'}"]
         lines.append(f"default_model(session): {self.get_default_model(sk) or '(none)'}")
         lines.append(f"default_effort(session): {self.get_default_effort(sk) or '(none)'}")
+        core = context.application.bot_data.get("core")
+        node_cfg: dict[str, Any] = {}
+        if core is not None:
+            try:
+                cfg_rep = await core.appserver_call(node_id, "config/read", {}, timeout_s=min(60.0, self.task_timeout_s))
+                if bool(cfg_rep.get("ok")):
+                    cfg_result = cfg_rep.get("result") if isinstance(cfg_rep.get("result"), dict) else {}
+                    node_cfg = cfg_result.get("config") if isinstance(cfg_result.get("config"), dict) else {}
+            except Exception:
+                node_cfg = {}
+        lines.append(f"default_model(node): {str(node_cfg.get('model') or '').strip() or '(unknown)'}")
+        lines.append(f"default_sandbox(node): {str(node_cfg.get('sandbox_mode') or '').strip() or '(unknown)'}")
+        lines.append(f"default_approval(node): {str(node_cfg.get('approval_policy') or '').strip() or '(unknown)'}")
         if tid:
-            core = context.application.bot_data.get("core")
             if core is not None:
                 try:
                     rep = await core.appserver_call(
@@ -149,9 +161,25 @@ class ThreadMethodsHandlers:
                         result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
                         thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
                         cwd = str(thread.get("cwd") or "").strip()
-                        sandbox = str(thread.get("sandbox") or thread.get("sandboxMode") or thread.get("sandbox_mode") or "").strip()
-                        approval = str(thread.get("approvalPolicy") or thread.get("approval_policy") or "").strip()
-                        model = str(thread.get("model") or thread.get("model_id") or "").strip()
+                        sandbox = str(
+                            thread.get("sandbox")
+                            or thread.get("sandboxMode")
+                            or thread.get("sandbox_mode")
+                            or node_cfg.get("sandbox_mode")
+                            or ""
+                        ).strip()
+                        approval = str(
+                            thread.get("approvalPolicy")
+                            or thread.get("approval_policy")
+                            or node_cfg.get("approval_policy")
+                            or ""
+                        ).strip()
+                        model = str(
+                            thread.get("model")
+                            or thread.get("model_id")
+                            or node_cfg.get("model")
+                            or ""
+                        ).strip()
                         lines.append(f"model: {model or '(unknown)'}")
                         lines.append(f"sandbox: {sandbox or '(unknown)'}")
                         lines.append(f"approval: {approval or '(unknown)'}")
