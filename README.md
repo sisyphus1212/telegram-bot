@@ -259,6 +259,48 @@ sudo systemctl status agent-node@1.service
 sudo journalctl -u agent-node@1.service -f
 ```
 
+### 9. WSL 或无 systemd 场景（推荐流程）
+
+当目标环境没有可用 systemd（典型如 WSL），不要使用 `agent-node*.service`，改用单脚本常驻：
+
+```bash
+cd /root/work/telegram-bot
+
+# 启动 master
+nohup bash -lc 'cd /root/work/telegram-bot && scripts/run_node_forever.sh --config node_config.json --python .venv/bin/python' \
+  >/tmp/node.master.daemon.out 2>&1 &
+
+# 启动 void_1（或任意第二实例）
+nohup bash -lc 'cd /root/work/telegram-bot && scripts/run_node_forever.sh --config node_config.void.json --python .venv/bin/python' \
+  >/tmp/node.void.daemon.out 2>&1 &
+```
+
+检查是否运行：
+
+```bash
+ps -ef | rg 'codex_node.py --config node_config(\\.void)?\\.json'
+ls -l run/node.*.json
+```
+
+看日志：
+
+```bash
+tail -f /tmp/codex_node_forever.log
+```
+
+停止：
+
+```bash
+pkill -f 'codex_node.py --config node_config.json'
+pkill -f 'codex_node.py --config node_config.void.json'
+```
+
+说明：
+
+- WSL 流程只和“是否有 systemd”相关，与 `master` / `void_1` 这两个具体 node_id 无绑定关系。
+- 多实例统一使用 `scripts/run_node_forever.sh --config <你的配置文件>`，不要再引入重复脚本。
+- 对应操作说明也已沉淀到 skill：`skills/wsl-node-runtime/SKILL.md`。
+
 ## 故障排除
 
 1. Telegram 收不到消息：
