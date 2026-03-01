@@ -1184,6 +1184,13 @@ def main() -> int:
                     tg.add_handler(CommandHandler("skills", app._with_typing(app.cmd_skills, what="/skills typing")))
                     tg.add_handler(CommandHandler("config", app._with_typing(app.cmd_config, what="/config typing")))
                     tg.add_handler(CommandHandler("collaborationmode", app._with_typing(app.cmd_collaborationmode, what="/collaborationmode typing")))
+                    # Accept absolute-like path input such as `/root/xray` during fork wizard.
+                    tg.add_handler(
+                        MessageHandler(
+                            filters.COMMAND & filters.Regex(r"^/[^/\s]+/.+"),
+                            app._with_typing(app.on_text, what="path typing"),
+                        )
+                    )
                     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app._with_typing(app.on_text, what="text typing")))
                     async def _on_tg_error(_update: object, context: object) -> None:
                         err = getattr(context, "error", None)

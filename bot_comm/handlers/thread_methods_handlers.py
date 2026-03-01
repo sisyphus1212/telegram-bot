@@ -87,7 +87,7 @@ class ThreadMethodsHandlers:
         if "fork_wizard" in entry:
             entry.pop("fork_wizard", None)
 
-    def _build_fork_keyboard(self, *, sandbox: str, approval: str) -> InlineKeyboardMarkup:
+    def _build_fork_select_keyboard(self, *, sandbox: str, approval: str) -> InlineKeyboardMarkup:
         sb_vals = [
             ("workspace-write", "workspace"),
             ("read-only", "readonly"),
@@ -103,22 +103,57 @@ class ThreadMethodsHandlers:
         row2 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:fork:approval:{v}") for v, lab in ap_vals[:2]]
         row3 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:fork:approval:{v}") for v, lab in ap_vals[2:]]
         row4 = [
-            InlineKeyboardButton("Create Fork", callback_data="thread:fork:create"),
+            InlineKeyboardButton("Next: Confirm", callback_data="thread:fork:review"),
             InlineKeyboardButton("Cancel", callback_data="thread:fork:cancel"),
         ]
         return InlineKeyboardMarkup([row1, row2, row3, row4])
 
-    def _render_fork_text(self, *, node_id: str, source_tid: str, cwd: str, sandbox: str, approval: str) -> str:
+    def _build_fork_confirm_keyboard(self) -> InlineKeyboardMarkup:
+        row = [
+            InlineKeyboardButton("Create Fork", callback_data="thread:fork:create"),
+            InlineKeyboardButton("Back", callback_data="thread:fork:back"),
+            InlineKeyboardButton("Cancel", callback_data="thread:fork:cancel"),
+        ]
+        return InlineKeyboardMarkup([row])
+
+    def _render_fork_text(
+        self,
+        *,
+        node_id: str,
+        source_tid: str,
+        cwd: str,
+        sandbox: str,
+        approval: str,
+        sandbox_selected: bool,
+        approval_selected: bool,
+    ) -> str:
         return "\n".join(
             [
                 f"[{node_id}] thread fork",
                 f"source: {source_tid}",
                 f"cwd: {cwd or '(missing)'}",
+                f"sandbox: {sandbox} {'(ok)' if sandbox_selected else '(please choose)'}",
+                f"approval: {approval} {'(ok)' if approval_selected else '(please choose)'}",
+                "",
+                "用法: /thread fork <idx|threadId> cwd=/path",
+                "先选择 sandbox 和 approval，然后点 Next: Confirm",
+            ]
+        )
+
+    def _render_fork_confirm_text(self, *, node_id: str, source_tid: str, cwd: str, sandbox: str, approval: str) -> str:
+        full_cmd = f"/thread fork {source_tid} cwd={cwd} sandbox={sandbox} approvalPolicy={approval}"
+        return "\n".join(
+            [
+                f"[{node_id}] fork confirm",
+                f"source_thread: {source_tid}",
+                f"target_cwd: {cwd}",
                 f"sandbox: {sandbox}",
                 f"approval: {approval}",
                 "",
-                "用法: /thread fork <idx|threadId> cwd=/path",
-                "然后点按钮选择权限并 Create Fork",
+                "full_command:",
+                full_cmd,
+                "",
+                "确认后将创建新 thread 并切换到新 thread。",
             ]
         )
 
@@ -129,11 +164,18 @@ class ThreadMethodsHandlers:
                 f"source: {source_tid}",
                 "",
                 "请先输入目标路径后再选择权限：",
-                "/thread fork cwd=/your/path",
+                "/thread fork /your/path",
                 "或",
-                "/thread fork <idx|threadId> cwd=/your/path",
+                "/thread fork <idx|threadId> /your/path",
+                "或直接发一条：cwd=/your/path",
             ]
         )
+
+    def _looks_like_path_token(self, token: str) -> bool:
+        t = (token or "").strip()
+        if not t:
+            return False
+        return t.startswith("/") or t.startswith("./") or t.startswith("../") or t.startswith("~")
 
     async def _resolve_thread_token(
         self,
@@ -474,8 +516,20 @@ class ThreadMethodsHandlers:
         node_id = await self.require_node_online(update)
         if not node_id:
             return
-        kv = self.parse_kv(context.args or [])
-        source_token = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        args = list(context.args or [])
+        kv = self.parse_kv(args)
+        source_token = str(kv.get("threadId") or "").strip()
+        cwd = str(kv.get("cwd") or "").strip()
+        positional = [str(a).strip() for a in args if str(a).strip() and "=" not in str(a)]
+        if positional:
+            first = positional[0]
+            second = positional[1] if len(positional) > 1 else ""
+            if not source_token and self._looks_like_path_token(first) and not cwd:
+                cwd = first
+            elif not source_token:
+                source_token = first
+                if self._looks_like_path_token(second) and not cwd:
+                    cwd = second
         sk = self.session_key_fn(update)
         source_tid = ""
         if source_token:
@@ -485,13 +539,22 @@ class ThreadMethodsHandlers:
         if not source_tid:
             await self.tg_call(lambda: msg.reply_text("usage: /thread fork <idx|threadId> cwd=/path  (or set current thread first)"), timeout_s=15.0, what="/thread_fork reply")
             return
-        cwd = str(kv.get("cwd") or "").strip()
         wiz = self._get_fork_wizard(sk, node_id)
         wiz["source_thread_id"] = source_tid
         if cwd:
             wiz["cwd"] = cwd
         wiz["sandbox"] = str(wiz.get("sandbox") or "workspace-write")
         wiz["approvalPolicy"] = str(wiz.get("approvalPolicy") or "on-request")
+        if "sandbox" in kv:
+            wiz["sandbox"] = str(kv.get("sandbox") or "workspace-write")
+            wiz["sandbox_selected"] = True
+        else:
+            wiz["sandbox_selected"] = bool(wiz.get("sandbox_selected"))
+        if "approvalPolicy" in kv:
+            wiz["approvalPolicy"] = str(kv.get("approvalPolicy") or "on-request")
+            wiz["approval_selected"] = True
+        else:
+            wiz["approval_selected"] = bool(wiz.get("approval_selected"))
         self.save_sessions_fn(self.sessions_ref)
         if not str(wiz.get("cwd") or "").strip():
             await self.tg_call(
@@ -506,8 +569,13 @@ class ThreadMethodsHandlers:
             cwd=str(wiz.get("cwd") or ""),
             sandbox=str(wiz.get("sandbox") or "workspace-write"),
             approval=str(wiz.get("approvalPolicy") or "on-request"),
+            sandbox_selected=bool(wiz.get("sandbox_selected")),
+            approval_selected=bool(wiz.get("approval_selected")),
         )
-        kb = self._build_fork_keyboard(sandbox=str(wiz.get("sandbox") or "workspace-write"), approval=str(wiz.get("approvalPolicy") or "on-request"))
+        kb = self._build_fork_select_keyboard(
+            sandbox=str(wiz.get("sandbox") or "workspace-write"),
+            approval=str(wiz.get("approvalPolicy") or "on-request"),
+        )
         await self.tg_call(lambda: msg.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/thread_fork reply")
 
     async def on_thread_fork_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -530,8 +598,66 @@ class ThreadMethodsHandlers:
         data = str(q.data or "")
         if data.startswith("thread:fork:sandbox:"):
             wiz["sandbox"] = data.split(":", 3)[3].strip() or "workspace-write"
+            wiz["sandbox_selected"] = True
         elif data.startswith("thread:fork:approval:"):
             wiz["approvalPolicy"] = data.split(":", 3)[3].strip() or "on-request"
+            wiz["approval_selected"] = True
+        elif data == "thread:fork:back":
+            text = self._render_fork_text(
+                node_id=node_id,
+                source_tid=str(wiz.get("source_thread_id") or ""),
+                cwd=str(wiz.get("cwd") or ""),
+                sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                approval=str(wiz.get("approvalPolicy") or "on-request"),
+                sandbox_selected=bool(wiz.get("sandbox_selected")),
+                approval_selected=bool(wiz.get("approval_selected")),
+            )
+            kb = self._build_fork_select_keyboard(
+                sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                approval=str(wiz.get("approvalPolicy") or "on-request"),
+            )
+            await self.tg_call(
+                lambda: context.bot.edit_message_text(
+                    chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    text=text,
+                    reply_markup=kb,
+                ),
+                timeout_s=15.0,
+                what="thread fork back",
+            )
+            await q.answer("ok")
+            return
+        elif data == "thread:fork:review":
+            if not bool(wiz.get("sandbox_selected")) or not bool(wiz.get("approval_selected")):
+                await q.answer("请先完成 sandbox + approval 选择", show_alert=True)
+                return
+            source_tid = str(wiz.get("source_thread_id") or "").strip()
+            cwd = str(wiz.get("cwd") or "").strip()
+            sandbox = str(wiz.get("sandbox") or "workspace-write").strip()
+            approval = str(wiz.get("approvalPolicy") or "on-request").strip()
+            if not source_tid or not cwd:
+                await q.answer("缺少 source/cwd", show_alert=True)
+                return
+            text = self._render_fork_confirm_text(
+                node_id=node_id,
+                source_tid=source_tid,
+                cwd=cwd,
+                sandbox=sandbox,
+                approval=approval,
+            )
+            await self.tg_call(
+                lambda: context.bot.edit_message_text(
+                    chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    text=text,
+                    reply_markup=self._build_fork_confirm_keyboard(),
+                ),
+                timeout_s=15.0,
+                what="thread fork review",
+            )
+            await q.answer("confirm")
+            return
         elif data == "thread:fork:cancel":
             self._clear_fork_wizard(sk, node_id)
             self.save_sessions_fn(self.sessions_ref)
@@ -593,8 +719,13 @@ class ThreadMethodsHandlers:
             cwd=str(wiz.get("cwd") or ""),
             sandbox=str(wiz.get("sandbox") or "workspace-write"),
             approval=str(wiz.get("approvalPolicy") or "on-request"),
+            sandbox_selected=bool(wiz.get("sandbox_selected")),
+            approval_selected=bool(wiz.get("approval_selected")),
         )
-        kb = self._build_fork_keyboard(sandbox=str(wiz.get("sandbox") or "workspace-write"), approval=str(wiz.get("approvalPolicy") or "on-request"))
+        kb = self._build_fork_select_keyboard(
+            sandbox=str(wiz.get("sandbox") or "workspace-write"),
+            approval=str(wiz.get("approvalPolicy") or "on-request"),
+        )
         await self.tg_call(
             lambda: context.bot.edit_message_text(
                 chat_id=msg.chat_id,

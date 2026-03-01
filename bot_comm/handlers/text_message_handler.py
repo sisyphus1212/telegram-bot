@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 
@@ -48,6 +48,59 @@ class TextMessageHandler:
         self.task_timeout_s = task_timeout_s
         self.logger = logger
 
+    def _get_fork_wizard(self, sk: str, node_id: str) -> dict[str, Any]:
+        sess = self.sessions_ref.get(sk)
+        if not isinstance(sess, dict):
+            return {}
+        by_node = sess.get("by_node") if isinstance(sess.get("by_node"), dict) else {}
+        entry = by_node.get(node_id) if isinstance(by_node.get(node_id), dict) else {}
+        wiz = entry.get("fork_wizard")
+        if isinstance(wiz, dict):
+            return wiz
+        return {}
+
+    def _build_fork_select_keyboard(self, *, sandbox: str, approval: str) -> InlineKeyboardMarkup:
+        sb_vals = [
+            ("workspace-write", "workspace"),
+            ("read-only", "readonly"),
+            ("danger-full-access", "danger"),
+        ]
+        ap_vals = [
+            ("on-request", "onRequest"),
+            ("on-failure", "onFailure"),
+            ("untrusted", "unlessTrusted"),
+            ("never", "never"),
+        ]
+        row1 = [InlineKeyboardButton(("• " if sandbox == v else "") + lab, callback_data=f"thread:fork:sandbox:{v}") for v, lab in sb_vals]
+        row2 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:fork:approval:{v}") for v, lab in ap_vals[:2]]
+        row3 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:fork:approval:{v}") for v, lab in ap_vals[2:]]
+        row4 = [
+            InlineKeyboardButton("Next: Confirm", callback_data="thread:fork:review"),
+            InlineKeyboardButton("Cancel", callback_data="thread:fork:cancel"),
+        ]
+        return InlineKeyboardMarkup([row1, row2, row3, row4])
+
+    def _render_fork_text(self, *, node_id: str, source_tid: str, cwd: str, sandbox: str, approval: str) -> str:
+        return "\n".join(
+            [
+                f"[{node_id}] thread fork",
+                f"source: {source_tid}",
+                f"cwd: {cwd or '(missing)'}",
+                f"sandbox: {sandbox} (please choose)",
+                f"approval: {approval} (please choose)",
+                "",
+                "已接收路径，请继续选择权限后确认创建。",
+            ]
+        )
+
+    def _looks_like_path_text(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return False
+        if t.lower().startswith("cwd="):
+            return True
+        return t.startswith("/") or t.startswith("./") or t.startswith("../") or t.startswith("~")
+
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         trace_id = uuid.uuid4().hex
         chat_id = update.effective_chat.id if update.effective_chat else None
@@ -68,6 +121,32 @@ class TextMessageHandler:
         if not self.registry_is_online(node_id):
             await self.tg_call(lambda: update.message.reply_text(f"node offline: {node_id} (use /node)"), timeout_s=15.0, what="msg reply")
             return
+        raw_text = update.message.text.strip()
+        wiz = self._get_fork_wizard(sk, node_id)
+        if isinstance(wiz, dict) and str(wiz.get("source_thread_id") or "").strip() and self._looks_like_path_text(raw_text):
+            cwd = raw_text
+            if raw_text.lower().startswith("cwd="):
+                cwd = raw_text.split("=", 1)[1].strip()
+            if cwd:
+                wiz["cwd"] = cwd
+                wiz["sandbox"] = str(wiz.get("sandbox") or "workspace-write")
+                wiz["approvalPolicy"] = str(wiz.get("approvalPolicy") or "on-request")
+                wiz["sandbox_selected"] = False
+                wiz["approval_selected"] = False
+                self.save_sessions_fn(self.sessions_ref)
+                text = self._render_fork_text(
+                    node_id=node_id,
+                    source_tid=str(wiz.get("source_thread_id") or ""),
+                    cwd=str(wiz.get("cwd") or ""),
+                    sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                    approval=str(wiz.get("approvalPolicy") or "on-request"),
+                )
+                kb = self._build_fork_select_keyboard(
+                    sandbox=str(wiz.get("sandbox") or "workspace-write"),
+                    approval=str(wiz.get("approvalPolicy") or "on-request"),
+                )
+                await self.tg_call(lambda: update.message.reply_text(text, reply_markup=kb), timeout_s=15.0, what="fork cwd input")
+                return
 
         task_id = uuid.uuid4().hex
         thread_id = self.get_current_thread_id(sk, node_id)
