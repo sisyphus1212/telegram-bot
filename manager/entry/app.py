@@ -709,8 +709,14 @@ class ManagerApp:
     async def cmd_node(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.node_handlers.cmd_node(update, context)
 
+    async def cmd_nodecap(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.node_handlers.cmd_nodecap(update, context)
+
     async def on_node_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.node_handlers.on_node_callback(update, context)
+
+    async def on_nodecap_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.node_handlers.on_nodecap_callback(update, context)
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.status_handlers.cmd_status(update, context)
@@ -746,6 +752,7 @@ class ManagerApp:
         lines.append("")
         lines.append("1) 选择机器（node）")
         lines.append("- /node  弹出在线机器按钮，并显示 current")
+        lines.append("- /nodecap  按钮向导更新当前 node 的 capabilities（node.meta.set）")
         lines.append("- /status  查看当前会话状态汇总")
         lines.append("- /manager 查看 manager 运行信息")
         lines.append("- /model  查看当前会话模型（以及 node 默认模型），并列出可点按钮切换")
@@ -1188,8 +1195,10 @@ def main() -> int:
                     tg.add_handler(CommandHandler("decline", app._with_typing(app.cmd_decline, what="/decline typing")))
                     tg.add_handler(CallbackQueryHandler(app._with_typing(app.on_approve_callback, what="approve callback typing"), pattern=r"^approve:"))
                     tg.add_handler(CommandHandler("node", app._with_typing(app.cmd_node, what="/node typing")))
+                    tg.add_handler(CommandHandler("nodecap", app._with_typing(app.cmd_nodecap, what="/nodecap typing")))
                     tg.add_handler(CommandHandler("manager", app._with_typing(app.cmd_manager, what="/manager typing")))
                     tg.add_handler(CallbackQueryHandler(app._with_typing(app.on_node_callback, what="node callback typing"), pattern=r"^node:"))
+                    tg.add_handler(CallbackQueryHandler(app._with_typing(app.on_nodecap_callback, what="nodecap callback typing"), pattern=r"^nodecap:"))
                     tg.add_handler(CommandHandler("status", app._with_typing(app.cmd_status, what="/status typing")))
                     tg.add_handler(CommandHandler("model", app._with_typing(app.cmd_model, what="/model typing")))
                     tg.add_handler(CommandHandler("token", app._with_typing(app.cmd_token, what="/token typing")))
