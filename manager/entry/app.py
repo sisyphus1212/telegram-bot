@@ -330,6 +330,10 @@ class ManagerApp:
         default_node: str,
         manager_public_ws: str,
         task_timeout_s: float,
+        ws_listen: str = "",
+        control_listen: str = "",
+        git_sha: str = "",
+        started_at_ts: float = 0.0,
     ) -> None:
         self.core = core
         self.logger = logger
@@ -341,6 +345,10 @@ class ManagerApp:
         self.default_node = default_node
         self.manager_public_ws = manager_public_ws
         self.task_timeout_s = task_timeout_s
+        self.ws_listen = ws_listen
+        self.control_listen = control_listen
+        self.git_sha = git_sha
+        self.started_at_ts = float(started_at_ts or time.time())
         self.node_handlers = NodeHandlers(
             registry=self.registry,
             is_allowed=self._is_allowed,
@@ -723,6 +731,7 @@ class ManagerApp:
         lines.append("1) 选择机器（node）")
         lines.append("- /node  弹出在线机器按钮，并显示 current")
         lines.append("- /status  查看当前会话状态汇总")
+        lines.append("- /manager 查看 manager 运行信息")
         lines.append("- /model  查看当前会话模型（以及 node 默认模型），并列出可点按钮切换")
         lines.append("- /model <model_id>  切换当前会话模型（会在每次 turn/start 里下发，按 app-server 语义写回 thread 默认）")
         lines.append("- /result [replace|send]  结果输出模式：覆盖占位 / 单独发结果")
@@ -770,6 +779,32 @@ class ManagerApp:
         lines.append("提示：thread 内容由 Codex 保存在 node 机器的 ~/.codex/；manager 只保存 chat->(node, threadId) 路由。")
 
         await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/help reply")
+
+    async def cmd_manager(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self.logger.info(f"cmd /manager chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
+        if not update.message:
+            return
+        if not self._is_allowed(update):
+            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/manager reply")
+            return
+        now = time.time()
+        uptime_s = max(0, int(now - self.started_at_ts))
+        h = uptime_s // 3600
+        m = (uptime_s % 3600) // 60
+        s = uptime_s % 60
+        online = self.registry.online_node_ids()
+        lines: list[str] = []
+        lines.append("manager:")
+        lines.append(f"uptime: {h:02d}:{m:02d}:{s:02d}")
+        lines.append(f"git: {self.git_sha or '(unknown)'}")
+        lines.append(f"ws_listen: {self.ws_listen or '(unknown)'}")
+        lines.append(f"manager_ws(public): {self.manager_public_ws or '(unknown)'}")
+        lines.append(f"control_listen: {self.control_listen or '(disabled)'}")
+        lines.append(f"default_node: {self.default_node or '(none)'}")
+        lines.append(f"online_count: {len(online)}")
+        if online:
+            lines.append(f"online_nodes: {', '.join(online)}")
+        await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/manager reply")
 
     async def cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.approval_handlers.cmd_approve(update, context)
@@ -1048,6 +1083,10 @@ def main() -> int:
             default_node=default_node,
             manager_public_ws=public_ws,
             task_timeout_s=args.timeout,
+            ws_listen=args.ws_listen,
+            control_listen=args.control_listen,
+            git_sha=git_sha,
+            started_at_ts=time.time(),
         )
         async def telegram_loop() -> None:
             # Keep WS registry alive even if Telegram is temporarily unreachable.
@@ -1103,6 +1142,7 @@ def main() -> int:
                     tg.add_handler(CommandHandler("decline", app._with_typing(app.cmd_decline, what="/decline typing")))
                     tg.add_handler(CallbackQueryHandler(app._with_typing(app.on_approve_callback, what="approve callback typing"), pattern=r"^approve:"))
                     tg.add_handler(CommandHandler("node", app._with_typing(app.cmd_node, what="/node typing")))
+                    tg.add_handler(CommandHandler("manager", app._with_typing(app.cmd_manager, what="/manager typing")))
                     tg.add_handler(CallbackQueryHandler(app._with_typing(app.on_node_callback, what="node callback typing"), pattern=r"^node:"))
                     tg.add_handler(CommandHandler("status", app._with_typing(app.cmd_status, what="/status typing")))
                     tg.add_handler(CommandHandler("model", app._with_typing(app.cmd_model, what="/model typing")))
