@@ -44,6 +44,20 @@
    - `replace`：结果覆盖 placeholder
    - `send`：placeholder 改为 done/failed，结果单独发送
 
+### 任务状态机（Manager 侧）
+
+为避免“超时后无法追踪”，manager 将任务按状态机记录：
+
+1. `queued`
+2. `acked`
+3. `running`
+4. `turn_completed`
+5. `timeout`（带 `timeout_kind`）
+6. `late_progress`（超时后仍收到进度）
+7. `done` / `failed` / `late_result`
+
+每次迁移都写结构化日志：`op=task.state task_id trace_id phase_seq state timeout_kind`。
+
 ## 状态与持久化
 
 - Manager 持久化 **路由状态** 到 `manager_data.db`：
@@ -68,11 +82,23 @@
   - 失败：`{"type":"task_result","task_id":"...","ok":false,"error":"..."}`
 - `task_progress`：
   - `{"type":"task_progress","task_id":"...","event":"item/started","stage":"command","summary":"执行命令: ip -4 addr show"}`
+- `node_runtime_status`：
+  - `{"type":"node_runtime_status","node_id":"...","busy":true,"queue_len":0,"current_task_id":"...","current_thread_id":"...","current_stage":"...","status_age_ms":...}`
+- `node_network_alert`：
+  - `{"type":"node_network_alert","node_id":"...","target":"api.openai.com:443","consecutive_failures":3,"last_error":"..."}`
 - `appserver_response`（app-server JSON-RPC 透传结果）：
   - `{"type":"appserver_response","req_id":"...","ok":true,"result":{...}}`
   - `{"type":"appserver_response","req_id":"...","ok":false,"error":"..."}`
 
 注意：当 node 队列已满时，node 会直接返回 `task_result(ok=false, error="node queue full (max=10)")`，Manager 会将错误回写到 Telegram。
+
+### 长任务与超时处理
+
+1. Node 持续转发 app-server 事件摘要（`task_progress`）。
+2. Manager 使用“空闲超时/阶段超时”判定，而不是简单“总耗时到点即失败”。
+3. 若超时后仍收到同 `task_id` 的事件，不丢弃，标记为 `late_progress/late_result` 并继续投递 TG。
+4. Node 侧超过 120s 的执行会打 `op=task.timeout_watch`，用于区分“真卡死”与“长任务仍在推进”。
+5. Node 定时探测 OpenAI 连通性，连续失败会上报 manager（`node_network_alert`）。
 
 ### Manager -> Node（下行）
 

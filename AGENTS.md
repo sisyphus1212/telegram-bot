@@ -21,6 +21,8 @@
 - `execution_defaults(node)`（node 注册上报默认值）
 - `session_thread` 与 `status_thread`（标注来源）
 7. node 启动时 `codex_cwd` 不存在需自动创建并 warning；创建失败才退出。
+8. 任何发往 TG 的任务相关消息必须带 `task_id`、`trace_id`、`node`、`status` 元信息。
+9. 涉及超时逻辑的改动必须保留 `timeout_kind`（`queue/execution/return`）并继续支持 `late_progress/late_result`。
 
 ## 3. 项目结构（代码定位）
 
@@ -50,6 +52,7 @@ telegram-bot/
 4. 改会话与 thread 绑定：`manager/service/session_service.py` + `manager/infra/repo_sessions.py`
 5. 改 token 鉴权：`manager/auth/node_auth_service.py` + `manager/infra/repo_tokens.py` + `bot_comm/handlers/token_handlers.py`
 6. 改 `/status`：`bot_comm/handlers/status_handlers.py`
+7. 改日志与超时观测：`manager/service/manager_core.py` + `bot_comm/infra/telegram_outbox.py` + `node/entry/app.py`
 
 ## 5. 文档分工（防混乱）
 

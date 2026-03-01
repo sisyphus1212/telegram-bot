@@ -277,6 +277,83 @@ sudo journalctl -u agent-node@1.service -f
 5. 安全：
    - 真实接管 PC 前必须加 `TELEGRAM_ALLOWED_USER_IDS`，并只给可信节点分发 token
 
+## 日志与可观测性（重要）
+
+当前链路采用统一元信息，所有关键消息都应带：
+
+- `src`：消息来源（`manager` / `node`）
+- `node`：节点名
+- `status`：状态（`working` / `progress` / `done` / `failed` / `timeout` / `late_progress` / `late_result`）
+- `task_id`：任务唯一 ID（排障主键）
+- `trace_id`：跨模块关联 ID
+- `chat_id`：Telegram 会话
+- `timeout_count`：该任务已触发超时次数
+
+Telegram 侧推荐观察格式：
+
+1. 第一行：`[src=...][node=...][status=...]`
+2. 第二行：`[task_id=...][trace_id=...][chat_id=...][timeout_count=...]`
+3. 第三行开始：增量进度/结果正文
+
+Manager 关键结构化日志（`journalctl -u agent-manager.service`）：
+
+- `op=task.state`：任务状态机迁移（`queued/acked/running/turn_completed/timeout/late_progress/done/failed/late_result`）
+- `op=ws.recv`：收到 node 上行消息
+- `op=progress.forward`：进度转发到 TG
+- `op=task.timeout`：超时判定
+- `op=node.network_alert`：node 上报 OpenAI 连通性异常
+- `op=node.runtime_status`：node 周期性运行状态
+
+Node 关键结构化日志（`journalctl -u agent-node@1.service` 或 `agent-node.service`）：
+
+- `op=task.start` / `op=task.done`
+- `op=task.progress`（app-server 事件摘要）
+- `op=task.timeout_watch`（任务执行超过 120s 的运行中告警）
+- `op=ws.send` / `op=ws.recv`
+- `op=network.probe`（OpenAI 连通性探测）
+
+## 超时语义（必须区分）
+
+当前超时不再等同于“任务终止”，而是“manager 侧超时判定”：
+
+1. `timeout_kind=queue`：尚未进入有效执行阶段
+2. `timeout_kind=execution`：执行中超时
+3. `timeout_kind=return`：执行结束但回传阶段超时
+
+若超时后仍收到同一 `task_id` 的 `task_progress/task_result`：
+
+- 应标注为 `late_progress` / `late_result`
+- 继续向 Telegram 输出，不丢后续信息
+- 通过 `timeout_count` 标记该任务经历过超时
+
+## Debug SOP（全链路）
+
+按顺序做，避免误判：
+
+1. 查 manager 状态机是否推进：
+```bash
+journalctl -u agent-manager.service --since "10 min ago" --no-pager | rg "op=task.state|task_id="
+```
+2. 查同一 `task_id` 在 manager 是否有 `task_progress/task_result`：
+```bash
+journalctl -u agent-manager.service --since "10 min ago" --no-pager | rg "task_id=<TASK_ID>|op=progress.forward|op=ws.recv"
+```
+3. 查 node 是否仍在产出 app-server 事件：
+```bash
+journalctl -u agent-node@1.service --since "10 min ago" --no-pager | rg "task_id=<TASK_ID>|op=task.progress|op=task.timeout_watch"
+```
+4. 若 TG 无更新但 node 有输出：重点检查 manager 是否把该 task 误判为 orphan（查 `late_progress/late_result` 与映射日志）。
+5. 查 OpenAI 网络可达性：
+```bash
+journalctl -u agent-node@1.service --since "30 min ago" --no-pager | rg "op=network.probe|node_network_alert"
+```
+6. 最后确认 Telegram 发送是否失败：
+```bash
+journalctl -u agent-manager.service --since "10 min ago" --no-pager | rg "telegram|send_message|edit_message|429|timeout|forbidden"
+```
+
+排障时务必固定一个 `task_id` 做主线，禁止只按时间片段盲查。
+
 ## 多机管理
 
 - `/node` 弹出在线 node 按钮，并显示 current
