@@ -29,6 +29,8 @@ CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh servers
 ```bash
 python3 scripts/node_manager_rpc.py system.status --token "$CODEX_MANAGER_CONTROL_TOKEN"
 python3 scripts/node_manager_rpc.py system.servers --token "$CODEX_MANAGER_CONTROL_TOKEN"
+python3 scripts/node_manager_rpc.py node.meta.set --token "$CODEX_MANAGER_CONTROL_TOKEN" \
+  --params-json '{"node_id":"my_node","capabilities":{"roles":["ansible"],"note":"ops"}}' --print-json
 ```
 
 2. 生成 token（完整返回）

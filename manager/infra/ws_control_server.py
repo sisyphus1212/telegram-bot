@@ -225,6 +225,24 @@ async def run_control_server(
                             writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
                             await writer.drain()
                             continue
+                        if action == "node.meta.set":
+                            node_id = str(params.get("node_id") or "").strip()
+                            if not node_id:
+                                out = rpc_err("bad_request", "missing node_id")
+                            else:
+                                ok = await registry.set_node_capabilities(node_id=node_id, capabilities=params.get("capabilities"))
+                                if not ok:
+                                    out = rpc_err("not_found", f"node offline: {node_id}")
+                                else:
+                                    out = rpc_ok(
+                                        {
+                                            "node_id": node_id,
+                                            "capabilities": registry.get_node_capabilities(node_id),
+                                        }
+                                    )
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
                         out = rpc_err("bad_action", f"unknown action: {action}")
                         writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()

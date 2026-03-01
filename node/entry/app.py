@@ -54,6 +54,15 @@ def _cfg_get_str(cfg: JsonDict, key: str) -> str:
     return v.strip() if isinstance(v, str) else ""
 
 
+def _cfg_get_capabilities(cfg: JsonDict) -> Any:
+    # Optional structured capability descriptor, e.g.
+    # {"tools":["ansible","docker"],"region":"cn-hz","note":"build host"}
+    v = cfg.get("capabilities")
+    if isinstance(v, (dict, list, str, int, float, bool)) or v is None:
+        return v
+    return str(v)
+
+
 def _ensure_cwd_ready(*, node_id: str, cwd: str) -> str:
     p = Path(str(cwd or "")).expanduser()
     if not p.is_absolute():
@@ -281,6 +290,7 @@ class CodexNodeAgent:
         *,
         sandbox: str,
         approval_policy: str,
+        capabilities: Any,
         config_path: str,
         log_path_hint: str,
     ) -> None:
@@ -290,6 +300,7 @@ class CodexNodeAgent:
         self.cwd = cwd
         self.sandbox = sandbox
         self.approval_policy = approval_policy
+        self.capabilities = capabilities
         self._approval_waiters: dict[str, asyncio.Future[str]] = {}
         self._ws: Any | None = None
         self._ws_send_lock: asyncio.Lock | None = None
@@ -394,6 +405,7 @@ class CodexNodeAgent:
             "max_pending": self.max_pending,
             "sandbox": self.sandbox,
             "approval_policy": self.approval_policy,
+            "capabilities": self.capabilities,
             "codex_cwd": self.cwd,
             "config_path": self._config_path or "",
             "log_path_hint": self._log_path_hint or "",
@@ -726,6 +738,7 @@ class CodexNodeAgent:
                                     "host_name": socket.gethostname(),
                                     "sandbox": self.sandbox,
                                     "approval_policy": self.approval_policy,
+                                    "capabilities": self.capabilities,
                                 }
                             )
                         )
@@ -1006,6 +1019,7 @@ def main() -> int:
     max_pending = int(os.environ.get("NODE_MAX_PENDING") or str(cfg.get("max_pending") or 10))
     sandbox = args.sandbox or os.environ.get("CODEX_SANDBOX") or _cfg_get_str(cfg, "sandbox") or "workspaceWrite"
     approval_policy = args.approval_policy or os.environ.get("CODEX_APPROVAL_POLICY") or _cfg_get_str(cfg, "approval_policy") or "unlessTrusted"
+    capabilities = _cfg_get_capabilities(cfg)
 
     if not node_id:
         raise SystemExit("missing NODE_ID / --node-id")
@@ -1027,6 +1041,7 @@ def main() -> int:
         env=env or None,
         sandbox=sandbox,
         approval_policy=approval_policy,
+        capabilities=capabilities,
         config_path=config_path_str,
         log_path_hint=log_path_hint,
     )

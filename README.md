@@ -221,6 +221,12 @@ python3 scripts/node_manager_rpc.py token.generate \
   --token "$CODEX_MANAGER_CONTROL_TOKEN" \
   --params-json '{"node_id":"my_node","note":"bootstrap"}' \
   --print-json
+
+# 注册后动态更新某个在线 node 的 capabilities
+python3 scripts/node_manager_rpc.py node.meta.set \
+  --token "$CODEX_MANAGER_CONTROL_TOKEN" \
+  --params-json '{"node_id":"my_node","capabilities":{"roles":["ansible","build"],"note":"prod operator"}}' \
+  --print-json
 ```
 
 RPC 回归测试（建议每次升级后跑）：

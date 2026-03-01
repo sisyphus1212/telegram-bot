@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -41,6 +42,17 @@ class NodeHandlers:
         lines.append("")
         lines.append("点击按钮选择 node：")
         return "\n".join(lines)
+
+    def _format_capabilities(self, node_id: str) -> str:
+        caps = self.registry.get_node_capabilities(node_id)
+        if caps is None or caps == "":
+            return "(none)"
+        if isinstance(caps, str):
+            return caps
+        try:
+            return json.dumps(caps, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(caps)
 
     def build_node_keyboard(self, *, online: list[str], selected: str) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = []
@@ -98,6 +110,13 @@ class NodeHandlers:
                 return
             self.set_selected_node(sk, node_id)
             self.save_sessions_fn(self.sessions_ref)
+            if q.message is not None:
+                caps_text = self._format_capabilities(node_id)
+                await self.tg_call(
+                    lambda: q.message.reply_text(f"node selected: {self.registry.get_node_label(node_id)}\ncapabilities:\n{caps_text}"),
+                    timeout_s=15.0,
+                    what="node capabilities reply",
+                )
         else:
             await q.answer()
             return

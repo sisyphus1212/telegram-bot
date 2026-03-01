@@ -23,6 +23,7 @@ class NodeConn:
     connected_at: float = 0.0
     sandbox: str = ""
     approval_policy: str = ""
+    capabilities: Any = None
 
 
 class NodeRegistry:
@@ -51,6 +52,7 @@ class NodeRegistry:
         peer: str = "",
         sandbox: str = "",
         approval_policy: str = "",
+        capabilities: Any = None,
     ) -> bool:
         ok, reason = await self._node_auth.validate_for_node(node_id=node_id, token=token)
         if not ok:
@@ -68,6 +70,7 @@ class NodeRegistry:
                 connected_at=now,
                 sandbox=str(sandbox or "").strip(),
                 approval_policy=str(approval_policy or "").strip(),
+                capabilities=capabilities,
             )
         return True
 
@@ -96,6 +99,7 @@ class NodeRegistry:
                     "last_seen": c.last_seen,
                     "sandbox": c.sandbox,
                     "approval_policy": c.approval_policy,
+                    "capabilities": c.capabilities,
                 }
                 for c in self._conns.values()
             ]
@@ -114,6 +118,20 @@ class NodeRegistry:
             return node_id
         hn = (c.host_name or "").strip()
         return f"{node_id} ({hn})" if hn else node_id
+
+    def get_node_capabilities(self, node_id: str) -> Any:
+        c = self._conns.get(node_id)
+        if not c:
+            return None
+        return c.capabilities
+
+    async def set_node_capabilities(self, node_id: str, capabilities: Any) -> bool:
+        async with self._lock:
+            c = self._conns.get(node_id)
+            if not c:
+                return False
+            c.capabilities = capabilities
+            return True
 
     async def send_json(self, node_id: str, msg: JsonDict) -> None:
         async with self._lock:

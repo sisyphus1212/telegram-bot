@@ -26,6 +26,7 @@ async def run_ws_server(listen: str, registry: Any, core: Any, *, logger: Any) -
             host_name = str(msg.get("host_name") or "").strip()
             sandbox = str(msg.get("sandbox") or "").strip()
             approval_policy = str(msg.get("approval_policy") or "").strip()
+            capabilities = msg.get("capabilities")
             if not node_id:
                 await ws.send(json.dumps({"type": "register_error", "error": "missing node_id"}))
                 return
@@ -38,6 +39,7 @@ async def run_ws_server(listen: str, registry: Any, core: Any, *, logger: Any) -
                 peer=str(peer or ""),
                 sandbox=sandbox,
                 approval_policy=approval_policy,
+                capabilities=capabilities,
             )
             if not ok:
                 logger.warning(f"op=ws.register.reject peer={peer!r} node_id={node_id} host_name={host_name or '-'}")
