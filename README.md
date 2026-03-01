@@ -191,6 +191,25 @@ export CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME
 scripts/verify_phase2_appserver_rpc.sh node27
 ```
 
+补充：统一本地控制脚本（推荐）
+
+```bash
+# 查看 control 面状态
+CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh status
+
+# 查看在线节点
+CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh servers
+
+# 直接在 manager 本机生成 node token
+CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh token-generate --node-id my_node --note "bootstrap"
+
+# 直接输出可落地的 node_config.json（最常用）
+CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh token-generate --node-id my_node --print-config
+
+# 废除 token
+CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh token-revoke --token-id <token_id>
+```
+
 阶段 3：Telegram 端到端验证见 [docs/verify_phase3_tg.md](/root/telegram-bot/docs/verify_phase3_tg.md)。
 
 ### 7. 验证链路（TG）
@@ -330,6 +349,13 @@ pkill -f 'codex_node.py --config node_config.void.json'
      - `config_path`：该实例使用的配置文件
      - `log_path_hint`：日志查看建议命令
      - `current_task_id/current_thread_id`：正在处理的任务与线程
+
+7. 本地脚本调用 manager 控制口失败：
+   - 确认 manager 已启用 control server：`CODEX_MANAGER_CONTROL_LISTEN` + `CODEX_MANAGER_CONTROL_TOKEN`
+   - 确认调用脚本在 manager 所在机器上执行，或网络可达该监听地址
+   - 先测：
+     - `CODEX_MANAGER_CONTROL_TOKEN=... scripts/manager_ctl.sh status`
+     - `CODEX_MANAGER_CONTROL_TOKEN=... scripts/manager_ctl.sh servers`
 
 ## 日志与可观测性（重要）
 

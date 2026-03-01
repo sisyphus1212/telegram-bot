@@ -14,8 +14,10 @@ async def run_control_server(
     *,
     registry: Any,
     core: Any,
+    node_auth: Any,
     session_store: SessionStore,
     base_dir: Path,
+    manager_public_ws: str,
     logger: Any,
 ) -> None:
     """
@@ -24,6 +26,18 @@ async def run_control_server(
     """
     host, port_s = listen.rsplit(":", 1)
     port = int(port_s)
+
+    def _build_node_config(node_id: str, plain_token: str) -> dict[str, Any]:
+        return {
+            "manager_ws": manager_public_ws,
+            "node_id": node_id,
+            "node_token": plain_token,
+            "max_pending": 10,
+            "sandbox": "dangerFullAccess",
+            "approval_policy": "onRequest",
+            "codex_cwd": str(base_dir),
+            "codex_bin": "codex",
+        }
 
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -180,6 +194,66 @@ async def run_control_server(
                         writer.write((json.dumps({"ok": True, "type": "dispatch_text", "result": {"ok": False, "error": f"{type(e).__name__}: {e}"}}, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()
                         logger.info(f"op=ctl.send peer={peer} type=dispatch_text ok=true node_id={node_id} result_ok=false error={type(e).__name__}")
+                    continue
+                if t == "token_generate":
+                    node_id = str(req.get("node_id") or "").strip()
+                    note = str(req.get("note") or "").strip()
+                    created_by_raw = req.get("created_by")
+                    created_by = int(created_by_raw) if isinstance(created_by_raw, int) else None
+                    if not node_id:
+                        writer.write((json.dumps({"ok": False, "type": "token_generate", "error": "missing node_id"}) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        continue
+                    try:
+                        rec = await node_auth.generate(node_id=node_id, note=note, created_by=created_by)
+                        plain_token = str(rec.get("token") or "")
+                        token_id = str(rec.get("token_id") or "")
+                        resp = {
+                            "ok": True,
+                            "type": "token_generate",
+                            "token_id": token_id,
+                            "node_id": node_id,
+                            "note": note,
+                            "token": plain_token,
+                            "node_config": _build_node_config(node_id, plain_token),
+                        }
+                        writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=token_generate ok=true node_id={node_id} token_id={token_id}")
+                    except Exception as e:
+                        writer.write((json.dumps({"ok": False, "type": "token_generate", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=token_generate ok=false node_id={node_id} error={type(e).__name__}")
+                    continue
+                if t == "token_list":
+                    include_revoked = bool(req.get("include_revoked"))
+                    try:
+                        items = await node_auth.list_items(include_revoked=include_revoked)
+                        writer.write((json.dumps({"ok": True, "type": "token_list", "items": items}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=token_list ok=true include_revoked={include_revoked} count={len(items)}")
+                    except Exception as e:
+                        writer.write((json.dumps({"ok": False, "type": "token_list", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=token_list ok=false error={type(e).__name__}")
+                    continue
+                if t == "token_revoke":
+                    token_id = str(req.get("token_id") or "").strip()
+                    revoked_by_raw = req.get("revoked_by")
+                    revoked_by = int(revoked_by_raw) if isinstance(revoked_by_raw, int) else None
+                    if not token_id:
+                        writer.write((json.dumps({"ok": False, "type": "token_revoke", "error": "missing token_id"}) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        continue
+                    try:
+                        ok, reason = await node_auth.revoke(token_id=token_id, revoked_by=revoked_by)
+                        writer.write((json.dumps({"ok": bool(ok), "type": "token_revoke", "token_id": token_id, "reason": reason}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=token_revoke ok={bool(ok)} token_id={token_id}")
+                    except Exception as e:
+                        writer.write((json.dumps({"ok": False, "type": "token_revoke", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        logger.info(f"op=ctl.send peer={peer} type=token_revoke ok=false token_id={token_id} error={type(e).__name__}")
                     continue
                 writer.write((json.dumps({"ok": False, "error": "unknown type"}) + "\n").encode("utf-8"))
                 await writer.drain()
