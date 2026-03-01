@@ -130,7 +130,31 @@ class ThreadMethodsHandlers:
             return
         sk = self.session_key_fn(update)
         tid = self.get_current_thread_id(sk, node_id)
-        await self.tg_call(lambda: msg.reply_text(f"threadId: {tid or '(none)'}"), timeout_s=15.0, what="/thread_current reply")
+        lines: list[str] = [f"threadId: {tid or '(none)'}"]
+        if tid:
+            core = context.application.bot_data.get("core")
+            if core is not None:
+                try:
+                    rep = await core.appserver_call(
+                        node_id,
+                        "thread/read",
+                        {"threadId": tid, "includeTurns": False},
+                        timeout_s=min(60.0, self.task_timeout_s),
+                    )
+                    if bool(rep.get("ok")):
+                        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+                        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+                        cwd = str(thread.get("cwd") or "").strip()
+                        sandbox = str(thread.get("sandbox") or thread.get("sandboxMode") or thread.get("sandbox_mode") or "").strip()
+                        approval = str(thread.get("approvalPolicy") or thread.get("approval_policy") or "").strip()
+                        model = str(thread.get("model") or thread.get("model_id") or "").strip()
+                        lines.append(f"model: {model or '(unknown)'}")
+                        lines.append(f"sandbox: {sandbox or '(unknown)'}")
+                        lines.append(f"approval: {approval or '(unknown)'}")
+                        lines.append(f"cwd: {cwd or '(unknown)'}")
+                except Exception:
+                    pass
+        await self.tg_call(lambda: msg.reply_text("\n".join(lines)), timeout_s=15.0, what="/thread_current reply")
 
     async def cmd_thread_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         self.logger.info(f"cmd /thread_start chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
