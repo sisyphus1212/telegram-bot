@@ -38,6 +38,56 @@ class ThreadMethodsHandlers:
         self.task_timeout_s = task_timeout_s
         self.logger = logger
 
+    def _get_thread_index_map(self, sk: str, node_id: str) -> list[str]:
+        sess = self.sessions_ref.get(sk)
+        if not isinstance(sess, dict):
+            return []
+        by_node = sess.get("by_node") if isinstance(sess.get("by_node"), dict) else {}
+        entry = by_node.get(node_id) if isinstance(by_node.get(node_id), dict) else {}
+        arr = entry.get("thread_list_index") if isinstance(entry.get("thread_list_index"), list) else []
+        out: list[str] = []
+        for x in arr:
+            s = str(x or "").strip()
+            if s:
+                out.append(s)
+        return out
+
+    def _set_thread_index_map(self, sk: str, node_id: str, ids: list[str]) -> None:
+        sess = self.sessions_ref.setdefault(sk, {"node": node_id, "by_node": {}, "defaults": {}})
+        if not isinstance(sess, dict):
+            return
+        by_node = sess.get("by_node")
+        if not isinstance(by_node, dict):
+            by_node = {}
+            sess["by_node"] = by_node
+        entry = by_node.get(node_id)
+        if not isinstance(entry, dict):
+            entry = {}
+            by_node[node_id] = entry
+        entry["thread_list_index"] = ids[:50]
+
+    async def _resolve_thread_token(self, *, update: Update, node_id: str, token: str, usage: str) -> str:
+        token = (token or "").strip()
+        if not token:
+            return ""
+        if token.isdigit():
+            idx = int(token)
+            if idx <= 0:
+                return ""
+            sk = self.session_key_fn(update)
+            arr = self._get_thread_index_map(sk, node_id)
+            if idx <= len(arr):
+                return str(arr[idx - 1])
+            msg = update.effective_message
+            if msg is not None:
+                await self.tg_call(
+                    lambda: msg.reply_text(f"[{node_id}] idx out of range: {idx} (list_count={len(arr)}). 先执行 /thread list"),
+                    timeout_s=15.0,
+                    what=f"{usage} idx",
+                )
+            return ""
+        return token
+
     async def cmd_thread_current(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         self.logger.info(f"cmd /thread_current chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         msg = update.effective_message
@@ -103,7 +153,8 @@ class ThreadMethodsHandlers:
         if not node_id:
             return
         kv = self.parse_kv(context.args or [])
-        thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        raw = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        thread_id = await self._resolve_thread_token(update=update, node_id=node_id, token=raw, usage="/thread_resume")
         if not thread_id:
             await self.tg_call(lambda: update.message.reply_text("usage: /thread_resume <id>"), timeout_s=15.0, what="/thread_resume reply")
             return
@@ -157,6 +208,7 @@ class ThreadMethodsHandlers:
         result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
         data = result.get("data") if isinstance(result.get("data"), list) else []
         lines: list[str] = [f"node: {node_id}", f"count: {len(data)}"]
+        idx_ids: list[str] = []
         for i, item in enumerate(data[:20], start=1):
             if not isinstance(item, dict):
                 continue
@@ -165,8 +217,16 @@ class ThreadMethodsHandlers:
             status = item.get("status") if isinstance(item.get("status"), dict) else {}
             stype = str(status.get("type") or "")
             lines.append(f"{i}. {tid} [{stype}] {preview[:80]}")
+            if tid:
+                idx_ids.append(tid)
+        sk = self.session_key_fn(update)
+        self._set_thread_index_map(sk, node_id, idx_ids)
+        self.save_sessions_fn(self.sessions_ref)
         if result.get("nextCursor"):
             lines.append(f"nextCursor: {result.get('nextCursor')}")
+        if idx_ids:
+            lines.append("")
+            lines.append("tips: /thread resume <idx|threadId>, /thread read <idx|threadId>")
         await self.tg_call(lambda: msg.reply_text("\n".join(lines)), timeout_s=15.0, what="/thread_list reply")
 
     async def cmd_thread_read(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -180,7 +240,8 @@ class ThreadMethodsHandlers:
         if not node_id:
             return
         kv = self.parse_kv(context.args or [])
-        thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        raw = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        thread_id = await self._resolve_thread_token(update=update, node_id=node_id, token=raw, usage="/thread_read")
         if not thread_id:
             await self.tg_call(lambda: update.message.reply_text("usage: /thread_read <id> includeTurns=false"), timeout_s=15.0, what="/thread_read reply")
             return
@@ -206,7 +267,8 @@ class ThreadMethodsHandlers:
         if not node_id:
             return
         kv = self.parse_kv(context.args or [])
-        thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        raw = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        thread_id = await self._resolve_thread_token(update=update, node_id=node_id, token=raw, usage="/thread_archive")
         if not thread_id:
             sk = self.session_key_fn(update)
             thread_id = self.get_current_thread_id(sk, node_id)
@@ -234,7 +296,8 @@ class ThreadMethodsHandlers:
         if not node_id:
             return
         kv = self.parse_kv(context.args or [])
-        thread_id = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        raw = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        thread_id = await self._resolve_thread_token(update=update, node_id=node_id, token=raw, usage="/thread_unarchive")
         if not thread_id:
             await self.tg_call(lambda: update.message.reply_text("usage: /thread_unarchive <id>"), timeout_s=15.0, what="/thread_unarchive reply")
             return
