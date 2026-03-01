@@ -223,6 +223,14 @@ python3 scripts/node_manager_rpc.py token.generate \
   --print-json
 ```
 
+RPC 回归测试（建议每次升级后跑）：
+
+```bash
+CODEX_MANAGER_CONTROL=127.0.0.1:18766 \
+CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME \
+scripts/verify_manager_rpc.sh
+```
+
 阶段 3：Telegram 端到端验证见 [docs/verify_phase3_tg.md](/root/telegram-bot/docs/verify_phase3_tg.md)。
 
 ### 7. 验证链路（TG）
