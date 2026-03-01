@@ -122,6 +122,19 @@ class ThreadMethodsHandlers:
             ]
         )
 
+    def _render_fork_need_cwd_text(self, *, node_id: str, source_tid: str) -> str:
+        return "\n".join(
+            [
+                f"[{node_id}] thread fork",
+                f"source: {source_tid}",
+                "",
+                "请先输入目标路径后再选择权限：",
+                "/thread fork cwd=/your/path",
+                "或",
+                "/thread fork <idx|threadId> cwd=/your/path",
+            ]
+        )
+
     async def _resolve_thread_token(
         self,
         *,
@@ -475,10 +488,18 @@ class ThreadMethodsHandlers:
         cwd = str(kv.get("cwd") or "").strip()
         wiz = self._get_fork_wizard(sk, node_id)
         wiz["source_thread_id"] = source_tid
-        wiz["cwd"] = cwd
+        if cwd:
+            wiz["cwd"] = cwd
         wiz["sandbox"] = str(wiz.get("sandbox") or "workspace-write")
         wiz["approvalPolicy"] = str(wiz.get("approvalPolicy") or "on-request")
         self.save_sessions_fn(self.sessions_ref)
+        if not str(wiz.get("cwd") or "").strip():
+            await self.tg_call(
+                lambda: msg.reply_text(self._render_fork_need_cwd_text(node_id=node_id, source_tid=source_tid)),
+                timeout_s=15.0,
+                what="/thread_fork need cwd",
+            )
+            return
         text = self._render_fork_text(
             node_id=node_id,
             source_tid=source_tid,
