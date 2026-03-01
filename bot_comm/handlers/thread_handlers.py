@@ -19,6 +19,8 @@ class ThreadHandlers:
         cmd_thread_read: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
         cmd_thread_archive: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
         cmd_thread_unarchive: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
+        cmd_thread_fork: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
+        on_thread_fork_callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Any],
         logger: Any,
     ) -> None:
         self.is_allowed = is_allowed
@@ -30,6 +32,8 @@ class ThreadHandlers:
         self.cmd_thread_read = cmd_thread_read
         self.cmd_thread_archive = cmd_thread_archive
         self.cmd_thread_unarchive = cmd_thread_unarchive
+        self.cmd_thread_fork = cmd_thread_fork
+        self.on_thread_fork_callback = on_thread_fork_callback
         self.logger = logger
 
     async def cmd_thread(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -48,7 +52,7 @@ class ThreadHandlers:
             ]])
             await self.tg_call(
                 lambda: msg.reply_text(
-                    "usage: /thread <current|start|resume|list|read|archive|unarchive> ...\n\n"
+                    "usage: /thread <current|start|resume|list|read|archive|unarchive|fork> ...\n\n"
                     "快捷按钮：",
                     reply_markup=kb,
                 ),
@@ -75,9 +79,11 @@ class ThreadHandlers:
                 await self.cmd_thread_archive(update, context)
             elif sub == "unarchive":
                 await self.cmd_thread_unarchive(update, context)
+            elif sub == "fork":
+                await self.cmd_thread_fork(update, context)
             else:
                 await self.tg_call(
-                    lambda: msg.reply_text("usage: /thread <current|start|resume|list|read|archive|unarchive> ..."),
+                    lambda: msg.reply_text("usage: /thread <current|start|resume|list|read|archive|unarchive|fork> ..."),
                     timeout_s=15.0,
                     what="/thread reply",
                 )
@@ -93,6 +99,8 @@ class ThreadHandlers:
             return
         data = str(q.data or "")
         if not data.startswith("thread:shortcut:"):
+            if data.startswith("thread:fork:"):
+                await self.on_thread_fork_callback(update, context)
             return
         action = data.split(":", 2)[2].strip()
         orig_args = context.args

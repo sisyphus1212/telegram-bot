@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 
@@ -67,6 +67,50 @@ class ThreadMethodsHandlers:
             entry = {}
             by_node[node_id] = entry
         entry["thread_list_index"] = ids[:50]
+
+    def _get_fork_wizard(self, sk: str, node_id: str) -> dict[str, Any]:
+        sess = self.sessions_ref.setdefault(sk, {"node": node_id, "by_node": {}, "defaults": {}})
+        by_node = sess.setdefault("by_node", {}) if isinstance(sess, dict) else {}
+        entry = by_node.setdefault(node_id, {}) if isinstance(by_node, dict) else {}
+        wiz = entry.get("fork_wizard")
+        if not isinstance(wiz, dict):
+            wiz = {}
+            entry["fork_wizard"] = wiz
+        return wiz
+
+    def _clear_fork_wizard(self, sk: str, node_id: str) -> None:
+        sess = self.sessions_ref.get(sk)
+        if not isinstance(sess, dict):
+            return
+        by_node = sess.get("by_node") if isinstance(sess.get("by_node"), dict) else {}
+        entry = by_node.get(node_id) if isinstance(by_node.get(node_id), dict) else {}
+        if "fork_wizard" in entry:
+            entry.pop("fork_wizard", None)
+
+    def _build_fork_keyboard(self, *, sandbox: str, approval: str) -> InlineKeyboardMarkup:
+        sb_vals = [("workspace-write", "workspace"), ("read-only", "readonly"), ("danger-full-access", "danger")]
+        ap_vals = [("on-request", "onRequest"), ("never", "never")]
+        row1 = [InlineKeyboardButton(("• " if sandbox == v else "") + lab, callback_data=f"thread:fork:sandbox:{v}") for v, lab in sb_vals]
+        row2 = [InlineKeyboardButton(("• " if approval == v else "") + lab, callback_data=f"thread:fork:approval:{v}") for v, lab in ap_vals]
+        row3 = [
+            InlineKeyboardButton("Create Fork", callback_data="thread:fork:create"),
+            InlineKeyboardButton("Cancel", callback_data="thread:fork:cancel"),
+        ]
+        return InlineKeyboardMarkup([row1, row2, row3])
+
+    def _render_fork_text(self, *, node_id: str, source_tid: str, cwd: str, sandbox: str, approval: str) -> str:
+        return "\n".join(
+            [
+                f"[{node_id}] thread fork",
+                f"source: {source_tid}",
+                f"cwd: {cwd or '(missing)'}",
+                f"sandbox: {sandbox}",
+                f"approval: {approval}",
+                "",
+                "用法: /thread fork <idx|threadId> cwd=/path",
+                "然后点按钮选择权限并 Create Fork",
+            ]
+        )
 
     async def _resolve_thread_token(
         self,
@@ -395,3 +439,139 @@ class ThreadMethodsHandlers:
             await self.tg_call(lambda: update.message.reply_text(f"[{node_id}] error: {rep.get('error')}"), timeout_s=15.0, what="/thread_unarchive reply")
             return
         await self.tg_call(lambda: update.message.reply_text(f"[{node_id}] ok unarchived threadId={thread_id}"), timeout_s=15.0, what="/thread_unarchive reply")
+
+    async def cmd_thread_fork(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self.logger.info(f"cmd /thread_fork chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'} args={context.args!r}")
+        msg = update.effective_message
+        if msg is None:
+            return
+        if not self.is_allowed(update):
+            await self.tg_call(lambda: msg.reply_text("unauthorized"), timeout_s=15.0, what="/thread_fork reply")
+            return
+        node_id = await self.require_node_online(update)
+        if not node_id:
+            return
+        kv = self.parse_kv(context.args or [])
+        source_token = (kv.get("threadId") or (context.args[0] if context.args else "")).strip()
+        sk = self.session_key_fn(update)
+        source_tid = ""
+        if source_token:
+            source_tid = await self._resolve_thread_token(update=update, context=context, node_id=node_id, token=source_token, usage="/thread_fork")
+        if not source_tid:
+            source_tid = self.get_current_thread_id(sk, node_id)
+        if not source_tid:
+            await self.tg_call(lambda: msg.reply_text("usage: /thread fork <idx|threadId> cwd=/path  (or set current thread first)"), timeout_s=15.0, what="/thread_fork reply")
+            return
+        cwd = str(kv.get("cwd") or "").strip()
+        wiz = self._get_fork_wizard(sk, node_id)
+        wiz["source_thread_id"] = source_tid
+        wiz["cwd"] = cwd
+        wiz["sandbox"] = str(wiz.get("sandbox") or "workspace-write")
+        wiz["approvalPolicy"] = str(wiz.get("approvalPolicy") or "on-request")
+        self.save_sessions_fn(self.sessions_ref)
+        text = self._render_fork_text(
+            node_id=node_id,
+            source_tid=source_tid,
+            cwd=str(wiz.get("cwd") or ""),
+            sandbox=str(wiz.get("sandbox") or "workspace-write"),
+            approval=str(wiz.get("approvalPolicy") or "on-request"),
+        )
+        kb = self._build_fork_keyboard(sandbox=str(wiz.get("sandbox") or "workspace-write"), approval=str(wiz.get("approvalPolicy") or "on-request"))
+        await self.tg_call(lambda: msg.reply_text(text, reply_markup=kb), timeout_s=15.0, what="/thread_fork reply")
+
+    async def on_thread_fork_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q is None:
+            return
+        msg = update.effective_message
+        if msg is None:
+            await q.answer("bad message", show_alert=True)
+            return
+        if not self.is_allowed(update):
+            await q.answer("unauthorized", show_alert=True)
+            return
+        node_id = await self.require_node_online(update)
+        if not node_id:
+            await q.answer("node offline", show_alert=True)
+            return
+        sk = self.session_key_fn(update)
+        wiz = self._get_fork_wizard(sk, node_id)
+        data = str(q.data or "")
+        if data.startswith("thread:fork:sandbox:"):
+            wiz["sandbox"] = data.split(":", 3)[3].strip() or "workspace-write"
+        elif data.startswith("thread:fork:approval:"):
+            wiz["approvalPolicy"] = data.split(":", 3)[3].strip() or "on-request"
+        elif data == "thread:fork:cancel":
+            self._clear_fork_wizard(sk, node_id)
+            self.save_sessions_fn(self.sessions_ref)
+            await q.answer("cancelled")
+            await self.tg_call(lambda: msg.reply_text(f"[{node_id}] fork cancelled"), timeout_s=15.0, what="thread fork cancel")
+            return
+        elif data == "thread:fork:create":
+            source_tid = str(wiz.get("source_thread_id") or "").strip()
+            cwd = str(wiz.get("cwd") or "").strip()
+            sandbox = str(wiz.get("sandbox") or "workspace-write").strip()
+            approval = str(wiz.get("approvalPolicy") or "on-request").strip()
+            if not source_tid:
+                await q.answer("missing source", show_alert=True)
+                return
+            if not cwd:
+                await q.answer("请先输入 cwd", show_alert=True)
+                return
+            core = context.application.bot_data.get("core")
+            if core is None:
+                await q.answer("manager core missing", show_alert=True)
+                return
+            params: dict[str, Any] = {"threadId": source_tid, "cwd": cwd, "sandbox": sandbox, "approvalPolicy": approval}
+            rep = await core.appserver_call(node_id, "thread/fork", params, timeout_s=min(60.0, self.task_timeout_s))
+            if not bool(rep.get("ok")):
+                await q.answer("fork failed", show_alert=True)
+                await self.tg_call(lambda: msg.reply_text(f"[{node_id}] error: {rep.get('error')}"), timeout_s=15.0, what="thread fork create")
+                return
+            result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+            thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+            new_tid = str(thread.get("id") or "").strip()
+            if not new_tid:
+                await q.answer("fork missing id", show_alert=True)
+                return
+            self.set_current_thread_id(sk, node_id, new_tid)
+            self._clear_fork_wizard(sk, node_id)
+            self.save_sessions_fn(self.sessions_ref)
+            await q.answer("fork ok")
+            await self.tg_call(
+                lambda: msg.reply_text(
+                    "\n".join(
+                        [
+                            f"[{node_id}] ok forked",
+                            f"from: {source_tid}",
+                            f"to:   {new_tid}",
+                            f"cwd: {cwd}",
+                            f"sandbox: {sandbox}",
+                            f"approval: {approval}",
+                        ]
+                    )
+                ),
+                timeout_s=15.0,
+                what="thread fork create",
+            )
+            return
+        self.save_sessions_fn(self.sessions_ref)
+        text = self._render_fork_text(
+            node_id=node_id,
+            source_tid=str(wiz.get("source_thread_id") or ""),
+            cwd=str(wiz.get("cwd") or ""),
+            sandbox=str(wiz.get("sandbox") or "workspace-write"),
+            approval=str(wiz.get("approvalPolicy") or "on-request"),
+        )
+        kb = self._build_fork_keyboard(sandbox=str(wiz.get("sandbox") or "workspace-write"), approval=str(wiz.get("approvalPolicy") or "on-request"))
+        await self.tg_call(
+            lambda: context.bot.edit_message_text(
+                chat_id=msg.chat_id,
+                message_id=msg.message_id,
+                text=text,
+                reply_markup=kb,
+            ),
+            timeout_s=15.0,
+            what="thread fork update",
+        )
+        await q.answer("ok")

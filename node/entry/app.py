@@ -529,6 +529,7 @@ class CodexNodeAgent:
                                         "account/rateLimits/read",
                                         "thread/start",
                                         "thread/resume",
+                                        "thread/fork",
                                         "thread/list",
                                         "thread/read",
                                         "thread/archive",
@@ -550,11 +551,11 @@ class CodexNodeAgent:
                                     async with rpc_lock:
                                         await self.app.ensure_started_and_initialized(client_name=f"codex_node:{self.node_id}", version="0.0")
                                         p = params if isinstance(params, dict) else None
-                                        if method == "thread/start" and isinstance(p, dict):
+                                        if method in ("thread/start", "thread/fork") and isinstance(p, dict):
                                             # If manager doesn't specify, use node-local defaults from node_config.json.
-                                            if "sandbox" not in p:
+                                            if method == "thread/start" and "sandbox" not in p:
                                                 p["sandbox"] = self.sandbox
-                                            if "approvalPolicy" not in p:
+                                            if method == "thread/start" and "approvalPolicy" not in p:
                                                 p["approvalPolicy"] = self.approval_policy
                                             if "sandbox" in p and isinstance(p.get("sandbox"), str):
                                                 p["sandbox"] = _map_threadstart_sandbox(str(p["sandbox"]))

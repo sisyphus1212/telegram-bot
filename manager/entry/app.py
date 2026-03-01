@@ -399,6 +399,8 @@ class ManagerApp:
             cmd_thread_read=self.cmd_thread_read,
             cmd_thread_archive=self.cmd_thread_archive,
             cmd_thread_unarchive=self.cmd_thread_unarchive,
+            cmd_thread_fork=self.cmd_thread_fork,
+            on_thread_fork_callback=self.on_thread_fork_callback,
             logger=logger,
         )
         self.thread_methods_handlers = ThreadMethodsHandlers(
@@ -750,6 +752,7 @@ class ManagerApp:
         lines.append("- /thread read <id> [includeTurns=true|false]  (也支持: threadId=<id>)")
         lines.append("- /thread archive [threadId=<id>]   (不填则归档当前 thread)")
         lines.append("- /thread unarchive <id>  (也支持: threadId=<id>)")
+        lines.append("- /thread fork <idx|threadId> cwd=/path  (按钮选择 sandbox/approval 后创建)")
         lines.append("")
         lines.append("4) 其它 app-server 查询/配置")
         lines.append("- /model")
@@ -940,6 +943,12 @@ class ManagerApp:
 
     async def cmd_thread_unarchive(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.thread_methods_handlers.cmd_thread_unarchive(update, context)
+
+    async def cmd_thread_fork(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.thread_methods_handlers.cmd_thread_fork(update, context)
+
+    async def on_thread_fork_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.thread_methods_handlers.on_thread_fork_callback(update, context)
 
     async def cmd_skills_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.remote_command_handlers.cmd_skills_list(update, context)
