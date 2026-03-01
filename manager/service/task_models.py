@@ -44,6 +44,10 @@ class TaskContext:
     progress_last_message_at: float = 0.0
     progress_change_count: int = 0
     progress_last_batch_sent_count: int = 0
+    timeout_count: int = 0
+    phase_seq: int = 0
+    phase_state: str = "created"
+    timeout_kind: str = ""
 
 
 @dataclass

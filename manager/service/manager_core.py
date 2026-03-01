@@ -106,6 +106,17 @@ class ManagerCore:
             logger=self.logger,
         )
 
+    def _emit_task_state(self, ctx: TaskContext, *, state: str, timeout_kind: str = "") -> None:
+        ctx.phase_seq += 1
+        ctx.phase_state = state
+        if timeout_kind:
+            ctx.timeout_kind = timeout_kind
+        self.logger.info(
+            "op=task.state "
+            f"trace_id={ctx.trace_id} task_id={ctx.task_id} phase_seq={ctx.phase_seq} "
+            f"state={state} timeout_kind={timeout_kind or '-'} node_id={ctx.node_id} thread_id={ctx.thread_id}"
+        )
+
     def set_outbox(self, outbox: TelegramOutbox) -> None:
         self._outbox = outbox
         if self._timeout_task is None:
@@ -228,6 +239,7 @@ class ManagerCore:
             if ctx.progress_lines is None:
                 ctx.progress_lines = []
             self._tasks_inflight[ctx.task_id] = ctx
+            self._emit_task_state(ctx, state="queued")
             self._gc_recent_locked()
         self._start_typing_for_task(ctx)
 
@@ -341,6 +353,48 @@ class ManagerCore:
             task_id = str(msg.get("task_id") or "")
             trace_id = str(msg.get("trace_id") or "")
             self.logger.info(f"op=ws.recv node_id={node_id} type=task_ack trace_id={trace_id} task_id={task_id}")
+            async with self._lock:
+                ctx = self._tasks_inflight.get(task_id)
+                if ctx is not None:
+                    self._emit_task_state(ctx, state="acked")
+            return
+        if t == "node_runtime_status":
+            # Lightweight runtime snapshot from node; keep as structured log for timeout diagnostics.
+            self.logger.info(
+                "op=node.runtime "
+                f"node_id={node_id} trace_id={str(msg.get('trace_id') or '-')} task_id={str(msg.get('task_id') or '-')} "
+                f"thread_id={str(msg.get('thread_id') or '-')} stage={str(msg.get('stage') or '-')} "
+                f"queue_len={msg.get('queue_len')} busy={msg.get('busy')} "
+                f"appserver_state={str(msg.get('appserver_state') or '-')} status_age_ms={msg.get('status_age_ms')}"
+            )
+            return
+        if t == "node_network_alert":
+            fail_count = int(msg.get("fail_count") or 0)
+            check_target = str(msg.get("target") or "api.openai.com:443")
+            err = str(msg.get("error") or "")
+            self.logger.warning(
+                f"op=node.network_alert node_id={node_id} fail_count={fail_count} target={check_target} error={err}"
+            )
+            outbox = self._outbox
+            if outbox is not None and self.node_notify_chat_ids:
+                text = (
+                    f"node 网络告警: {node_id}\n"
+                    f"target: {check_target}\n"
+                    f"consecutive_failures: {fail_count}\n"
+                    f"last_error: {err or '-'}"
+                )
+                for chat_id in self.node_notify_chat_ids:
+                    await outbox.enqueue(
+                        TgAction(
+                            type="send",
+                            chat_id=int(chat_id),
+                            text=text,
+                            node_id=node_id,
+                            task_id=str(msg.get("task_id") or ""),
+                            trace_id=str(msg.get("trace_id") or ""),
+                            kind="network_alert",
+                        )
+                    )
             return
         if t == "appserver_response":
             req_id = str(msg.get("req_id") or "")
@@ -381,14 +435,24 @@ class ManagerCore:
         self.logger.info(f"op=ws.recv node_id={node_id} type=task_progress trace_id={trace_id} task_id={task_id} event={event} force={force} summary={summary[:200]}")
 
         ctx: TaskContext | None = None
+        is_late_ctx = False
         text_to_send = ""
         send_batch = False
         batch_size = 5
         async with self._lock:
             ctx = self._tasks_inflight.get(task_id)
-            if ctx is None:
-                return
             now = time.time()
+            if ctx is None:
+                # Keep accepting post-timeout progress for recently-expired tasks.
+                item = self._recent.get(task_id)
+                if item is None:
+                    return
+                ctx = item[0]
+                is_late_ctx = True
+                self._recent[task_id] = (ctx, now)
+                self._recent.move_to_end(task_id)
+                self._gc_recent_locked()
+                self._emit_task_state(ctx, state="late_progress")
             ctx.last_progress_seen_at = now
             if ctx.progress_lines is None:
                 ctx.progress_lines = []
@@ -397,6 +461,10 @@ class ManagerCore:
             if stage == "retrying" and not force:
                 ctx.last_progress_event = event
                 return
+            if ctx.phase_state in ("queued", "acked"):
+                self._emit_task_state(ctx, state="running")
+            if event == "turn/completed":
+                self._emit_task_state(ctx, state="turn_completed")
             label = self.progress_render.normalize_progress_line(event=event, stage=stage, summary=summary, ctx=ctx, now=now)
             if label is not None:
                 before_last = ctx.progress_lines[-1] if ctx.progress_lines else ""
@@ -426,10 +494,11 @@ class ManagerCore:
                 trace_id=trace_id or ctx.trace_id,
                 node_id=node_id,
                 task_id=task_id,
-                kind="progress_batch",
+                kind="late_progress" if is_late_ctx else "progress_batch",
+                timeout_count=ctx.timeout_count,
             )
         ):
-            self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (progress_batch)")
+            self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} ({'late_progress' if is_late_ctx else 'progress_batch'})")
 
     async def _handle_approval_request(self, *, node_id: str, msg: JsonDict) -> None:
         approval_id = str(msg.get("approval_id") or "")
@@ -524,6 +593,7 @@ class ManagerCore:
                 node_id=node_id,
                 task_id=task_id,
                 kind="approval_detail",
+                timeout_count=ctx.timeout_count,
             )
         )
         await outbox.enqueue(
@@ -536,6 +606,7 @@ class ManagerCore:
                 node_id=node_id,
                 task_id=task_id,
                 kind="approval",
+                timeout_count=ctx.timeout_count,
             )
         )
 
@@ -588,12 +659,22 @@ class ManagerCore:
             return
 
         if ctx is None and late_ctx is not None:
+            self._emit_task_state(late_ctx, state="late_result")
             body = text.strip() if ok else f"error: {err or 'unknown error'}"
             body = body or "(empty)"
             parts = _prefix_and_split_telegram_text(body, prefix=f"[{node_id}][late task_id={task_id}] ")
             for p in parts:
                 await outbox.enqueue(
-                    TgAction(type="send", chat_id=late_ctx.chat_id, text=p, trace_id=trace_id or late_ctx.trace_id, node_id=node_id, task_id=task_id, kind="late")
+                    TgAction(
+                        type="send",
+                        chat_id=late_ctx.chat_id,
+                        text=p,
+                        trace_id=trace_id or late_ctx.trace_id,
+                        node_id=node_id,
+                        task_id=task_id,
+                        kind="late",
+                        timeout_count=late_ctx.timeout_count,
+                    )
                 )
             return
 
@@ -601,6 +682,7 @@ class ManagerCore:
             self.logger.info(f"orphan task_result: node={node_id} task_id={task_id} ok={ok} err={err!r}")
             return
 
+        self._emit_task_state(ctx, state="done" if ok else "failed")
         if ok:
             body = text.strip() or "(empty)"
             parts = _prefix_and_split_telegram_text(body, prefix=f"[{node_id}] ")
@@ -617,12 +699,13 @@ class ManagerCore:
                         node_id=node_id,
                         task_id=task_id,
                         kind="result_done",
+                        timeout_count=ctx.timeout_count,
                     )
                 ):
                     self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit done)")
                 for extra in parts:
                     if not await outbox.enqueue(
-                        TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, node_id=node_id, task_id=task_id, kind="result")
+                        TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, node_id=node_id, task_id=task_id, kind="result", timeout_count=ctx.timeout_count)
                     ):
                         self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send result)")
             else:
@@ -636,12 +719,13 @@ class ManagerCore:
                         node_id=node_id,
                         task_id=task_id,
                         kind="result",
+                        timeout_count=ctx.timeout_count,
                     )
                 ):
                     self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit)")
                 for extra in parts[1:]:
                     if not await outbox.enqueue(
-                        TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, node_id=node_id, task_id=task_id, kind="result")
+                        TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, node_id=node_id, task_id=task_id, kind="result", timeout_count=ctx.timeout_count)
                     ):
                         self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send extra)")
             return
@@ -666,12 +750,13 @@ class ManagerCore:
                     node_id=node_id,
                     task_id=task_id,
                     kind="result_done",
+                    timeout_count=ctx.timeout_count,
                 )
             ):
                 self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit err done)")
             for extra in parts:
                 if not await outbox.enqueue(
-                    TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, node_id=node_id, task_id=task_id, kind="result")
+                    TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, node_id=node_id, task_id=task_id, kind="result", timeout_count=ctx.timeout_count)
                 ):
                     self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send err)")
         else:
@@ -685,12 +770,13 @@ class ManagerCore:
                     node_id=node_id,
                     task_id=task_id,
                     kind="result",
+                    timeout_count=ctx.timeout_count,
                 )
             ):
                 self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (edit err)")
             for extra in parts[1:]:
                 if not await outbox.enqueue(
-                    TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, node_id=node_id, task_id=task_id, kind="result")
+                    TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=trace_id or ctx.trace_id, node_id=node_id, task_id=task_id, kind="result", timeout_count=ctx.timeout_count)
                 ):
                     self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (send extra err)")
 
@@ -717,11 +803,12 @@ class ManagerCore:
                 node_id=node_id,
                 task_id=task_id,
                 kind="manager_error",
+                timeout_count=ctx.timeout_count,
             )
         )
         for extra in parts[1:]:
             await outbox.enqueue(
-                TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=ctx.trace_id, node_id=node_id, task_id=task_id, kind="manager_error")
+                TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=ctx.trace_id, node_id=node_id, task_id=task_id, kind="manager_error", timeout_count=ctx.timeout_count)
             )
 
     async def _timeout_loop(self) -> None:
@@ -737,6 +824,7 @@ class ManagerCore:
                     if (now - last) > timeout_s:
                         expired.append((tid, ctx))
                         self._tasks_inflight.pop(tid, None)
+                        ctx.timeout_count += 1
                         self._recent[tid] = (ctx, now)
                         self._recent.move_to_end(tid)
                 self._gc_recent_locked()
@@ -747,7 +835,13 @@ class ManagerCore:
                 continue
             for _tid, ctx in expired:
                 self._stop_typing_for_task(_tid)
-                parts = _prefix_and_split_telegram_text("error: timeout", prefix=f"[{ctx.node_id}] ")
+                timeout_kind = "execution"
+                if not ctx.last_progress_event:
+                    timeout_kind = "queue"
+                elif ctx.last_progress_event == "turn/completed":
+                    timeout_kind = "return"
+                self._emit_task_state(ctx, state="timeout", timeout_kind=timeout_kind)
+                parts = _prefix_and_split_telegram_text(f"error: timeout ({timeout_kind})", prefix=f"[{ctx.node_id}] ")
                 await outbox.enqueue(
                     TgAction(
                         type="edit",
@@ -758,11 +852,12 @@ class ManagerCore:
                         node_id=ctx.node_id,
                         task_id=_tid,
                         kind="timeout",
+                        timeout_count=ctx.timeout_count,
                     )
                 )
                 for extra in parts[1:]:
                     await outbox.enqueue(
-                        TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=ctx.trace_id, node_id=ctx.node_id, task_id=_tid, kind="timeout")
+                        TgAction(type="send", chat_id=ctx.chat_id, text=extra, trace_id=ctx.trace_id, node_id=ctx.node_id, task_id=_tid, kind="timeout", timeout_count=ctx.timeout_count)
                     )
 
     def _gc_recent_locked(self) -> None:

@@ -228,6 +228,18 @@ def _prefix_and_split_telegram_text(text: str, prefix: str, limit: int = 3900) -
     return [prefix + p for p in parts]
 
 
+def _manager_meta_prefix(text: str, *, task_id: str = "-") -> str:
+    tid = (task_id or "").strip() or "-"
+    prefix = (
+        "[src=manager][node=manager][status=manager_info]\n"
+        f"[task_id={tid}][trace_id=-][chat_id=-][timeout_count=0]\n"
+    )
+    body = text or ""
+    if body.startswith(prefix):
+        return body
+    return prefix + body
+
+
 def _short_one_line(s: str, limit: int = 80) -> str:
     s = (s or "").replace("\n", " ").strip()
     if len(s) <= limit:
@@ -726,7 +738,7 @@ class ManagerApp:
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/help reply")
+            await _tg_call(lambda: update.message.reply_text(_manager_meta_prefix("unauthorized")), timeout_s=15.0, what="/help reply")
             return
 
         lines: list[str] = []
@@ -783,14 +795,14 @@ class ManagerApp:
         lines.append("")
         lines.append("提示：thread 内容由 Codex 保存在 node 机器的 ~/.codex/；manager 只保存 chat->(node, threadId) 路由。")
 
-        await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/help reply")
+        await _tg_call(lambda: update.message.reply_text(_manager_meta_prefix("\n".join(lines))), timeout_s=15.0, what="/help reply")
 
     async def cmd_manager(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         self.logger.info(f"cmd /manager chat={update.effective_chat.id if update.effective_chat else '?'} user={update.effective_user.id if update.effective_user else '?'}")
         if not update.message:
             return
         if not self._is_allowed(update):
-            await _tg_call(lambda: update.message.reply_text("unauthorized"), timeout_s=15.0, what="/manager reply")
+            await _tg_call(lambda: update.message.reply_text(_manager_meta_prefix("unauthorized")), timeout_s=15.0, what="/manager reply")
             return
         now = time.time()
         uptime_s = max(0, int(now - self.started_at_ts))
@@ -828,7 +840,7 @@ class ManagerApp:
         lines.append(f"http_proxy: {http_proxy_l or '(unset)'}")
         lines.append(f"https_proxy: {https_proxy_l or '(unset)'}")
         lines.append(f"no_proxy: {no_proxy_l or '(unset)'}")
-        await _tg_call(lambda: update.message.reply_text("\n".join(lines)), timeout_s=15.0, what="/manager reply")
+        await _tg_call(lambda: update.message.reply_text(_manager_meta_prefix("\n".join(lines))), timeout_s=15.0, what="/manager reply")
 
     async def cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.approval_handlers.cmd_approve(update, context)
@@ -865,10 +877,10 @@ class ManagerApp:
         sk = _session_key(update)
         node_id = self._get_selected_node(sk)
         if not node_id:
-            await _tg_call(lambda: msg.reply_text("请先 /node 选择一台 node"), timeout_s=15.0, what="require node")
+            await _tg_call(lambda: msg.reply_text(_manager_meta_prefix("请先 /node 选择一台 node")), timeout_s=15.0, what="require node")
             return None
         if not self.registry.is_online(node_id):
-            await _tg_call(lambda: msg.reply_text(f"node offline: {node_id} (use /node)"), timeout_s=15.0, what="require node")
+            await _tg_call(lambda: msg.reply_text(_manager_meta_prefix(f"node offline: {node_id} (use /node)")), timeout_s=15.0, what="require node")
             return None
         return node_id
 
@@ -1264,7 +1276,11 @@ def main() -> int:
                         msg_text = "\n".join(text_lines)
                         for chat_id in startup_notify_chat_ids:
                             try:
-                                await _tg_call(lambda: tg.bot.send_message(chat_id=chat_id, text=msg_text), timeout_s=15.0, what="startup_notify")
+                                await _tg_call(
+                                    lambda: tg.bot.send_message(chat_id=chat_id, text=_manager_meta_prefix(msg_text)),
+                                    timeout_s=15.0,
+                                    what="startup_notify",
+                                )
                                 logger.info(f"op=startup_notify ok=true chat_id={chat_id}")
                             except Exception as e:
                                 logger.warning(f"op=startup_notify ok=false chat_id={chat_id} error={type(e).__name__}: {e}")

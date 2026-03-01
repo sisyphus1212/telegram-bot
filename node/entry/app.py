@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -271,6 +272,13 @@ class CodexNodeAgent:
         self._ws_send_lock: asyncio.Lock | None = None
         self._current_task_id: str = ""
         self._current_trace_id: str = ""
+        self._current_thread_id: str = ""
+        self._current_stage: str = ""
+        self._current_summary: str = ""
+        self._last_progress_ts: float = 0.0
+        self._queue_len: int = 0
+        self._appserver_state: str = "starting"
+        self._probe_fail_count: int = 0
 
         async def _on_approval(req: JsonDict) -> str:
             # Forward approval request to manager and wait for TG user decision.
@@ -328,6 +336,9 @@ class CodexNodeAgent:
             }
             try:
                 logger.info(_kv(op="progress.forward", node_id=self.node_id, trace_id=trace_id or None, task_id=task_id, event=out.get("event"), stage=out.get("stage"), summary=_short_text(out.get("summary"), 120)))
+                self._current_stage = str(out.get("stage") or "")
+                self._current_summary = str(out.get("summary") or "")
+                self._last_progress_ts = time.time()
                 async with send_lock:
                     await ws.send(_json_dumps(out))
             except Exception:
@@ -343,6 +354,37 @@ class CodexNodeAgent:
         self._resumed_threads: set[str] = set()
         self._busy = asyncio.Lock()  # single execution loop (node feeds Codex sequentially)
         self.max_pending = int(os.environ.get("NODE_MAX_PENDING", "10") or "10")
+
+    async def _probe_openai_connectivity(self, *, timeout_s: float = 5.0) -> tuple[bool, str]:
+        host = "api.openai.com"
+        port = 443
+        try:
+            conn = asyncio.open_connection(host=host, port=port)
+            reader, writer = await asyncio.wait_for(conn, timeout=timeout_s)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            _ = reader
+            return True, ""
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _runtime_status_msg(self) -> JsonDict:
+        now = time.time()
+        age_ms = int((now - self._last_progress_ts) * 1000.0) if self._last_progress_ts > 0 else -1
+        return {
+            "type": "node_runtime_status",
+            "node_id": self.node_id,
+            "trace_id": self._current_trace_id,
+            "task_id": self._current_task_id,
+            "thread_id": self._current_thread_id,
+            "stage": self._current_stage,
+            "summary": _short_text(self._current_summary, 200),
+            "queue_len": int(self._queue_len),
+            "busy": bool(self._busy.locked()),
+            "appserver_state": self._appserver_state,
+            "status_age_ms": age_ms,
+        }
 
     async def _run_task(self, msg: JsonDict) -> JsonDict:
         trace_id = str(msg.get("trace_id") or "") or uuid.uuid4().hex
@@ -379,7 +421,40 @@ class CodexNodeAgent:
         async with self._busy:
             self._current_task_id = task_id
             self._current_trace_id = trace_id
+            self._current_thread_id = thread_id
             t0 = time.time()
+            stop_watchdog = asyncio.Event()
+            watchdog_task: asyncio.Task | None = None
+            async def _long_task_watchdog() -> None:
+                warned = False
+                while not stop_watchdog.is_set():
+                    await asyncio.sleep(10.0)
+                    elapsed = int(time.time() - t0)
+                    if elapsed >= 120 and not warned:
+                        warned = True
+                        logger.warning(
+                            _kv(
+                                op="task.timeout_watch",
+                                node_id=self.node_id,
+                                trace_id=trace_id,
+                                task_id=task_id,
+                                thread_id=thread_id,
+                                elapsed_s=elapsed,
+                                note="running_over_120s",
+                            )
+                        )
+                    elif elapsed >= 120 and (elapsed % 60 == 0):
+                        logger.info(
+                            _kv(
+                                op="task.timeout_watch",
+                                node_id=self.node_id,
+                                trace_id=trace_id,
+                                task_id=task_id,
+                                thread_id=thread_id,
+                                elapsed_s=elapsed,
+                                note="still_running",
+                            )
+                        )
             logger.info(
                 _kv(
                     op="codex.turn.start",
@@ -393,6 +468,8 @@ class CodexNodeAgent:
                 )
             )
             try:
+                watchdog_task = asyncio.create_task(_long_task_watchdog(), name=f"watchdog:{task_id}")
+                self._appserver_state = "running"
                 await self.app.ensure_started_and_initialized(client_name=f"codex_node:{self.node_id}", version="0.0")
                 if thread_id not in self._resumed_threads:
                     # Best-effort resume: required after app-server restart to reload persisted thread.
@@ -445,6 +522,7 @@ class CodexNodeAgent:
                 # Treat app-server errors as potentially "poisoning" the in-memory server state.
                 # Restarting app-server is cheap and tends to recover from stuck child processes.
                 try:
+                    self._appserver_state = "restarting"
                     await self.app.stop()
                     self._resumed_threads.clear()
                     logger.warning(_kv(op="appserver.restart", node_id=self.node_id, trace_id=trace_id, task_id=task_id, reason="CodexAppServerError"))
@@ -480,6 +558,7 @@ class CodexNodeAgent:
                 if isinstance(e, TimeoutError):
                     # app-server can get stuck after upstream timeouts; restart to recover.
                     try:
+                        self._appserver_state = "restarting"
                         await self.app.stop()
                         self._resumed_threads.clear()
                         logger.warning(_kv(op="appserver.restart", node_id=self.node_id, trace_id=trace_id, task_id=task_id, reason="TimeoutError"))
@@ -495,8 +574,17 @@ class CodexNodeAgent:
                     "retriable": retriable,
                 }
             finally:
+                stop_watchdog.set()
+                if watchdog_task is not None:
+                    watchdog_task.cancel()
+                    await asyncio.gather(watchdog_task, return_exceptions=True)
                 self._current_task_id = ""
                 self._current_trace_id = ""
+                self._current_thread_id = ""
+                self._current_stage = ""
+                self._current_summary = ""
+                self._last_progress_ts = 0.0
+                self._appserver_state = "running"
 
     async def run_forever(self) -> None:
         try:
@@ -642,9 +730,56 @@ class CodexNodeAgent:
                                     pass
                                 finally:
                                     pending_count = max(0, pending_count - 1)
+                                    self._queue_len = pending_count
+
+                        async def _status_loop() -> None:
+                            while not stop_hb.is_set():
+                                try:
+                                    msg = self._runtime_status_msg()
+                                    async with send_lock:
+                                        await ws.send(_json_dumps(msg))
+                                except Exception:
+                                    return
+                                await asyncio.sleep(2.0)
+
+                        async def _network_probe_loop() -> None:
+                            while not stop_hb.is_set():
+                                ok, err = await self._probe_openai_connectivity(timeout_s=5.0)
+                                if ok:
+                                    self._probe_fail_count = 0
+                                else:
+                                    self._probe_fail_count += 1
+                                    logger.warning(
+                                        _kv(
+                                            op="network.probe",
+                                            node_id=self.node_id,
+                                            target="api.openai.com:443",
+                                            ok=False,
+                                            fail_count=self._probe_fail_count,
+                                            error=err,
+                                        )
+                                    )
+                                    if self._probe_fail_count >= 3:
+                                        alert = {
+                                            "type": "node_network_alert",
+                                            "node_id": self.node_id,
+                                            "target": "api.openai.com:443",
+                                            "fail_count": self._probe_fail_count,
+                                            "error": err,
+                                            "trace_id": self._current_trace_id,
+                                            "task_id": self._current_task_id,
+                                        }
+                                        try:
+                                            async with send_lock:
+                                                await ws.send(_json_dumps(alert))
+                                        except Exception:
+                                            return
+                                await asyncio.sleep(30.0)
 
                         hb_task = asyncio.create_task(_hb_loop(), name="heartbeat")
                         exec_task = asyncio.create_task(_exec_loop(), name="exec_loop")
+                        status_task = asyncio.create_task(_status_loop(), name="status_loop")
+                        probe_task = asyncio.create_task(_network_probe_loop(), name="network_probe_loop")
                         try:
                             async for raw in ws:
                                 try:
@@ -691,12 +826,14 @@ class CodexNodeAgent:
                                     continue
 
                                 pending_count += 1
+                                self._queue_len = pending_count
                                 logger.info(_kv(op="exec.enqueue", node_id=self.node_id, trace_id=trace_id, task_id=task_id, pending=pending_count, max_pending=self.max_pending))
                                 try:
                                     async with send_lock:
                                         await ws.send(_json_dumps({"type": "task_ack", "trace_id": trace_id, "task_id": task_id}))
                                 except Exception:
                                     pending_count = max(0, pending_count - 1)
+                                    self._queue_len = pending_count
                                     continue
 
                                 # Queue for sequential Codex feeding (FIFO).
@@ -704,6 +841,7 @@ class CodexNodeAgent:
                                     exec_queue.put_nowait(msg)
                                 except Exception:
                                     pending_count = max(0, pending_count - 1)
+                                    self._queue_len = pending_count
                                     out = {
                                         "type": "task_result",
                                         "trace_id": trace_id,
@@ -725,10 +863,14 @@ class CodexNodeAgent:
                             self._ws_send_lock = None
                             hb_task.cancel()
                             exec_task.cancel()
+                            status_task.cancel()
+                            probe_task.cancel()
                             for task in list(rpc_tasks):
                                 task.cancel()
                             await asyncio.gather(hb_task, return_exceptions=True)
                             await asyncio.gather(exec_task, return_exceptions=True)
+                            await asyncio.gather(status_task, return_exceptions=True)
+                            await asyncio.gather(probe_task, return_exceptions=True)
                             if rpc_tasks:
                                 await asyncio.gather(*rpc_tasks, return_exceptions=True)
                 except asyncio.CancelledError:

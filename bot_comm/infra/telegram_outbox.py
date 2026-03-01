@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -20,6 +21,7 @@ class TgAction:
     node_id: str = ""
     task_id: str = ""
     kind: str = ""  # "placeholder" | "result" | "late" | "timeout" | ...
+    timeout_count: int = 0
     retries_left: int | None = None
     backoff_s: float = 1.0
 
@@ -67,6 +69,49 @@ class TelegramOutbox:
             while i < n and s[i] in " \n":
                 i += 1
         return out if out else [""]
+
+    @staticmethod
+    def _task_prefix(task_id: str) -> str:
+        tid = (task_id or "").strip() or "-"
+        return f"[task_id={tid}] "
+
+    @staticmethod
+    def _source_prefix(*, node_id: str) -> str:
+        nid = (node_id or "").strip()
+        if nid:
+            return f"[src=node][node={nid}] "
+        return "[src=manager][node=manager] "
+
+    @staticmethod
+    def _status_prefix(kind: str) -> str:
+        k = (kind or "").strip() or "-"
+        return f"[status={k}] "
+
+    @staticmethod
+    def _detail_line(*, task_id: str, trace_id: str, chat_id: int, timeout_count: int) -> str:
+        tid = (task_id or "").strip() or "-"
+        tr = (trace_id or "").strip() or "-"
+        return f"[task_id={tid}][trace_id={tr}][chat_id={chat_id}][timeout_count={max(0, int(timeout_count or 0))}]"
+
+    @staticmethod
+    def _strip_legacy_leading_prefixes(text: str) -> str:
+        s = text or ""
+        # Remove old task-flow prefixes like:
+        #   [node]
+        #   [node][late task_id=...]
+        s = re.sub(r"^\[[^\]]+\](?:\[late task_id=[^\]]+\])?\s*", "", s)
+        return s
+
+    def _split_text_with_meta_prefix(self, text: str, *, node_id: str, task_id: str, limit: int = 3900) -> list[str]:
+        prefix = self._source_prefix(node_id=node_id) + self._task_prefix(task_id)
+        body = text or ""
+        # If already prefixed with source+task, keep as-is.
+        if body.startswith(prefix):
+            return self._split_text(body, limit=limit)
+        body = self._strip_legacy_leading_prefixes(body)
+        per_part_limit = max(200, limit - len(prefix))
+        core_parts = self._split_text(body, limit=per_part_limit)
+        return [prefix + p for p in core_parts]
 
     @staticmethod
     def _is_low_priority(action: TgAction) -> bool:
@@ -144,7 +189,15 @@ class TelegramOutbox:
                         last_text = self._last_edit_text.get(key)
                         if last_text == action.text:
                             continue
-                        parts = self._split_text(action.text, limit=3900)
+                        prefix = self._source_prefix(node_id=action.node_id) + self._status_prefix(action.kind)
+                        clean_text = self._strip_legacy_leading_prefixes(action.text)
+                        full_text = prefix + "\n" + self._detail_line(
+                            task_id=action.task_id,
+                            trace_id=action.trace_id,
+                            chat_id=action.chat_id,
+                            timeout_count=action.timeout_count,
+                        ) + "\n" + clean_text
+                        parts = self._split_text(full_text, limit=3900)
                         await self.tg_call(
                             lambda: self.bot.edit_message_text(
                                 chat_id=action.chat_id,
@@ -170,7 +223,15 @@ class TelegramOutbox:
                             f"trace_id={action.trace_id} node_id={action.node_id} task_id={action.task_id} kind={action.kind}"
                         )
                     elif action.type == "send":
-                        parts = self._split_text(action.text, limit=3900)
+                        prefix = self._source_prefix(node_id=action.node_id) + self._status_prefix(action.kind)
+                        clean_text = self._strip_legacy_leading_prefixes(action.text)
+                        full_text = prefix + "\n" + self._detail_line(
+                            task_id=action.task_id,
+                            trace_id=action.trace_id,
+                            chat_id=action.chat_id,
+                            timeout_count=action.timeout_count,
+                        ) + "\n" + clean_text
+                        parts = self._split_text(full_text, limit=3900)
                         for idx, part in enumerate(parts):
                             await self.tg_call(
                                 lambda t=part, rm=(action.reply_markup if idx == 0 else None): self.bot.send_message(chat_id=action.chat_id, text=t, reply_markup=rm),
