@@ -24,6 +24,13 @@ CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh status
 CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh servers
 ```
 
+统一 RPC（推荐给自动化脚本）：
+
+```bash
+python3 scripts/node_manager_rpc.py system.status --token "$CODEX_MANAGER_CONTROL_TOKEN"
+python3 scripts/node_manager_rpc.py system.servers --token "$CODEX_MANAGER_CONTROL_TOKEN"
+```
+
 2. 生成 token（完整返回）
 
 ```bash
@@ -34,6 +41,15 @@ CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh token-generate --n
 
 ```bash
 CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh token-generate --node-id my_node --print-config
+```
+
+或走统一 RPC 包络：
+
+```bash
+python3 scripts/node_manager_rpc.py token.generate \
+  --token "$CODEX_MANAGER_CONTROL_TOKEN" \
+  --params-json '{"node_id":"my_node","note":"bootstrap"}' \
+  --print-json
 ```
 
 4. 查询 / 废除 token

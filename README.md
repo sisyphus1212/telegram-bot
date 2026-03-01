@@ -210,6 +210,19 @@ CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh token-generate --n
 CODEX_MANAGER_CONTROL_TOKEN=REPLACE_ME scripts/manager_ctl.sh token-revoke --token-id <token_id>
 ```
 
+统一 RPC（结构化、可扩展）调用器：
+
+```bash
+# 查看在线节点（返回 result.details）
+python3 scripts/node_manager_rpc.py system.servers --token "$CODEX_MANAGER_CONTROL_TOKEN"
+
+# 生成 token 并返回 node_config（完整 envelope）
+python3 scripts/node_manager_rpc.py token.generate \
+  --token "$CODEX_MANAGER_CONTROL_TOKEN" \
+  --params-json '{"node_id":"my_node","note":"bootstrap"}' \
+  --print-json
+```
+
 阶段 3：Telegram 端到端验证见 [docs/verify_phase3_tg.md](/root/telegram-bot/docs/verify_phase3_tg.md)。
 
 ### 7. 验证链路（TG）

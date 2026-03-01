@@ -1044,6 +1044,7 @@ def main() -> int:
     registry = NodeRegistry(node_auth=node_auth, logger=logger)
     migrate_legacy_sessions_if_needed(store=SESSION_STORE, legacy_file=LEGACY_SESSIONS_FILE, logger=logger)
     sessions = load_sessions()
+    public_ws = _resolve_manager_public_ws(ws_listen=args.ws_listen, cfg=cfg, logger=logger)
 
     async def runner():
         core = ManagerCore(
@@ -1118,8 +1119,6 @@ def main() -> int:
                 ctl_task.cancel()
                 await asyncio.gather(ctl_task, return_exceptions=True)
             return
-
-        public_ws = _resolve_manager_public_ws(ws_listen=args.ws_listen, cfg=cfg, logger=logger)
 
         app = ManagerApp(
             core=core,

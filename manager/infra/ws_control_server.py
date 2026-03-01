@@ -73,6 +73,167 @@ async def run_control_server(
                             continue
                     except Exception:
                         pass
+                if t == "rpc":
+                    req_id = str(req.get("id") or "")
+                    action = str(req.get("action") or "").strip()
+                    params = req.get("params") if isinstance(req.get("params"), dict) else {}
+
+                    def rpc_ok(result: dict[str, Any]) -> dict[str, Any]:
+                        return {"ok": True, "type": "rpc", "id": req_id, "action": action, "result": result}
+
+                    def rpc_err(code: str, message: str) -> dict[str, Any]:
+                        return {"ok": False, "type": "rpc", "id": req_id, "action": action, "error": {"code": code, "message": message}}
+
+                    try:
+                        if action == "system.status":
+                            try:
+                                status = await core.get_runtime_status()
+                            except Exception:
+                                status = {"draining": bool(core.is_draining()), "inflight_tasks": -1, "pending_approvals": -1}
+                            out = rpc_ok({"status": status})
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
+                        if action == "system.servers":
+                            try:
+                                details = await registry.get_online_snapshot()
+                            except Exception:
+                                details = []
+                            out = rpc_ok(
+                                {
+                                    "online": registry.online_node_ids(),
+                                    "allowed": registry.allowed_node_ids(),
+                                    "details": details,
+                                }
+                            )
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
+                        if action == "task.dispatch":
+                            node_id = str(params.get("node_id") or "").strip()
+                            prompt = str(params.get("prompt") or "ping")
+                            timeout_s = float(params.get("timeout") or 60.0)
+                            model = str(params.get("model") or "").strip()
+                            effort = str(params.get("effort") or "").strip()
+                            if not node_id:
+                                out = rpc_err("bad_request", "missing node_id")
+                            else:
+                                try:
+                                    res = await core.dispatch_once(node_id, prompt, timeout_s=timeout_s, model=model, effort=effort)
+                                    out = rpc_ok({"dispatch": res})
+                                except Exception as e:
+                                    out = rpc_ok({"dispatch": {"ok": False, "error": f"{type(e).__name__}: {e}"}})
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
+                        if action == "appserver.call":
+                            node_id = str(params.get("node_id") or "").strip()
+                            method = str(params.get("method") or "").strip()
+                            method_params = params.get("params")
+                            timeout_s = float(params.get("timeout") or 30.0)
+                            if not node_id:
+                                out = rpc_err("bad_request", "missing node_id")
+                            elif not method:
+                                out = rpc_err("bad_request", "missing method")
+                            else:
+                                try:
+                                    res = await core.appserver_call(node_id, method, method_params if isinstance(method_params, dict) else {}, timeout_s=timeout_s)
+                                    out = rpc_ok({"appserver": res})
+                                except Exception as e:
+                                    out = rpc_ok({"appserver": {"ok": False, "error": f"{type(e).__name__}: {e}"}})
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
+                        if action == "task.dispatch_text":
+                            node_id = str(params.get("node_id") or "").strip()
+                            session_key = str(params.get("session_key") or "").strip()
+                            text = str(params.get("text") or "")
+                            timeout_s = float(params.get("timeout") or 60.0)
+                            if not node_id or not session_key:
+                                out = rpc_err("bad_request", "missing node_id/session_key")
+                            else:
+                                try:
+                                    sessions = session_store.load_all()
+                                    sess = sessions.get(session_key) or {"node": node_id, "by_node": {}, "defaults": {}}
+                                    byp = sess.get("by_node") if isinstance(sess.get("by_node"), dict) else {}
+                                    entry = byp.get(node_id) if isinstance(byp.get(node_id), dict) else {}
+                                    thread_id = str(entry.get("current_thread_id") or "")
+                                    if not thread_id:
+                                        rep = await core.appserver_call(
+                                            node_id,
+                                            "thread/start",
+                                            {"cwd": str(base_dir), "personality": "pragmatic"},
+                                            timeout_s=min(timeout_s, 60.0),
+                                        )
+                                        if not bool(rep.get("ok")):
+                                            raise RuntimeError(f"thread/start failed: {rep.get('error')}")
+                                        result = rep.get("result") if isinstance(rep.get("result"), dict) else {}
+                                        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+                                        thread_id = str(thread.get("id") or "")
+                                        if not thread_id:
+                                            raise RuntimeError(f"thread/start missing id: {result!r}")
+                                        byp.setdefault(node_id, {})["current_thread_id"] = thread_id
+                                        sess["by_node"] = byp
+                                        sessions[session_key] = sess
+                                        session_store.save_all(sessions)
+                                    res = await core.dispatch_task(node_id, thread_id, text, thread_key=session_key, timeout_s=timeout_s)
+                                    out = rpc_ok({"thread_id": thread_id, "dispatch_text": res})
+                                except Exception as e:
+                                    out = rpc_ok({"dispatch_text": {"ok": False, "error": f"{type(e).__name__}: {e}"}})
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
+                        if action == "token.generate":
+                            node_id = str(params.get("node_id") or "").strip()
+                            note = str(params.get("note") or "").strip()
+                            created_by_raw = params.get("created_by")
+                            created_by = int(created_by_raw) if isinstance(created_by_raw, int) else None
+                            if not node_id:
+                                out = rpc_err("bad_request", "missing node_id")
+                            else:
+                                rec = await node_auth.generate(node_id=node_id, note=note, created_by=created_by)
+                                plain_token = str(rec.get("token") or "")
+                                token_id = str(rec.get("token_id") or "")
+                                out = rpc_ok(
+                                    {
+                                        "token_id": token_id,
+                                        "node_id": node_id,
+                                        "note": note,
+                                        "token": plain_token,
+                                        "node_config": _build_node_config(node_id, plain_token),
+                                    }
+                                )
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
+                        if action == "token.list":
+                            include_revoked = bool(params.get("include_revoked"))
+                            items = await node_auth.list_items(include_revoked=include_revoked)
+                            out = rpc_ok({"items": items})
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
+                        if action == "token.revoke":
+                            token_id = str(params.get("token_id") or "").strip()
+                            revoked_by_raw = params.get("revoked_by")
+                            revoked_by = int(revoked_by_raw) if isinstance(revoked_by_raw, int) else None
+                            if not token_id:
+                                out = rpc_err("bad_request", "missing token_id")
+                            else:
+                                ok, reason = await node_auth.revoke(token_id=token_id, revoked_by=revoked_by)
+                                out = rpc_ok({"ok": bool(ok), "token_id": token_id, "reason": reason})
+                            writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            continue
+                        out = rpc_err("bad_action", f"unknown action: {action}")
+                        writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        continue
+                    except Exception as e:
+                        out = rpc_err("internal_error", f"{type(e).__name__}: {e}")
+                        writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        continue
                 if t == "status":
                     try:
                         status = await core.get_runtime_status()
