@@ -64,3 +64,14 @@ telegram-bot/
 - 运维排障步骤
 
 如果两处冲突，以 README 的运行步骤为准，并在同一提交里修正 AGENTS 的引用。
+
+## 6. Git 提交流程（稳定分支）
+
+1. 稳定基线分支：`stable`（远端 `origin/stable`）。
+2. 后续开发流程：
+- 从 `stable` 切功能分支（例如 `feat/xxx`、`fix/xxx`）
+- 在功能分支完成改动与验证
+- 向 `stable` 提 PR，不直接向 `main` 叠加
+3. `CHANGELOG.md` 维护要求：
+- 重要功能、架构调整、协议修复必须写入 `CHANGELOG.md`
+- 与发布相关的行为变更（升级、超时、消息交付）必须记录
