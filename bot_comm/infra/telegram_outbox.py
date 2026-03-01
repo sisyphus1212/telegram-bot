@@ -47,10 +47,14 @@ class TelegramOutbox:
         self._last_active: dict[int, float] = {}
         self._last_edit_text: dict[tuple[int, int], str] = {}
 
+    @staticmethod
+    def _is_low_priority(action: TgAction) -> bool:
+        return action.type == "typing" or action.kind in ("progress", "progress_batch")
+
     async def enqueue(self, action: TgAction) -> bool:
         now = time.time()
         if action.retries_left is None:
-            if action.type == "typing" or action.kind in ("progress",):
+            if self._is_low_priority(action):
                 action.retries_left = 0
             elif action.kind in ("result", "result_done", "manager_error", "timeout", "approval"):
                 action.retries_left = 12
@@ -69,7 +73,26 @@ class TelegramOutbox:
             try:
                 q.put_nowait(action)
             except asyncio.QueueFull:
-                return False
+                # Keep result/error delivery reliable: drop low-priority progress first.
+                if self._is_low_priority(action):
+                    return False
+                dropped = False
+                try:
+                    # asyncio.Queue stores items in a deque at _queue.
+                    # We surgically drop one low-priority item to make room for high-priority results.
+                    for i, old in enumerate(q._queue):  # type: ignore[attr-defined]
+                        if isinstance(old, TgAction) and self._is_low_priority(old):
+                            del q._queue[i]  # type: ignore[attr-defined]
+                            dropped = True
+                            break
+                except Exception:
+                    dropped = False
+                if not dropped:
+                    return False
+                try:
+                    q.put_nowait(action)
+                except asyncio.QueueFull:
+                    return False
             return True
 
     async def _sender_loop(self, chat_id: int) -> None:
