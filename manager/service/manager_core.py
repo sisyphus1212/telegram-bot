@@ -372,6 +372,8 @@ class ManagerCore:
 
         ctx: TaskContext | None = None
         text_to_send = ""
+        send_batch = False
+        batch_size = 5
         async with self._lock:
             ctx = self._tasks_inflight.get(task_id)
             if ctx is None:
@@ -387,33 +389,37 @@ class ManagerCore:
                 return
             label = self.progress_render.normalize_progress_line(event=event, stage=stage, summary=summary, ctx=ctx, now=now)
             if label is not None:
+                before_last = ctx.progress_lines[-1] if ctx.progress_lines else ""
                 self.progress_render.push_progress_line(ctx.progress_lines, label)
+                if label != before_last:
+                    ctx.progress_change_count += 1
             ctx.pending_progress_text = summary
             ctx.last_progress_event = event
-            should_send = force or ctx.last_progress_at <= 0 or (now - ctx.last_progress_at) >= self.progress_update_interval_s
-            if not should_send:
+            unsent_changes = ctx.progress_change_count - ctx.progress_last_batch_sent_count
+            if unsent_changes < batch_size and not (force and unsent_changes > 0):
                 return
-            text_to_send = self.progress_render.render_progress_text(ctx)
+            send_batch = True
+            text_to_send = self.progress_render.render_progress_batch_text(ctx, batch_size=batch_size)
             ctx.last_progress_at = now
             ctx.last_progress_text = ctx.pending_progress_text
             ctx.pending_progress_text = ""
+            ctx.progress_last_batch_sent_count = ctx.progress_change_count
 
         outbox = self._outbox
-        if outbox is None or ctx is None:
+        if outbox is None or ctx is None or not send_batch:
             return
         if not await outbox.enqueue(
             TgAction(
-                type="edit",
+                type="send",
                 chat_id=ctx.chat_id,
-                message_id=ctx.placeholder_msg_id,
                 text=text_to_send,
                 trace_id=trace_id or ctx.trace_id,
                 node_id=node_id,
                 task_id=task_id,
-                kind="progress",
+                kind="progress_batch",
             )
         ):
-            self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (progress)")
+            self.logger.warning(f"tg outbox enqueue failed chat={ctx.chat_id} (progress_batch)")
 
     async def _handle_approval_request(self, *, node_id: str, msg: JsonDict) -> None:
         approval_id = str(msg.get("approval_id") or "")

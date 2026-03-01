@@ -263,11 +263,16 @@ class CodexAppServerStdioProcess:
         return turn_id
 
     async def run_turn_and_collect_agent_message(self, thread_id: str, turn_id: str, timeout_s: float = 120.0) -> str:
+        # timeout_s is treated as idle timeout:
+        # keep waiting as long as app-server keeps emitting notifications.
         agent_texts: list[str] = []
 
-        async def _wait():
+        async def _wait() -> None:
             while True:
-                msg = await self._notifications.get()
+                try:
+                    msg = await asyncio.wait_for(self._notifications.get(), timeout=max(5.0, float(timeout_s)))
+                except asyncio.TimeoutError:
+                    raise TimeoutError(f"idle timeout after {int(timeout_s)}s without app-server notifications")
                 method = msg.get("method")
                 params = msg.get("params") or {}
 
@@ -307,7 +312,7 @@ class CodexAppServerStdioProcess:
                     if isinstance(turn, dict) and turn.get("id") == turn_id:
                         return
 
-        await asyncio.wait_for(_wait(), timeout=timeout_s)
+        await _wait()
         return "\n".join(agent_texts).strip()
 
     async def _handle_server_request(self, req: JsonDict) -> None:

@@ -70,3 +70,16 @@ class ProgressRenderService:
         status = "working done" if ok else "working failed"
         lines.append(f"{status} (node={ctx.node_id}, threadId={ctx.thread_id[-8:]})")
         return "\n".join(lines)
+
+    def render_progress_batch_text(self, ctx: TaskContext, *, batch_size: int = 5) -> str:
+        sess = (ctx.session_key or "").strip()
+        header = (
+            f"[progress] node={ctx.node_id} thread={ctx.thread_id[-8:]} "
+            f"session={sess or '-'} changes={ctx.progress_change_count}"
+        )
+        lines: list[str] = [header]
+        if ctx.progress_lines:
+            tail = ctx.progress_lines[-max(1, int(batch_size)) :]
+            lines.append("")
+            lines.extend(tail)
+        return "\n".join(lines)

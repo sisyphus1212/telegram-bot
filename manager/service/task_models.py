@@ -41,6 +41,8 @@ class TaskContext:
     last_progress_event: str = ""
     progress_lines: list[str] | None = None
     progress_last_message_at: float = 0.0
+    progress_change_count: int = 0
+    progress_last_batch_sent_count: int = 0
 
 
 @dataclass

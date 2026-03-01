@@ -357,8 +357,8 @@ class CodexNodeAgent:
         # Guardrails: avoid nonsense values; keep a sensible upper bound.
         if timeout_s < 10.0:
             timeout_s = 10.0
-        if timeout_s > 600.0:
-            timeout_s = 600.0
+        if timeout_s > 7200.0:
+            timeout_s = 7200.0
         model = msg.get("model")
         effort = msg.get("effort")
         if not isinstance(model, str):
