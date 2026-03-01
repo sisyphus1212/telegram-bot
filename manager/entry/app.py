@@ -410,6 +410,7 @@ class ManagerApp:
             get_current_thread_id=self._get_current_thread_id,
             set_current_thread_id=self._set_current_thread_id,
             get_default_model=self._get_default_model,
+            get_default_effort=self._get_default_effort,
             save_sessions_fn=save_sessions,
             sessions_ref=self.sessions,
             pretty_json=self._pretty_json,

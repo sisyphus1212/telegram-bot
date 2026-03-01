@@ -18,6 +18,7 @@ class ThreadMethodsHandlers:
         get_current_thread_id: Callable[[str, str], str],
         set_current_thread_id: Callable[[str, str, str], None],
         get_default_model: Callable[[str], str],
+        get_default_effort: Callable[[str], str],
         save_sessions_fn: Callable[[dict[str, dict]], None],
         sessions_ref: dict[str, dict],
         pretty_json: Callable[[Any], str],
@@ -32,6 +33,7 @@ class ThreadMethodsHandlers:
         self.get_current_thread_id = get_current_thread_id
         self.set_current_thread_id = set_current_thread_id
         self.get_default_model = get_default_model
+        self.get_default_effort = get_default_effort
         self.save_sessions_fn = save_sessions_fn
         self.sessions_ref = sessions_ref
         self.pretty_json = pretty_json
@@ -131,6 +133,8 @@ class ThreadMethodsHandlers:
         sk = self.session_key_fn(update)
         tid = self.get_current_thread_id(sk, node_id)
         lines: list[str] = [f"threadId: {tid or '(none)'}"]
+        lines.append(f"default_model(session): {self.get_default_model(sk) or '(none)'}")
+        lines.append(f"default_effort(session): {self.get_default_effort(sk) or '(none)'}")
         if tid:
             core = context.application.bot_data.get("core")
             if core is not None:
